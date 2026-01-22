@@ -1,0 +1,21 @@
+# Core dependencies for live-event Realtime Audio Streaming
+# Install with: pip install -r requirements.txt
+
+# Audio processing
+numpy==2.0.2
+sounddevice==0.5.3
+
+# NVIDIA Riva client for speech-to-speech translation
+nvidia-riva-client==2.24.0
+
+# gRPC for Riva service communication
+grpcio==1.67.1
+grpcio-tools==1.67.1
+
+# Required by nvidia-riva-client
+protobuf==5.29.5
+
+# HTTP/networking (required dependencies)
+certifi==2026.1.4
+requests==2.32.5
+urllib3==2.6.3
