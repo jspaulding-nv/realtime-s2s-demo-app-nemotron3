@@ -9,6 +9,7 @@ from starlette.websockets import WebSocketState
 
 from riva_client import riva_client, AudioChunkIterator
 from audio_processor import float32_to_int16, calculate_rms
+from timing_logger import timing_logger
 
 
 class SessionStatus(str, Enum):
@@ -105,7 +106,13 @@ class TranslationSession:
             # These run in a background thread, so use run_coroutine_threadsafe
             def on_audio(audio_bytes: bytes):
                 if not self._closed:
-                    asyncio.run_coroutine_threadsafe(self.send_audio(audio_bytes), loop)
+                    timing_logger.log_audio_from_riva(len(audio_bytes))
+
+                    async def _send_and_log():
+                        await self.send_audio(audio_bytes)
+                        timing_logger.log_audio_sent_to_client(len(audio_bytes))
+
+                    asyncio.run_coroutine_threadsafe(_send_and_log(), loop)
 
             def on_error(error_msg: str):
                 if not self._closed:
@@ -146,10 +153,14 @@ class TranslationSession:
         # Just pass it through to Riva
         print(f"[WS] Received {len(audio_bytes)} bytes (Int16) from client")
 
+        # Timing instrumentation
+        chunk_idx = timing_logger.log_audio_received(len(audio_bytes))
+
         # Calculate RMS for visualization
         rms = calculate_rms(audio_bytes, dtype="int16")
 
         # Send to Riva (already Int16 format)
+        timing_logger.log_audio_to_riva(chunk_idx, len(audio_bytes))
         self.chunk_iterator.add_chunk(audio_bytes)
 
         # Send RMS level back to client for visualization

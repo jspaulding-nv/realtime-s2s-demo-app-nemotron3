@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import SUPPORTED_LANGUAGES, audio_config
 from riva_client import riva_client
 from websocket_handler import session_manager, SessionStatus
+from timing_logger import timing_logger
 
 
 @asynccontextmanager
@@ -76,6 +77,48 @@ async def get_config():
         "chunkSize": audio_config.chunk_size,
         "channels": audio_config.channels,
     }
+
+
+@app.post("/api/test/start")
+async def test_start():
+    """Start a latency measurement test session."""
+    timing_logger.start_test()
+    return {"status": "started"}
+
+
+@app.post("/api/test/stop")
+async def test_stop():
+    """Stop the current latency measurement test session."""
+    timing_logger.stop_test()
+    return {"status": "stopped"}
+
+
+@app.get("/api/test/export")
+async def test_export():
+    """Export all timing events from the current or last test session."""
+    return {"events": timing_logger.get_all_events()}
+
+
+@app.websocket("/ws/metrics")
+async def websocket_metrics(websocket: WebSocket):
+    """WebSocket endpoint for real-time timing event streaming."""
+    await websocket.accept()
+    queue = timing_logger.subscribe()
+    try:
+        while True:
+            event = await queue.get()
+            await websocket.send_json({
+                "stage": event.stage,
+                "timestamp": event.timestamp,
+                "chunk_index": event.chunk_index,
+                "source_position_sec": event.source_position_sec,
+                "audio_bytes_len": event.audio_bytes_len,
+                "wall_clock": event.wall_clock,
+            })
+    except Exception:
+        pass  # client disconnected
+    finally:
+        timing_logger.unsubscribe(queue)
 
 
 @app.websocket("/ws/translate")
