@@ -22,10 +22,17 @@ export function exportTimingDataAsCSV(
   const csv = rows.join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+  const a = document.createElement('a');
   a.href = url;
   a.download = `timing-export-${timestamp}.csv`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  // Clean up after a short delay to ensure download starts
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 100);
 }

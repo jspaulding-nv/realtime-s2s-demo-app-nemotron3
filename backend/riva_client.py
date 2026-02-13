@@ -94,6 +94,18 @@ class RivaS2SClient:
 
         print(f"[Riva] Creating config: {riva_config.source_language} -> {target_language}, voice: {voice_name}")
 
+        # Endpointing config — reduce stalls by detecting silence faster
+        # Default server config waits too long for sentence boundaries,
+        # causing 15-35s stalls in continuous speech (e.g., samples).
+        endpointing_config = riva_asr_pb2.EndpointingConfig(
+            start_history=100,       # 100ms — very fast speech start detection
+            start_threshold=0.3,     # 30% non-blank frames triggers start
+            stop_history=300,        # 300ms silence triggers final result
+            stop_threshold=0.5,      # 50% blank frames triggers end
+            stop_history_eou=200,    # 200ms early end-of-utterance
+            stop_threshold_eou=0.6,  # 60% blank for early EOU
+        )
+
         # ASR config for speech recognition
         asr_config = riva_asr_pb2.StreamingRecognitionConfig(
             config=riva_asr_pb2.RecognitionConfig(
@@ -103,6 +115,7 @@ class RivaS2SClient:
                 max_alternatives=1,
                 enable_automatic_punctuation=True,
                 audio_channel_count=audio_config.channels,
+                endpointing_config=endpointing_config,
             ),
             interim_results=True
         )

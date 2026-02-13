@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useMemo, useRef } from 'react';
 import type { ClientTimingEvent } from '../types/timing';
 
 interface UseTimingTrackerReturn {
@@ -69,7 +69,7 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     [],
   );
 
-  return {
+  return useMemo(() => ({
     startTest,
     logChunkSent,
     logAudioReceived,
@@ -78,5 +78,5 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     getReceiveCount,
     getSourcePosition,
     getCumulativeOutputDuration,
-  };
+  }), [startTest, logChunkSent, logAudioReceived, getEvents, getSendCount, getReceiveCount, getSourcePosition, getCumulativeOutputDuration]);
 }
