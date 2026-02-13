@@ -26,35 +26,23 @@ export function DriftChart({ data }: DriftChartProps) {
           fontSize={12}
         />
         <YAxis
-          label={{ value: 'Drift (s)', angle: -90, position: 'insideLeft' }}
+          label={{ value: 'Translation Delay (s)', angle: -90, position: 'insideLeft' }}
           stroke="#6b7280"
           fontSize={12}
         />
         <Tooltip
-          formatter={(value, name) => [
-            `${Number(value).toFixed(2)}s`,
-            name === 'rawDriftSeconds' ? 'Raw Drift' : 'Accumulating Drift',
-          ]}
+          formatter={(value: number) => [`${value.toFixed(2)}s`, 'Translation Delay']}
           labelFormatter={(label) => `${Number(label).toFixed(1)} min`}
         />
         <ReferenceLine y={20} stroke="#f59e0b" strokeDasharray="6 3" label="Warning (20s)" />
         <ReferenceLine y={30} stroke="#ef4444" strokeDasharray="6 3" label="Danger (30s)" />
         <Line
           type="monotone"
-          dataKey="rawDriftSeconds"
+          dataKey="driftSeconds"
           stroke="#3b82f6"
           dot={false}
           isAnimationActive={false}
-          name="Raw Drift"
-          strokeWidth={2}
-        />
-        <Line
-          type="monotone"
-          dataKey="driftSeconds"
-          stroke="#10b981"
-          dot={false}
-          isAnimationActive={false}
-          name="Accumulating Drift"
+          name="Translation Delay"
           strokeWidth={2}
         />
       </LineChart>

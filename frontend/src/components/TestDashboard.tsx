@@ -3,6 +3,7 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { useFileAudioSource } from '../hooks/useFileAudioSource';
 import { useTimingTracker } from '../hooks/useTimingTracker';
 import { useMetricsSocket } from '../hooks/useMetricsSocket';
+import { useAudioPlayback } from '../hooks/useAudioPlayback';
 import { DriftChart } from './DriftChart';
 import { exportTimingDataAsCSV } from '../utils/csvExport';
 import type { DriftDataPoint } from '../types/timing';
@@ -24,7 +25,6 @@ export function TestDashboard() {
     responsesReceived: 0,
   });
 
-  const initialDriftRef = useRef<number | null>(null);
   const testStartTimeRef = useRef(0);
   const driftUpdateTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastReceiveChangeRef = useRef(0);
@@ -35,6 +35,16 @@ export function TestDashboard() {
   const trackerRef = useRef(tracker);
   trackerRef.current = tracker;
   const metrics = useMetricsSocket();
+
+  // Audio playback: input (English) starts muted, output (Spanish) starts muted
+  const inputPlayback = useAudioPlayback({ sampleRate: 16000, initialMuted: true });
+  const outputPlayback = useAudioPlayback({ sampleRate: 16000, initialMuted: true });
+
+  // Stable refs for playback instances
+  const inputPlaybackRef = useRef(inputPlayback);
+  inputPlaybackRef.current = inputPlayback;
+  const outputPlaybackRef = useRef(outputPlayback);
+  outputPlaybackRef.current = outputPlayback;
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -61,6 +71,8 @@ export function TestDashboard() {
       }
       trackerRef.current.logAudioReceived(audio.byteLength);
       lastReceiveChangeRef.current = performance.now();
+      // Queue translated audio for output playback
+      outputPlaybackRef.current.queueAudio(audio);
     },
   });
   wsRef.current = ws;
@@ -74,6 +86,8 @@ export function TestDashboard() {
       }
       wsRef.current.sendAudio(chunk);
       trackerRef.current.logChunkSent(chunk.byteLength);
+      // Queue input audio for input playback monitoring
+      inputPlaybackRef.current.queueAudio(chunk);
     },
     onComplete: () => {
       console.log('[TestDashboard] onComplete fired. phaseRef.current =', phaseRef.current);
@@ -86,46 +100,41 @@ export function TestDashboard() {
   });
   fileSourceRef.current = fileSource;
 
-  // -- Drift data update --
+  // -- Drift data update (playback-based) --
   const updateDriftData = useCallback(() => {
     const t = trackerRef.current;
     const elapsedMs = performance.now() - testStartTimeRef.current;
     const elapsedSec = elapsedMs / 1000;
-    const cumulativeOutput = t.getCumulativeOutputDuration();
     const sendCount = t.getSendCount();
     const recvCount = t.getReceiveCount();
-    const rawDrift = elapsedSec - cumulativeOutput;
 
-    if (initialDriftRef.current === null && cumulativeOutput > 0) {
-      initialDriftRef.current = rawDrift;
-    }
-
-    const accumulatingDrift =
-      initialDriftRef.current !== null ? rawDrift - initialDriftRef.current : 0;
+    // Playback-based drift: how far the listener is behind the speaker
+    const inputPosition = fileSourceRef.current.position;
+    const playbackPosition = outputPlaybackRef.current.getPlaybackPosition();
+    const drift = inputPosition - playbackPosition;
 
     // Log every 5 seconds
     if (Math.floor(elapsedSec) % 5 === 0) {
-      console.log(`[TestDashboard] updateDriftData: elapsed=${elapsedSec.toFixed(1)}s, sent=${sendCount}, recv=${recvCount}, output=${cumulativeOutput.toFixed(2)}s, drift=${accumulatingDrift.toFixed(2)}s`);
+      console.log(`[TestDashboard] updateDriftData: elapsed=${elapsedSec.toFixed(1)}s, sent=${sendCount}, recv=${recvCount}, inputPos=${inputPosition.toFixed(2)}s, playbackPos=${playbackPosition.toFixed(2)}s, drift=${drift.toFixed(2)}s`);
     }
 
     const point: DriftDataPoint = {
       elapsedMinutes: elapsedSec / 60,
-      rawDriftSeconds: rawDrift,
-      driftSeconds: accumulatingDrift,
+      driftSeconds: drift,
     };
 
     setDriftData((prev) => [...prev, point]);
 
     const allDrifts = [...driftDataRef.current, point];
     setStats({
-      currentDrift: accumulatingDrift,
+      currentDrift: drift,
       avgDrift:
         allDrifts.length > 0
           ? allDrifts.reduce((s, d) => s + d.driftSeconds, 0) / allDrifts.length
           : 0,
       maxDrift:
         allDrifts.length > 0
-          ? Math.max(...allDrifts.map((d) => Math.abs(d.driftSeconds)))
+          ? Math.max(...allDrifts.map((d) => d.driftSeconds))
           : 0,
       elapsedSec,
       chunksSent: sendCount,
@@ -138,7 +147,6 @@ export function TestDashboard() {
     console.log('[TestDashboard] handleStart called');
     setDriftData([]);
     driftDataRef.current = [];
-    initialDriftRef.current = null;
     testStartTimeRef.current = performance.now();
     lastReceiveChangeRef.current = performance.now();
     chunkLogCountRef.current = 0;
@@ -151,6 +159,11 @@ export function TestDashboard() {
     metrics.connect();
     metrics.clearEvents();
     trackerRef.current.startTest();
+
+    // Start both playback instances
+    inputPlaybackRef.current.start();
+    outputPlaybackRef.current.start();
+
     console.log('[TestDashboard] Calling ws.connect()...');
     wsRef.current.connect();
     setPhase('running');
@@ -192,6 +205,11 @@ export function TestDashboard() {
     console.log('[TestDashboard] finishTest called');
     wsRef.current.disconnect();
     metrics.disconnect();
+
+    // Stop both playback instances
+    inputPlaybackRef.current.stop();
+    outputPlaybackRef.current.stop();
+
     await fetch('/api/test/stop', { method: 'POST' });
     if (driftUpdateTimerRef.current) {
       clearInterval(driftUpdateTimerRef.current);
@@ -337,6 +355,32 @@ export function TestDashboard() {
             </p>
           )}
 
+          {/* Audio Monitor Toggles */}
+          {(phase === 'running' || phase === 'draining') && (
+            <div className="mt-4 flex gap-3">
+              <button
+                onClick={() => inputPlayback.setMuted(!inputPlayback.isMuted)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                  inputPlayback.isMuted
+                    ? 'border-gray-300 text-gray-500 bg-gray-50 hover:bg-gray-100'
+                    : 'border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100'
+                }`}
+              >
+                {inputPlayback.isMuted ? '\u{1F507}' : '\u{1F50A}'} Input Audio
+              </button>
+              <button
+                onClick={() => outputPlayback.setMuted(!outputPlayback.isMuted)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                  outputPlayback.isMuted
+                    ? 'border-gray-300 text-gray-500 bg-gray-50 hover:bg-gray-100'
+                    : 'border-green-300 text-green-700 bg-green-50 hover:bg-green-100'
+                }`}
+              >
+                {outputPlayback.isMuted ? '\u{1F507}' : '\u{1F50A}'} Output Audio
+              </button>
+            </div>
+          )}
+
           {/* Progress Bar */}
           {(phase === 'running' || phase === 'draining') && (
             <div className="mt-4">
@@ -382,8 +426,8 @@ export function TestDashboard() {
               <StatCard
                 label="Current Drift"
                 value={`${stats.currentDrift.toFixed(2)}s`}
-                warn={Math.abs(stats.currentDrift) > 20}
-                danger={Math.abs(stats.currentDrift) > 30}
+                warn={stats.currentDrift > 20}
+                danger={stats.currentDrift > 30}
               />
               <StatCard label="Avg Drift" value={`${stats.avgDrift.toFixed(2)}s`} />
               <StatCard

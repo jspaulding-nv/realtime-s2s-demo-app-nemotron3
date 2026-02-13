@@ -11,9 +11,9 @@ describe('DriftChart', () => {
 
   it('renders with sample drift data', () => {
     const data: DriftDataPoint[] = [
-      { elapsedMinutes: 0.5, rawDriftSeconds: 5.0, driftSeconds: 2.0 },
-      { elapsedMinutes: 1.0, rawDriftSeconds: 8.0, driftSeconds: 5.0 },
-      { elapsedMinutes: 1.5, rawDriftSeconds: 12.0, driftSeconds: 9.0 },
+      { elapsedMinutes: 0.5, driftSeconds: 2.0 },
+      { elapsedMinutes: 1.0, driftSeconds: 5.0 },
+      { elapsedMinutes: 1.5, driftSeconds: 9.0 },
     ];
 
     const { container } = render(<DriftChart data={data} />);
@@ -25,8 +25,8 @@ describe('DriftChart', () => {
 
   it('renders with large drift values (warning/danger thresholds)', () => {
     const data: DriftDataPoint[] = [
-      { elapsedMinutes: 0.5, rawDriftSeconds: 25.0, driftSeconds: 22.0 },
-      { elapsedMinutes: 1.0, rawDriftSeconds: 35.0, driftSeconds: 32.0 },
+      { elapsedMinutes: 0.5, driftSeconds: 22.0 },
+      { elapsedMinutes: 1.0, driftSeconds: 32.0 },
     ];
 
     // Should not crash with values above warning/danger thresholds

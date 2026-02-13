@@ -21,5 +21,4 @@ export interface BackendTimingEvent {
 export interface DriftDataPoint {
   elapsedMinutes: number;
   driftSeconds: number;
-  rawDriftSeconds: number;
 }

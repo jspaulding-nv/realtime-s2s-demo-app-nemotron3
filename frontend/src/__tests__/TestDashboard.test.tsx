@@ -1,8 +1,38 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { TestDashboard } from '../components/TestDashboard';
 
-// Mock all hooks so TestDashboard renders in isolation
+// --- Mocks ---
+
+const mockSetMuted = vi.fn();
+const mockGetPlaybackPosition = vi.fn(() => 0);
+const mockPlaybackStart = vi.fn();
+const mockPlaybackStop = vi.fn();
+const mockQueueAudio = vi.fn();
+
+// Track which instances were created (input first, output second)
+let playbackInstances: Array<{
+  isMuted: boolean;
+  setMuted: ReturnType<typeof vi.fn>;
+  getPlaybackPosition: ReturnType<typeof vi.fn>;
+}>;
+
+vi.mock('../hooks/useAudioPlayback', () => ({
+  useAudioPlayback: vi.fn((opts?: { initialMuted?: boolean }) => {
+    const instance = {
+      isPlaying: false,
+      isMuted: opts?.initialMuted ?? false,
+      queueAudio: mockQueueAudio,
+      start: mockPlaybackStart,
+      stop: mockPlaybackStop,
+      setMuted: mockSetMuted,
+      getPlaybackPosition: mockGetPlaybackPosition,
+    };
+    playbackInstances.push(instance);
+    return instance;
+  }),
+}));
+
 vi.mock('../hooks/useWebSocket', () => ({
   useWebSocket: vi.fn(() => ({
     isConnected: false,
@@ -65,7 +95,10 @@ vi.stubGlobal('fetch', mockFetch);
 describe('TestDashboard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    playbackInstances = [];
   });
+
+  // --- Existing tests ---
 
   it('renders the dashboard header', () => {
     render(<TestDashboard />);
@@ -124,5 +157,129 @@ describe('TestDashboard', () => {
     render(<TestDashboard />);
     const startBtn = screen.getByText('Start Test');
     expect(startBtn).not.toBeDisabled();
+  });
+
+  // --- Audio playback integration tests ---
+
+  it('creates two useAudioPlayback instances, both with initialMuted=true', async () => {
+    const { useAudioPlayback } = await import('../hooks/useAudioPlayback');
+    const mockHook = vi.mocked(useAudioPlayback);
+
+    render(<TestDashboard />);
+
+    // useAudioPlayback is called on every render; check at least 2 calls
+    // with the correct options (input and output both start muted)
+    const calls = mockHook.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+
+    // First call = inputPlayback, second = outputPlayback
+    expect(calls[0][0]).toEqual({ sampleRate: 16000, initialMuted: true });
+    expect(calls[1][0]).toEqual({ sampleRate: 16000, initialMuted: true });
+  });
+
+  it('does not show audio toggle buttons when idle', () => {
+    render(<TestDashboard />);
+    expect(screen.queryByText(/Input Audio/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Output Audio/)).not.toBeInTheDocument();
+  });
+
+  it('shows audio toggle buttons during running phase', async () => {
+    // Set up file as loaded so we can start
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+
+    // Click Start Test
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    expect(screen.getByText(/Input Audio/)).toBeInTheDocument();
+    expect(screen.getByText(/Output Audio/)).toBeInTheDocument();
+  });
+
+  it('clicking audio toggle buttons calls setMuted', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    // Click input audio toggle (currently muted, so should unmute -> setMuted(false))
+    mockSetMuted.mockClear();
+    fireEvent.click(screen.getByText(/Input Audio/));
+    expect(mockSetMuted).toHaveBeenCalledWith(false);
+
+    // Click output audio toggle
+    mockSetMuted.mockClear();
+    fireEvent.click(screen.getByText(/Output Audio/));
+    expect(mockSetMuted).toHaveBeenCalledWith(false);
+  });
+
+  it('starts both playback instances when test starts', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+
+    mockPlaybackStart.mockClear();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    // Both input and output playback should have start() called
+    expect(mockPlaybackStart).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows Stop Test button and stats during running phase', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    expect(screen.getByText('Stop Test')).toBeInTheDocument();
+    expect(screen.getByText('Statistics')).toBeInTheDocument();
+    expect(screen.getByTestId('drift-chart')).toBeInTheDocument();
   });
 });

@@ -2,23 +2,31 @@ import { useCallback, useRef, useState } from 'react';
 
 interface UseAudioPlaybackOptions {
   sampleRate?: number;
+  initialMuted?: boolean;
 }
 
 interface UseAudioPlaybackReturn {
   isPlaying: boolean;
+  isMuted: boolean;
   queueAudio: (audioData: ArrayBuffer) => void;
   start: () => void;
   stop: () => void;
+  setMuted: (muted: boolean) => void;
+  getPlaybackPosition: () => number;
 }
 
 export function useAudioPlayback({
   sampleRate = 16000,
+  initialMuted = false,
 }: UseAudioPlaybackOptions = {}): UseAudioPlaybackReturn {
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isMuted, setIsMutedState] = useState(initialMuted);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const isActiveRef = useRef<boolean>(false);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const playbackPositionRef = useRef(0);
 
   const start = useCallback(() => {
     console.log('AudioPlayback: starting');
@@ -32,15 +40,23 @@ export function useAudioPlayback({
       audioContextRef.current.resume();
     }
 
+    const gainNode = audioContextRef.current.createGain();
+    gainNode.gain.value = initialMuted ? 0 : 1;
+    gainNode.connect(audioContextRef.current.destination);
+    gainNodeRef.current = gainNode;
+
     nextStartTimeRef.current = audioContextRef.current.currentTime;
+    playbackPositionRef.current = 0;
     isActiveRef.current = true;
     setIsPlaying(true);
-  }, [sampleRate]);
+  }, [sampleRate, initialMuted]);
 
   const stop = useCallback(() => {
     console.log('AudioPlayback: stopping');
     isActiveRef.current = false;
     setIsPlaying(false);
+
+    gainNodeRef.current = null;
 
     if (audioContextRef.current) {
       audioContextRef.current.close();
@@ -79,10 +95,21 @@ export function useAudioPlayback({
       const audioBuffer = ctx.createBuffer(1, float32Array.length, sampleRate);
       audioBuffer.getChannelData(0).set(float32Array);
 
-      // Create buffer source
+      // Create buffer source and route through gain node
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(ctx.destination);
+
+      if (gainNodeRef.current) {
+        source.connect(gainNodeRef.current);
+      } else {
+        source.connect(ctx.destination);
+      }
+
+      // Track playback position via onended
+      const bufferDuration = audioBuffer.duration;
+      source.onended = () => {
+        playbackPositionRef.current += bufferDuration;
+      };
 
       // Schedule playback
       const currentTime = ctx.currentTime;
@@ -95,10 +122,22 @@ export function useAudioPlayback({
     [sampleRate]
   );
 
+  const setMuted = useCallback((muted: boolean) => {
+    setIsMutedState(muted);
+    if (gainNodeRef.current) {
+      gainNodeRef.current.gain.value = muted ? 0 : 1;
+    }
+  }, []);
+
+  const getPlaybackPosition = useCallback(() => playbackPositionRef.current, []);
+
   return {
     isPlaying,
+    isMuted,
     queueAudio,
     start,
     stop,
+    setMuted,
+    getPlaybackPosition,
   };
 }
