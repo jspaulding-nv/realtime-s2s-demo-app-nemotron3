@@ -158,32 +158,50 @@ class RivaS2SClient:
             raise RuntimeError("Not connected to Riva")
 
         chunk_iterator = AudioChunkIterator()
-        s2s_config = self.create_s2s_config(target_language)
 
         def run_translation():
-            """Run the blocking Riva translation in a thread."""
+            """Run the blocking Riva translation in a thread with auto-restart."""
             print("[Riva] Starting translation thread")
-            response_count = 0
-            try:
-                responses = self._nmt_client.streaming_s2s_response_generator(
-                    audio_chunks=chunk_iterator,
-                    streaming_config=s2s_config
-                )
+            total_responses = 0
+            restart_count = 0
 
-                for response in responses:
-                    response_count += 1
-                    if response.speech and response.speech.audio:
-                        audio_len = len(response.speech.audio)
-                        print(f"[Riva] Response {response_count}: got {audio_len} bytes of audio")
-                        on_audio(response.speech.audio)
+            while not chunk_iterator._stopped:
+                try:
+                    # Create fresh config for each stream session
+                    config = self.create_s2s_config(target_language)
+                    responses = self._nmt_client.streaming_s2s_response_generator(
+                        audio_chunks=chunk_iterator,
+                        streaming_config=config,
+                    )
+
+                    for response in responses:
+                        total_responses += 1
+                        if response.speech and response.speech.audio:
+                            audio_len = len(response.speech.audio)
+                            print(f"[Riva] Response {total_responses}: got {audio_len} bytes of audio")
+                            on_audio(response.speech.audio)
+                        else:
+                            print(f"[Riva] Response {total_responses}: no audio")
+
+                    # for-loop ended normally = ASR endpointing closed the stream
+                    if not chunk_iterator._stopped:
+                        restart_count += 1
+                        print(f"[Riva] ASR endpointing — restarting stream (#{restart_count})")
+                        continue
                     else:
-                        print(f"[Riva] Response {response_count}: no audio")
+                        print(f"[Riva] Stream stopped normally, {total_responses} total responses")
+                        break
 
-                print(f"[Riva] Translation stream ended, {response_count} responses")
+                except Exception as e:
+                    if chunk_iterator._stopped:
+                        print(f"[Riva] Stream ended: {e}")
+                        break
+                    restart_count += 1
+                    print(f"[Riva] Error (restarting #{restart_count}): {e}")
+                    continue
 
-            except Exception as e:
-                print(f"[Riva] Translation error: {e}")
-                on_error(f"Translation error: {str(e)}")
+            print(f"[Riva] Translation thread exiting. "
+                  f"{total_responses} responses, {restart_count} restarts")
 
         # Run translation in background thread
         self._executor.submit(run_translation)
