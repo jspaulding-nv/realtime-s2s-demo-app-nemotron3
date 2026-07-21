@@ -1,6 +1,22 @@
-# Real-Time Speech-to-Speech Translation Web Demo
+# Real-Time Speech-to-Speech Translation with Nemotron 3
 
 A web-based real-time speech translation application using NVIDIA Riva services. Captures English audio from your microphone, translates it, and plays back synthesized speech in the target language.
+
+This repository preserves [@jgough-essextec's original demo](https://github.com/jgough-essextec/realtime-s2s-demo-app) and adds the Riva evaluation configuration for English-to-Spanish long-form speech. It uses Nemotron 3 streaming ASR in place of Parakeet CTC, pins all three NIM releases, and adds listener-tail measurements for sample-length tests.
+
+GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains @jgough-essextec's full Git history as a standalone repository and records his project as the upstream source.
+
+## What Changed
+
+- Nemotron ASR Streaming `1.2.0` with the English `batch_size=32` profile
+- Riva Translate 1.6B `1.5.2` and Magpie multilingual TTS `1.7.0`
+- Automatic ASR punctuation and an 800 ms final end-of-utterance window
+- Environment-based Riva configuration instead of a hardcoded server address
+- An `end_input` control message so the test harness can drain final translated audio
+- First-audio latency, output/input duration ratio, service tail, and simulated listener playback-tail metrics
+- Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
+
+The current monolithic Riva S2S endpoint does not expose separate ASR, NMT, and TTS stage queues. Explicit punctuation-boundary splitting and bounded NMT/TTS parallelism are therefore future client-orchestration work, not claims made by this version.
 
 ## Architecture
 
@@ -25,7 +41,10 @@ A web-based real-time speech translation application using NVIDIA Riva services.
 ## Project Structure
 
 ```
-s2s-streaming/
+realtime-s2s-demo-app/
+├── docker-compose.yaml     # Pinned Nemotron ASR, NMT, and TTS services
+├── .env.example            # Compose and application configuration template
+├── NEMOTRON_TEST_RESULTS.md
 ├── backend/
 │   ├── main.py              # FastAPI app + WebSocket endpoint
 │   ├── config.py            # Settings (Riva URI, audio params, languages)
@@ -61,14 +80,58 @@ s2s-streaming/
 
 - Python 3.9+
 - Node.js 18+
-- NVIDIA Riva server running with:
-  - ASR (Automatic Speech Recognition) for English
-  - NMT (Neural Machine Translation) model
-  - TTS (Text-to-Speech) voices for target languages
+- Docker with NVIDIA Container Toolkit and a visible CDI GPU device
+- An NGC Personal Key with access to the NGC Catalog
+- An NVIDIA GPU with enough memory for all three selected profiles
+
+The selected profiles allocate approximately 26.4 GB of GPU memory in total: 6 GB for ASR, 9.5 GB for NMT, and 10.87 GB for TTS. They fit comfortably on the tested 96 GB RTX PRO 6000 Blackwell Server Edition and should fit a 48 GB RTX 6000 Ada, though peak usage should be checked during an end-to-end stream.
 
 ## Quick Start
 
-### 1. Start Both Servers
+### 1. Configure NGC and the application
+
+```bash
+cp .env.example .env
+mkdir -p .cache/nim
+chmod 777 .cache/nim
+```
+
+Add an active NGC Personal Key to `.env`. Docker Compose reads that file automatically, but `docker login` runs in the shell, so export the values before authenticating:
+
+```bash
+set -a
+source .env
+set +a
+
+printf '%s' "$NGC_API_KEY" | \
+  docker login nvcr.io --username '$oauthtoken' --password-stdin
+```
+
+Never commit `.env`. If login returns `unauthorized`, confirm the key is active, unexpired, and includes the NGC Catalog service.
+
+### 2. Start the pinned Riva services
+
+```bash
+nvidia-ctk cdi list
+docker compose pull
+docker compose up -d
+docker compose ps
+```
+
+Initial model downloads and TensorRT engine generation can take 30 minutes or more. The NMT container starts after ASR and TTS report healthy.
+
+Verify readiness:
+
+```bash
+curl --fail http://localhost:9002/v1/health/ready  # ASR
+curl --fail http://localhost:9001/v1/health/ready  # NMT
+curl --fail http://localhost:9003/v1/health/ready  # TTS
+nvidia-smi
+```
+
+The application connects to the NMT/S2S gRPC endpoint at `localhost:50051`. ASR and TTS are also exposed at `localhost:50052` and `localhost:50053` for direct tests.
+
+### 3. Start the web application
 
 ```bash
 ./start.sh
@@ -80,11 +143,11 @@ This will:
 - Start the backend on http://localhost:8000
 - Start the frontend on http://localhost:5173
 
-### 2. Open the Web UI
+### 4. Open the Web UI
 
 Navigate to http://localhost:5173 in your browser.
 
-### 3. Use the Application
+### 5. Use the Application
 
 1. Click the microphone button to start
 2. Speak English into your microphone
@@ -98,6 +161,10 @@ Navigate to http://localhost:5173 in your browser.
 ### Backend
 
 ```bash
+set -a
+source .env
+set +a
+
 cd backend
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -117,14 +184,14 @@ npm run dev
 
 ### Riva Server
 
-Edit `backend/config.py` to configure your Riva server:
+Copy `.env.example` to `.env` and set these values when the defaults do not match your deployment:
 
-```python
-@dataclass
-class RivaConfig:
-    uri: str = "riva-host:50051"  # Your Riva server address
-    model: str = "megatronnmt_any_any_1b"
-    source_language: str = "en-US"
+```dotenv
+RIVA_URI=localhost:50051
+RIVA_NMT_MODEL=megatronnmt_any_any_1b
+RIVA_SOURCE_LANGUAGE=en-US
+RIVA_EOU_MS=800
+RIVA_VERBOSE_CHUNKS=0
 ```
 
 ### Adding Languages
@@ -179,9 +246,12 @@ class AudioConfig:
 Client → Server:
 ```json
 {"type": "start_stream", "targetLanguage": "es-US"}
+{"type": "end_input"}
 {"type": "stop_stream"}
 {"type": "ping"}
 ```
+
+`end_input` closes the request-audio iterator while leaving the WebSocket open so final translated audio can drain. `stop_stream` ends the session after that drain.
 Plus binary audio frames (Int16 PCM)
 
 Server → Client:
@@ -210,6 +280,21 @@ python realtime_s2s.py --test 5
 python realtime_s2s.py --translate 5
 ```
 
+## Long-Form Latency Test
+
+With the Riva services and backend running, execute a one-minute preflight before a sample file:
+
+```bash
+python batch_latency_test.py --preflight
+python batch_latency_test.py \
+  --file test_audio/long-form-01.mp3 \
+  --output-dir test_results_nemotron
+```
+
+Generated event CSVs and plots stay ignored because they are large. Compact summaries from the July 8, 2026 runs are versioned under `docs/results/nemotron3/`; interpretation and comparison with @jgough-essextec's earlier runs are in `NEMOTRON_TEST_RESULTS.md`.
+
+For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so the next architecture should cap the playback queue at roughly 5-10 seconds and evaluate adaptive playback/prosody speeds around 1.05x-1.10x.
+
 ## Troubleshooting
 
 ### No audio output
@@ -224,6 +309,14 @@ python realtime_s2s.py --translate 5
 ### Translation not working for a language
 - The TTS voice for that language may not be installed on your Riva server
 - Check `backend/config.py` for correct voice names
+
+### Stop the Riva services
+
+```bash
+docker compose down
+```
+
+The model cache remains under `.cache/nim`. Avoid `docker compose down --rmi all` unless removing the local images is intentional.
 
 ## Technology Stack
 

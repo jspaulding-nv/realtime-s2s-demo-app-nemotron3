@@ -1,6 +1,7 @@
 """Riva S2S client wrapper adapted from realtime_s2s.py."""
 
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from typing import Optional, Callable
@@ -10,6 +11,9 @@ import riva.client.proto.riva_asr_pb2 as riva_asr_pb2
 import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
 from config import audio_config, riva_config, SUPPORTED_LANGUAGES
+
+
+VERBOSE_CHUNKS = os.getenv("RIVA_VERBOSE_CHUNKS", "0") == "1"
 
 
 class AudioChunkIterator:
@@ -24,7 +28,8 @@ class AudioChunkIterator:
         """Add an audio chunk to be processed."""
         if not self._stopped:
             self._chunk_count += 1
-            print(f"[Riva] Audio chunk {self._chunk_count} added, {len(chunk)} bytes")
+            if VERBOSE_CHUNKS:
+                print(f"[Riva] Audio chunk {self._chunk_count} added, {len(chunk)} bytes")
             self._queue.put(chunk)
 
     def stop(self) -> None:
@@ -94,16 +99,15 @@ class RivaS2SClient:
 
         print(f"[Riva] Creating config: {riva_config.source_language} -> {target_language}, voice: {voice_name}")
 
-        # Endpointing config — reduce stalls by detecting silence faster
-        # Default server config waits too long for sentence boundaries,
-        # causing 15-35s stalls in continuous speech (e.g., samples).
+        # Nemotron streaming final EOU configuration. The Riva team's measured
+        # starting point is an 800 ms finalization window. Do not set the
+        # two-pass stop_history_eou fields here: NVIDIA documents those as
+        # supported only by Parakeet/Conformer CTC models, not Nemotron RNNT.
         endpointing_config = riva_asr_pb2.EndpointingConfig(
-            start_history=100,       # 100ms — very fast speech start detection
-            start_threshold=0.3,     # 30% non-blank frames triggers start
-            stop_history=300,        # 300ms silence triggers final result
-            stop_threshold=0.5,      # 50% blank frames triggers end
-            stop_history_eou=200,    # 200ms early end-of-utterance
-            stop_threshold_eou=0.6,  # 60% blank for early EOU
+            start_history=300,
+            start_threshold=0.2,
+            stop_history=riva_config.endpointing_history_ms,
+            stop_threshold=0.98,
         )
 
         # ASR config for speech recognition
@@ -178,9 +182,10 @@ class RivaS2SClient:
                         total_responses += 1
                         if response.speech and response.speech.audio:
                             audio_len = len(response.speech.audio)
-                            print(f"[Riva] Response {total_responses}: got {audio_len} bytes of audio")
+                            if VERBOSE_CHUNKS:
+                                print(f"[Riva] Response {total_responses}: got {audio_len} bytes of audio")
                             on_audio(response.speech.audio)
-                        else:
+                        elif VERBOSE_CHUNKS:
                             print(f"[Riva] Response {total_responses}: no audio")
 
                     # for-loop ended normally = ASR endpointing closed the stream

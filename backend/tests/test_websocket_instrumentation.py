@@ -64,3 +64,19 @@ async def test_no_logging_when_not_listening(mock_rms, mock_tl, session):
     await session.process_audio(audio)
     mock_tl.log_audio_received.assert_not_called()
     mock_tl.log_audio_to_riva.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finish_input_stops_input_and_keeps_websocket_open(session):
+    iterator = session.chunk_iterator
+
+    await session.finish_input()
+
+    iterator.stop.assert_called_once_with()
+    assert session.chunk_iterator is iterator
+    assert session.status == SessionStatus.PROCESSING
+    session.websocket.send_json.assert_awaited_once_with({
+        "type": "status",
+        "status": "processing",
+        "message": "Input complete; draining translated audio",
+    })

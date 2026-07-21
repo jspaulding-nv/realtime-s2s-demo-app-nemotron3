@@ -1,6 +1,7 @@
 """WebSocket session management for translation streams."""
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -10,6 +11,9 @@ from starlette.websockets import WebSocketState
 from riva_client import riva_client, AudioChunkIterator
 from audio_processor import float32_to_int16, calculate_rms
 from timing_logger import timing_logger
+
+
+VERBOSE_CHUNKS = os.getenv("RIVA_VERBOSE_CHUNKS", "0") == "1"
 
 
 class SessionStatus(str, Enum):
@@ -69,7 +73,8 @@ class TranslationSession:
         """Send translated audio to client."""
         if self._is_websocket_open():
             try:
-                print(f"[WS] Sending {len(audio_data)} bytes of audio to client")
+                if VERBOSE_CHUNKS:
+                    print(f"[WS] Sending {len(audio_data)} bytes of audio to client")
                 await self.websocket.send_bytes(audio_data)
             except Exception as e:
                 print(f"[WS] Failed to send audio: {e}")
@@ -136,6 +141,21 @@ class TranslationSession:
                 self.chunk_iterator = None
             await self.send_status(SessionStatus.STOPPED, "Stream stopped")
 
+    async def finish_input(self) -> None:
+        """Close the Riva request stream while keeping the WebSocket open.
+
+        Riva can then flush the final ASR/NMT/TTS responses back to the client,
+        which is required to measure true tail lag for file-based tests.
+        """
+        async with self._lock:
+            print(f"[WS] finish_input called, current_status={self.status}")
+            if self.chunk_iterator:
+                self.chunk_iterator.stop()
+            await self.send_status(
+                SessionStatus.PROCESSING,
+                "Input complete; draining translated audio",
+            )
+
     def close(self) -> None:
         """Close the session without sending messages (for cleanup)."""
         self._closed = True
@@ -151,7 +171,8 @@ class TranslationSession:
 
         # Audio is already Int16 from the browser (converted in AudioWorklet)
         # Just pass it through to Riva
-        print(f"[WS] Received {len(audio_bytes)} bytes (Int16) from client")
+        if VERBOSE_CHUNKS:
+            print(f"[WS] Received {len(audio_bytes)} bytes (Int16) from client")
 
         # Timing instrumentation
         chunk_idx = timing_logger.log_audio_received(len(audio_bytes))

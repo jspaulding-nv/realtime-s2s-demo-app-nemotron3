@@ -8,6 +8,8 @@ venv/
 env/
 ENV/
 .venv/
+.python-packages/
+.cache/
 *.egg-info/
 dist/
 build/
@@ -47,6 +49,7 @@ logs/
 .coverage
 htmlcov/
 .pytest_cache/
+test_results_nemotron/
 
 # Temporary files
 *.tmp

@@ -6,7 +6,7 @@ Streams audio files through the backend WebSocket, measures translation
 drift, and generates per-file latency plots and CSV exports.
 
 Prerequisites:
-  1. Riva gRPC services running at riva-host:50051
+  1. Riva gRPC services running at the backend's configured RIVA_URI
   2. Backend: cd backend && uvicorn main:app --host 0.0.0.0 --port 8000
 
 Usage:
@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import csv
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -41,7 +42,9 @@ BYTES_PER_SAMPLE = 2
 CHUNK_SAMPLES = 4800
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE  # 9600
 CHUNK_DURATION = CHUNK_SAMPLES / SAMPLE_RATE      # 0.3 s
-DRAIN_SECONDS = 30
+DRAIN_MIN_SECONDS = 10
+DRAIN_IDLE_SECONDS = 5
+DRAIN_MAX_SECONDS = 300
 TARGET_LANGUAGE = "es-US"
 
 TEST_FILES = [
@@ -84,6 +87,13 @@ class TestResult:
     avg_drift: float = 0.0
     max_drift: float = 0.0
     final_drift: float = 0.0
+    output_duration_sec: float = 0.0
+    tts_expansion_ratio: float = 0.0
+    tail_lag_sec: float = 0.0
+    first_audio_latency_sec: float = 0.0
+    duration_excess_sec: float = 0.0
+    playback_tail_sec: float = 0.0
+    post_input_responses: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +101,18 @@ class TestResult:
 # ---------------------------------------------------------------------------
 def decode_audio(path: str) -> np.ndarray:
     """Decode any audio file to 16 kHz mono Int16 PCM via ffmpeg."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError as exc:
+            raise RuntimeError(
+                "ffmpeg is not installed; install imageio-ffmpeg in the venv"
+            ) from exc
+
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        ffmpeg, "-hide_banner", "-loglevel", "error",
         "-i", path,
         "-ar", str(SAMPLE_RATE),
         "-ac", "1",
@@ -179,6 +199,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         chunks_sent = 0
         audio_responses = 0
         total_recv_bytes = 0
+        last_audio_time = time.monotonic()
         send_done = asyncio.Event()
         connection_lost = False
         last_print_time = 0.0
@@ -261,7 +282,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
 
         # -- Receive task ---------------------------------------------------
         async def receive_audio():
-            nonlocal audio_responses, total_recv_bytes, connection_lost
+            nonlocal audio_responses, total_recv_bytes, connection_lost, last_audio_time
             recv_idx = 0
             try:
                 while True:
@@ -270,6 +291,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                         recv_ts = time.time()
                         audio_responses += 1
                         total_recv_bytes += len(raw)
+                        last_audio_time = time.monotonic()
                         result.client_events.append(TimingEvent(
                             source="client",
                             stage="audio_received",
@@ -302,18 +324,27 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         if connection_lost:
             print("(connection lost — saving partial results)")
         else:
-            # Drain remaining audio
-            print(f"Draining remaining audio ({DRAIN_SECONDS}s)...",
-                  flush=True)
+            # Close only the input side so Riva can flush final ASR/NMT/TTS
+            # responses while this client keeps receiving translated audio.
+            responses_at_input_end = audio_responses
+            input_end_time = time.monotonic()
+            await ws.send(json.dumps({"type": "end_input"}))
+
+            print(
+                f"Draining translated tail (min {DRAIN_MIN_SECONDS}s, "
+                f"until {DRAIN_IDLE_SECONDS}s idle, max {DRAIN_MAX_SECONDS}s)...",
+                flush=True,
+            )
             drain_start = time.monotonic()
-            while time.monotonic() - drain_start < DRAIN_SECONDS:
+            while time.monotonic() - drain_start < DRAIN_MAX_SECONDS:
                 if connection_lost:
                     print("\n(connection lost during drain)")
                     break
                 elapsed = time.monotonic() - drain_start
+                idle = time.monotonic() - last_audio_time
                 drift = current_drift()
                 print(
-                    f"\rDraining: {elapsed:.0f}/{DRAIN_SECONDS}s"
+                    f"\rDraining: {elapsed:.0f}s | idle: {idle:.0f}s"
                     f" | Recv: {audio_responses} | Drift: {drift:.1f}s   ",
                     end="", flush=True,
                 )
@@ -321,8 +352,13 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                     elapsed_sec=time.monotonic() - test_start_time,
                     drift_sec=drift,
                 ))
+                if elapsed >= DRAIN_MIN_SECONDS and idle >= DRAIN_IDLE_SECONDS:
+                    break
                 await asyncio.sleep(1.0)
             print()
+
+            result.tail_lag_sec = max(0.0, last_audio_time - input_end_time)
+            result.post_input_responses = audio_responses - responses_at_input_end
 
             # Stop stream
             try:
@@ -364,12 +400,38 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     result.chunks_sent = chunks_sent
     result.audio_responses = audio_responses
     result.total_received_bytes = total_recv_bytes
+    result.output_duration_sec = total_recv_bytes / (
+        SAMPLE_RATE * BYTES_PER_SAMPLE
+    )
+    result.duration_excess_sec = max(
+        0.0, result.output_duration_sec - duration_sec
+    )
+    if duration_sec:
+        result.tts_expansion_ratio = result.output_duration_sec / duration_sec
 
     if result.drift_samples:
         drifts = [s.drift_sec for s in result.drift_samples]
         result.avg_drift = sum(drifts) / len(drifts)
         result.max_drift = max(drifts)
         result.final_drift = drifts[-1]
+
+    # Simulate the browser's gapless playback queue using actual arrival
+    # timestamps. This captures initial latency and delivery gaps as well as
+    # output-duration expansion, yielding the listener-visible tail.
+    playback_end_sec = 0.0
+    input_end_sec = 0.0
+    for event in sorted(result.client_events, key=lambda e: e.timestamp_ms):
+        event_time_sec = event.timestamp_ms / 1000
+        if event.stage == "chunk_sent":
+            input_end_sec = max(input_end_sec, event_time_sec)
+        elif event.stage == "audio_received":
+            if result.first_audio_latency_sec == 0.0:
+                result.first_audio_latency_sec = event_time_sec
+            playback_end_sec = max(playback_end_sec, event_time_sec)
+            playback_end_sec += event.audio_bytes / (
+                SAMPLE_RATE * BYTES_PER_SAMPLE
+            )
+    result.playback_tail_sec = max(0.0, playback_end_sec - input_end_sec)
 
     return result
 
@@ -421,6 +483,33 @@ def generate_csv(result: TestResult, output_path: str):
     print(f"Saved: {output_path}")
 
 
+def generate_summary(result: TestResult, output_path: str):
+    """Write compact metrics separately from the event-level CSV."""
+    summary = {
+        "audio_path": result.audio_path,
+        "input_duration_sec": result.duration_sec,
+        "chunks_sent": result.chunks_sent,
+        "audio_responses": result.audio_responses,
+        "total_received_bytes": result.total_received_bytes,
+        "output_duration_sec": result.output_duration_sec,
+        # This is a whole-file output/input proxy. Source silence is included
+        # in the denominator, so it is not a speech-only prosody measurement.
+        "output_to_input_duration_ratio": result.tts_expansion_ratio,
+        "average_drift_sec": result.avg_drift,
+        "max_drift_sec": result.max_drift,
+        "final_drift_sec": result.final_drift,
+        "tail_lag_sec": result.tail_lag_sec,
+        "first_audio_latency_sec": result.first_audio_latency_sec,
+        "duration_excess_sec": result.duration_excess_sec,
+        "playback_tail_sec": result.playback_tail_sec,
+        "post_input_responses": result.post_input_responses,
+    }
+    with open(output_path, "w") as f:
+        json.dump(summary, f, indent=2)
+        f.write("\n")
+    print(f"Saved: {output_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
@@ -454,18 +543,21 @@ async def run_preflight(backend_url: str) -> bool:
         print(
             f"\nPre-flight FAILED: No audio responses received."
             f" Sent {result.chunks_sent} chunks but got 0 translated audio back."
-            f"\nCheck that Riva services are running at riva-host:50051."
+            f"\nCheck that Riva services are running at the configured RIVA_URI."
         )
         return False
 
     print(
         f"Pre-flight PASSED: Received {result.audio_responses} audio responses, "
-        f"avg drift {result.avg_drift:.1f}s"
+        f"avg drift {result.avg_drift:.1f}s, "
+        f"output {result.output_duration_sec:.1f}s "
+        f"({result.tts_expansion_ratio:.3f}x), "
+        f"tail lag {result.tail_lag_sec:.1f}s"
     )
     return True
 
 
-async def run_batch(files: list[str], backend_url: str):
+async def run_batch(files: list[str], backend_url: str, output_dir: str):
     """Run tests on a list of audio files sequentially."""
     total = len(files)
     for i, fpath in enumerate(files, 1):
@@ -483,17 +575,27 @@ async def run_batch(files: list[str], backend_url: str):
 
         # Generate outputs
         stem = Path(fpath).stem
-        parent = Path(fpath).parent
+        parent = Path(output_dir)
+        parent.mkdir(parents=True, exist_ok=True)
         plot_path = str(parent / f"{stem}_latency.png")
         csv_path = str(parent / f"{stem}_results.csv")
+        summary_path = str(parent / f"{stem}_summary.json")
 
         generate_plot(result, plot_path)
         generate_csv(result, csv_path)
+        generate_summary(result, summary_path)
 
         print(
             f"Summary: avg_drift={result.avg_drift:.1f}s, "
             f"max_drift={result.max_drift:.1f}s, "
-            f"final_drift={result.final_drift:.1f}s"
+            f"final_drift={result.final_drift:.1f}s, "
+            f"output={result.output_duration_sec:.1f}s, "
+            f"expansion={result.tts_expansion_ratio:.3f}x, "
+            f"tail_lag={result.tail_lag_sec:.1f}s, "
+            f"first_audio={result.first_audio_latency_sec:.1f}s, "
+            f"duration_excess={result.duration_excess_sec:.1f}s, "
+            f"playback_tail={result.playback_tail_sec:.1f}s, "
+            f"post_input_responses={result.post_input_responses}"
         )
 
 
@@ -513,6 +615,10 @@ def main():
         "--backend", type=str, default="http://localhost:8000",
         help="Backend URL (default: http://localhost:8000)",
     )
+    parser.add_argument(
+        "--output-dir", type=str, default="test_results_nemotron",
+        help="Directory for new CSV and plot outputs",
+    )
     args = parser.parse_args()
 
     if not check_backend(args.backend):
@@ -523,9 +629,9 @@ def main():
         sys.exit(0 if ok else 1)
 
     if args.file:
-        asyncio.run(run_batch([args.file], args.backend))
+        asyncio.run(run_batch([args.file], args.backend, args.output_dir))
     else:
-        asyncio.run(run_batch(TEST_FILES, args.backend))
+        asyncio.run(run_batch(TEST_FILES, args.backend, args.output_dir))
 
 
 if __name__ == "__main__":
