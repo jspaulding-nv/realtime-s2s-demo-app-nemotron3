@@ -1,5 +1,6 @@
 """Configuration settings for the speech-to-speech translation backend."""
 
+import os
 from dataclasses import dataclass
 from typing import Dict
 
@@ -16,9 +17,10 @@ class AudioConfig:
 @dataclass
 class RivaConfig:
     """Riva service configuration."""
-    uri: str = "10.1.90.249:50051"
-    model: str = "megatronnmt_any_any_1b"
-    source_language: str = "en-US"
+    uri: str = os.getenv("RIVA_URI", "localhost:50051")
+    model: str = os.getenv("RIVA_NMT_MODEL", "megatronnmt_any_any_1b")
+    source_language: str = os.getenv("RIVA_SOURCE_LANGUAGE", "en-US")
+    endpointing_history_ms: int = int(os.getenv("RIVA_EOU_MS", "800"))
 
 
 # Supported target languages with their TTS voice names

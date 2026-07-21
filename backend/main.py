@@ -175,6 +175,9 @@ async def handle_control_message(session, data: dict) -> None:
     elif msg_type == "stop_stream":
         await session.stop_stream()
 
+    elif msg_type == "end_input":
+        await session.finish_input()
+
     elif msg_type == "ping":
         await session.websocket.send_json({"type": "pong"})
 

@@ -1,0 +1,17 @@
+{
+  "audio_path": "test_audio/200108_SpiritandPresenceofGod.mp3",
+  "input_duration_sec": 1908.432,
+  "chunks_sent": 6362,
+  "audio_responses": 14178,
+  "total_received_bytes": 64509498,
+  "output_duration_sec": 2015.9218125,
+  "output_to_input_duration_ratio": 1.0563236271976155,
+  "average_drift_sec": -23.06058731273408,
+  "max_drift_sec": 65.39131249999997,
+  "final_drift_sec": -107.32181250000008,
+  "tail_lag_sec": 0.0,
+  "first_audio_latency_sec": 16.098,
+  "duration_excess_sec": 107.48981249999993,
+  "playback_tail_sec": 172.77,
+  "post_input_responses": 0
+}

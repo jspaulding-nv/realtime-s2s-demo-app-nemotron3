@@ -1,0 +1,17 @@
+{
+  "audio_path": "test_audio/Blessed_Self-Forgetfulness.mp3",
+  "input_duration_sec": 2427.010625,
+  "chunks_sent": 8091,
+  "audio_responses": 18584,
+  "total_received_bytes": 83974298,
+  "output_duration_sec": 2624.1968125,
+  "output_to_input_duration_ratio": 1.0812465283294752,
+  "average_drift_sec": -71.33113848942968,
+  "max_drift_sec": 31.32531249999994,
+  "final_drift_sec": -196.89681250000012,
+  "tail_lag_sec": 0.4325280430202838,
+  "first_audio_latency_sec": 2.335,
+  "duration_excess_sec": 197.18618749999996,
+  "playback_tail_sec": 228.782,
+  "post_input_responses": 4
+}

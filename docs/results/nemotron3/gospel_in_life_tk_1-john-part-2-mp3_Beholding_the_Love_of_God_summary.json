@@ -1,0 +1,17 @@
+{
+  "audio_path": "test_audio/gospel_in_life_tk_1-john-part-2-mp3_Beholding_the_Love_of_God.mp3",
+  "input_duration_sec": 1888.1045,
+  "chunks_sent": 6294,
+  "audio_responses": 13229,
+  "total_received_bytes": 61424454,
+  "output_duration_sec": 1919.5141875,
+  "output_to_input_duration_ratio": 1.016635566251762,
+  "average_drift_sec": -8.850557255520524,
+  "max_drift_sec": 39.00468749999999,
+  "final_drift_sec": -31.314187500000116,
+  "tail_lag_sec": 0.801192462007748,
+  "first_audio_latency_sec": 4.665,
+  "duration_excess_sec": 31.409687500000018,
+  "playback_tail_sec": 70.598,
+  "post_input_responses": 26
+}
