@@ -174,7 +174,8 @@ python direct_asr_bridge_smoke.py \
 `--event-timeout-seconds` is terminal grace, not a per-event timer. The command
 must reach `COMPLETE` or `ERROR` within the expected real-time send duration
 plus that grace (30 seconds by default); recurring interims cannot extend the
-deadline. Cleanup has a separate 12-second outer bound.
+deadline. Producer stop is allowed up to one second; the subsequent
+`client.aclose()` operation has a separate 12-second outer bound.
 
 The observed 20-second real-time run with
 `open_stream(event_queue_maxsize=4)` produced 59 `INTERIM`, 5 `FINAL`, exactly
