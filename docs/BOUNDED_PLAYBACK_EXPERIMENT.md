@@ -117,7 +117,7 @@ npm run lint
 cd ..
 ```
 
-At the documentation snapshot, 53 combined Python backend/analysis tests and
+At the documentation snapshot, 70 combined Python backend/analysis/harness tests and
 81 frontend tests passed, and the frontend production build and lint both
 passed.
 
@@ -126,7 +126,7 @@ passed.
 Before a new live run, the saved July 8 arrival traces were replayed through a
 deterministic implementation of the browser policy:
 
-| Saved trace | Simulated adaptive tail | Queue p95 | Peak queue | Playback time over 10 s |
+| Saved trace | Simulated adaptive tail | Arrival-sampled queue p95 | Peak queue | Playback time over 10 s |
 |---|---:|---:|---:|---:|
 | Sample 01 | 27.183 s | 38.31 s | 46.54 s | 80.0% |
 | Sample 02 | 40.206 s | 44.95 s | 53.11 s | 77.3% |
@@ -159,23 +159,26 @@ python -m pytest \
 The generated report is
 [`results/nemotron3/playback_policy_analysis.md`](results/nemotron3/playback_policy_analysis.md).
 
-## Experimental matrix
+## Automated three-sample matched-trace run
 
-Run at least these two conditions:
+Install the root experiment dependencies before the first run:
 
-| Condition | Browser policy | Purpose |
-|---|---|---|
-| Control | Fixed 1.00x | Reproduce listener backlog without catch-up |
-| Adaptive | 1.00x / 1.05x / 1.10x at 5/8 seconds | Measure backlog reduction and quality tradeoff |
+```bash
+pip install -r requirements.txt
+```
 
-`useAudioPlayback` defaults to fixed mode, while translated output in the live
-panel opts into adaptive mode. The test dashboard exposes an **Adaptive
-Spanish playback** checkbox before a run starts. Leave it selected for the
-adaptive condition and clear it for the fixed 1.00x control. The CSV's
-`playback_session_started` event records the selection, so both conditions can
-use the same commit.
+This installs the pinned long-form runner dependencies, including
+`websockets==15.0.1`, `matplotlib==3.10.9`, and `imageio-ffmpeg==0.6.0`.
 
-Run all three sample files:
+Start the pinned containers and FastAPI backend separately, verify that they
+are ready, and run the full experiment from the repository root:
+
+```bash
+python run_long_form_experiment.py
+```
+
+This one command performs health checks and the one-minute preflight, then
+streams all three sample files at real-time pace:
 
 ```text
 test_audio/long-form-01.mp3
@@ -183,45 +186,144 @@ test_audio/long-form-02.mp3
 test_audio/long-form-03.mp3
 ```
 
-Use at least three repeats per file and condition. Randomize or alternate the
-condition order to reduce warm-cache and thermal bias. Before the first
-long-form run, validate the service path with:
+Inspect the complete plan without contacting the backend, collect three live
+traces per sample, or continue an interrupted output directory with:
 
 ```bash
-python batch_latency_test.py --preflight
+python run_long_form_experiment.py --dry-run
+python run_long_form_experiment.py --repeats 3
+python run_long_form_experiment.py --resume-dir experiment_results/<run-id>
 ```
 
-The batch CLI is useful for service timing and historical fixed-rate playback
-tails. The adaptive controller executes in the browser, so use the test
-dashboard and its CSV export for the live adaptive condition unless an offline
-simulator has been separately validated against browser scheduling.
+`--dry-run` prints the resolved run directory, backend, preflight setting,
+repeat count, files, and order without contacting the backend or Riva and
+without creating a run directory. A normal run creates this ignored artifact
+tree:
+
+```text
+experiment_results/YYYYMMDDTHHMMSSZ_<git-short-sha>/
+├── manifest.json
+├── playback_policy_analysis.json
+├── playback_policy_analysis.md
+├── preflight/
+│   ├── preflight_results.csv
+│   ├── preflight_summary.json
+│   └── preflight_latency.png
+└── repeat-01/
+    ├── <sample-stem>_results.csv
+    ├── <sample-stem>_summary.json
+    └── <sample-stem>_latency.png
+```
+
+Each one-based, zero-padded `repeat-NN` directory contains that three-file set
+for all three sample stems. The manifest is also the resumable status and
+checkpoint record. `--resume-dir` must point to an existing run with a
+compatible manifest. The harness validates required artifacts before skipping
+a completed entry and retries incomplete or failed entries. Resume is allowed
+only from the same clean Git commit with sample size and SHA-256 unchanged.
+Each saved CSV, summary, and plot must match its manifest hash; CSV sent/receive
+counts and received-byte totals must also match the summary. Backend and repeat
+settings come from the manifest, and explicit values must match. Optional
+new-run controls are `--output-root`, `--run-id`, and `--skip-preflight`;
+preflight cannot be changed on resume.
+
+One repeat is one live Riva pass through each sample. It takes approximately 1
+hour 45 minutes (103.7 minutes) of source-audio time. A new experiment adds a
+single one-minute preflight, and every capture adds its translated-tail drain
+time. Repeats and samples run sequentially because this backend supports one
+active translation session and its timing logger represents one global test
+session. Do not launch concurrent harnesses against the same backend.
+
+The harness also takes a backend-keyed local `flock`, so a second harness on
+the same machine fails before touching that backend. This does not coordinate
+clients launched from another machine; keep the backend isolated for the run.
+
+The harness does not run `docker compose up`, `docker compose down`, start the
+FastAPI backend, or stop any service after the test. Operators retain control
+of those processes, and the harness leaves them running for inspection or a
+resumed run.
+
+Failure to meet the 5-10 second queue objective is an experimental result, not
+an operational harness failure. The final playback-policy analysis flags those
+SLA misses; the process fails for problems such as an unavailable backend,
+failed preflight, zero translated responses, or missing required artifacts.
+After `end_input`, the CLI requires the backend's terminal `completed` status,
+which requires the request iterator to consume its stop sentinel, successful
+Riva response-generator exhaustion, and completion of every pending PCM
+WebSocket send. The sentinel proves every queued source chunk was read; if ASR
+endpointing closes earlier, the client restarts the generator to drain the
+remaining input. Generator/final-flush errors or audio-send failures emit
+`error` and invalidate the capture. Five seconds of silence is not completion,
+and reaching the 300-second drain maximum is a capture failure.
+
+New artifacts are generated in a temporary `.staging` directory. The harness
+validates the full CSV/summary/plot set, promotes it into `preflight` or
+`repeat-NN`, records SHA-256 hashes, and validates the promoted set again before
+marking the manifest entry complete.
+
+Each live arrival trace produces two derived playback conditions:
+
+| Derived condition | Playback policy | Purpose |
+|---|---|---|
+| Fixed control | Fixed 1.00x | Estimate listener backlog without catch-up |
+| Adaptive | 1.00x / 1.05x / 1.10x at 5/8 seconds | Estimate backlog reduction on the identical Riva output |
+
+This pairing is intentional. Playback speed is downstream of Riva and cannot
+change ASR, NMT, TTS, translated PCM, or its arrival timestamps. Replaying the
+same trace through both policies therefore removes inference and network
+variation from the fixed-versus-adaptive comparison and halves the number of
+long-form Riva passes. Use at least three live repeats per sample with
+`--repeats 3`; every repeat supplies both derived conditions.
+
+These derived conditions use the unit-tested Python policy scheduler, not a real
+`AudioContext`. They do not test browser timer behavior, Web Audio scheduling,
+pitch or chunk-boundary artifacts, subjective intelligibility, or listening
+fatigue. They also cannot locate corresponding English and Spanish semantics,
+so they do not measure how long an audience waits for a translated joke or
+marked phrase.
+
+The candidate queue gate uses the exact time-weighted p95 across the simulated
+playback window. It is not the nearest-rank percentile of queue depths sampled
+at audio arrivals. Reports also include exact time above 10 seconds and the
+longest continuous interval scheduled at 1.10x.
 
 ## Run procedure
 
-For each browser-dashboard run:
+For an automated run:
 
-1. Confirm all three readiness endpoints and save `docker compose ps` and
-   `nvidia-smi` output.
-2. Record commit, condition, file, repeat number, UTC start time, and whether
-   output monitoring is muted.
-3. Select or clear **Adaptive Spanish playback**, load one sample in `/#/test`,
-   and start the test. Muting does not stop browser scheduling, so leave output
-   muted for timing-only runs and use headphones when judging quality.
-4. Let the complete file run at real-time pace. Do not manually stop during
-   the drain phase.
-5. Verify natural completion sends `end_input` and that the dashboard waits
-   for both network quiet and an empty listener queue.
-6. Export the CSV and save backend/container logs with the same run ID.
-7. Note audible artifacts, pitch shift, discontinuities, skipped content,
-   WebSocket reconnects, container restarts, and GPU memory peaks.
-8. Confirm the CSV contains `playback_chunk_scheduled` and
-   `playback_queue_sample` events plus the expected
-   `adaptive_playback_enabled` value before accepting it.
+1. Commit the intended code, confirm the worktree is clean, then confirm all
+   three readiness endpoints and save `docker compose ps` and `nvidia-smi`
+   output. A run started dirty cannot later pass resume provenance checks.
+2. Run `--dry-run` and review the three resolved input paths, backend URL,
+   repeat count, and output location.
+3. Run the harness normally. Let every file finish at real-time pace and allow
+   its complete translated tail to drain. Accept a capture only after the
+   backend sends terminal `completed` with no terminal error; a 300-second
+   timeout is a failure.
+4. If the process is interrupted, correct the underlying problem and use
+   `--resume-dir` with that experiment directory instead of overwriting valid
+   completed traces.
+5. Confirm every requested repeat contains results for all three samples and
+   that each trace has nonzero translated responses, valid CSV/summary counts,
+   and manifest hashes.
+6. Review the compact fixed-versus-adaptive analysis and retain the raw CSVs,
+   plots, summaries, and manifest under the same experiment run.
+7. Save backend/container logs, WebSocket failures, container restarts, and GPU
+   memory/utilization separately with the generated run ID.
 
-Use a run ID such as:
+Then perform a browser and listener validation. Open `/#/test`, select or clear
+**Adaptive Spanish playback**, load a representative sample or shorter excerpt,
+and let the browser drain naturally. Export the dashboard CSV and compare its
+queue schedule with the Python replay. Use headphones and native Spanish
+listeners to evaluate 1.05x/1.10x intelligibility, pitch, discontinuities, and
+fatigue. Finally, mark English phrases or jokes and their corresponding Spanish
+audio on a synchronized timeline; neither the automated queue replay nor the
+dashboard backlog metric supplies that semantic alignment.
+
+The generated directory name is the automated run ID, for example:
 
 ```text
-20260722_sample_01_adaptive_repeat01_<git-short-sha>
+20260722T143000Z_d46451d
 ```
 
 Keep large CSV, audio, and plot artifacts outside Git or in an approved
@@ -229,30 +331,32 @@ artifact store. Commit compact, sanitized summaries only.
 
 ## Required measurements
 
-For every run, report:
+For every automated live trace and matched replay, report:
 
 - first translated audio latency;
 - service flush tail;
 - output/input duration ratio and duration excess;
-- listener playback tail;
-- browser queue p50, p95, and maximum;
+- fixed and adaptive simulated listener playback tail;
+- simulated time-weighted queue p50 and p95, plus maximum, for each policy;
 - seconds and percent over 5 seconds and over 10 seconds;
 - number of over-limit excursions;
-- time and audio duration scheduled at each playback rate;
-- maximum continuous interval at 1.10x;
+- simulated audio duration scheduled at each playback rate;
+- longest continuous interval scheduled at 1.10x;
 - container/runtime failures and reconnects; and
 - GPU memory and utilization peaks.
 
-For marked phrases or jokes, also report synchronized English-to-Spanish
-semantic delay. Follow the procedure in
-[Audience latency metrics](AUDIENCE_LATENCY_METRICS.md).
+For the separate browser and listener validation, report actual Web Audio queue
+statistics, any scheduling or playback artifacts, native-listener quality, and
+synchronized English-to-Spanish semantic delay for marked phrases or jokes.
+Follow the procedure in [Audience latency metrics](AUDIENCE_LATENCY_METRICS.md).
+Do not relabel Python replay metrics as browser observations.
 
 ## Candidate acceptance gates
 
 Agree final gates with evaluation partner before treating the experiment as a product
 decision. A reasonable starting point is:
 
-- browser queue p95 at or below 10 seconds for every sample;
+- automated time-weighted simulated queue p95 at or below 10 seconds for every sample;
 - no sustained upward queue trend in the final third of a sample;
 - time over 10 seconds below 1% of the observed run;
 - no dropped or reordered speech;
@@ -260,6 +364,9 @@ decision. A reasonable starting point is:
 - marked-phrase delay acceptable for a live room; and
 - native Spanish listeners accept intelligibility and naturalness at the
   selected speeds for long-form listening.
+
+The automated p95 gate is a deterministic replay result. Confirm it separately
+against actual browser/Web Audio behavior before using it as a product gate.
 
 Treat failure to satisfy the 10-second queue gate as an SLA breach, not a
 request to discard audio. If 1.10x cannot consume output as fast as it is
@@ -272,14 +379,22 @@ and the staged backend design.
 - [ ] Exact pinned images shown by `docker compose config --images`
 - [ ] ASR, NMT, and TTS readiness probes pass
 - [ ] GPU model, driver, memory, and utilization recorded
-- [ ] Git commit and control/adaptive flag recorded
+- [ ] Git commit and playback policy recorded in the harness manifest
 - [ ] Backend tests, frontend tests, build, and lint pass
 - [ ] 800 ms EOU and automatic punctuation confirmed
-- [ ] One-minute preflight produces translated audio
-- [ ] Three samples run under both control and adaptive conditions
-- [ ] At least three repeats per file and condition
-- [ ] Natural `end_input` and complete browser drain observed
-- [ ] CSV contains playback schedule and queue sample fields
+- [ ] Harness dry run resolves the expected backend, inputs, and output directory
+- [ ] Automated one-minute preflight produces translated audio
+- [ ] Every automated capture receives terminal `completed` before 300 seconds
+- [ ] No generator, final-flush, or PCM WebSocket send error is reported
+- [ ] Three samples complete sequentially with nonzero translated responses
+- [ ] At least three live traces per file; each is replayed as a matched fixed and adaptive pair
+- [ ] Interrupted-run recovery is verified with `--resume-dir` when applicable
+- [ ] Resume commit, clean worktree, sample hashes, and artifact hashes validate
+- [ ] CSV event counts and received-byte totals match every summary
+- [ ] Generated manifest, raw traces, summaries, plots, and compact analysis retained
+- [ ] Separate browser run reaches natural `end_input` and complete Web Audio drain
+- [ ] Browser CSV contains playback schedule and queue sample fields
+- [ ] Python replay is cross-checked against browser queue scheduling
 - [ ] Marked phrase/joke delay measured on a synchronized clock
 - [ ] Native-listener quality notes captured at 1.05x and 1.10x
 - [ ] Compact summary explicitly distinguishes historical and new runs

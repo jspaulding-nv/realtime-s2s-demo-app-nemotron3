@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from concurrent.futures import wait
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -22,6 +23,7 @@ class SessionStatus(str, Enum):
     CONNECTED = "connected"
     LISTENING = "listening"
     PROCESSING = "processing"
+    COMPLETED = "completed"
     STOPPED = "stopped"
     ERROR = "error"
 
@@ -35,6 +37,7 @@ class TranslationSession:
     chunk_iterator: Optional[AudioChunkIterator] = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _closed: bool = False
+    _awaiting_completion: bool = False
 
     def _is_websocket_open(self) -> bool:
         """Check if WebSocket is still open."""
@@ -69,15 +72,17 @@ class TranslationSession:
             except Exception:
                 pass  # WebSocket already closed
 
-    async def send_audio(self, audio_data: bytes) -> None:
+    async def send_audio(self, audio_data: bytes) -> bool:
         """Send translated audio to client."""
         if self._is_websocket_open():
             try:
                 if VERBOSE_CHUNKS:
                     print(f"[WS] Sending {len(audio_data)} bytes of audio to client")
                 await self.websocket.send_bytes(audio_data)
+                return True
             except Exception as e:
                 print(f"[WS] Failed to send audio: {e}")
+        return False
 
     async def send_level(self, rms: float) -> None:
         """Send audio level to client."""
@@ -98,6 +103,7 @@ class TranslationSession:
             # Stop any existing stream first
             if self.chunk_iterator:
                 print("[WS] Stopping existing stream before starting new one")
+                self._awaiting_completion = False
                 self.chunk_iterator.stop()
                 self.chunk_iterator = None
 
@@ -109,25 +115,66 @@ class TranslationSession:
 
             # Create callback to send audio back through WebSocket
             # These run in a background thread, so use run_coroutine_threadsafe
+            pending_audio_sends = []
+
             def on_audio(audio_bytes: bytes):
                 if not self._closed:
                     timing_logger.log_audio_from_riva(len(audio_bytes))
 
                     async def _send_and_log():
-                        await self.send_audio(audio_bytes)
+                        if not await self.send_audio(audio_bytes):
+                            raise RuntimeError(
+                                "translated audio could not be sent to the client"
+                            )
                         timing_logger.log_audio_sent_to_client(len(audio_bytes))
 
-                    asyncio.run_coroutine_threadsafe(_send_and_log(), loop)
+                    pending_audio_sends.append(
+                        asyncio.run_coroutine_threadsafe(_send_and_log(), loop)
+                    )
 
             def on_error(error_msg: str):
                 if not self._closed:
                     asyncio.run_coroutine_threadsafe(self.send_error(error_msg), loop)
+
+            def on_complete():
+                if self._closed or not self._awaiting_completion:
+                    return
+
+                done, not_done = wait(pending_audio_sends, timeout=60)
+                if not_done:
+                    on_error(
+                        "Timed out sending final translated audio to the client"
+                    )
+                    return
+                failed = []
+                for future in done:
+                    try:
+                        exception = future.exception()
+                    except BaseException as exc:
+                        exception = exc
+                    if exception is not None:
+                        failed.append(exception)
+                if failed:
+                    on_error(f"Failed to send final translated audio: {failed[0]}")
+                    return
+
+                async def _mark_completed():
+                    if self._closed or not self._awaiting_completion:
+                        return
+                    self._awaiting_completion = False
+                    await self.send_status(
+                        SessionStatus.COMPLETED,
+                        "Riva translated-audio stream complete",
+                    )
+
+                asyncio.run_coroutine_threadsafe(_mark_completed(), loop)
 
             try:
                 self.chunk_iterator = await riva_client.translate_stream(
                     target_language=target_language,
                     on_audio=on_audio,
                     on_error=on_error,
+                    on_complete=on_complete,
                 )
             except Exception as e:
                 await self.send_error(f"Failed to start stream: {str(e)}")
@@ -136,6 +183,7 @@ class TranslationSession:
         """Stop the current translation stream and notify client."""
         async with self._lock:
             print(f"[WS] stop_stream called, current_status={self.status}")
+            self._awaiting_completion = False
             if self.chunk_iterator:
                 self.chunk_iterator.stop()
                 self.chunk_iterator = None
@@ -150,15 +198,18 @@ class TranslationSession:
         async with self._lock:
             print(f"[WS] finish_input called, current_status={self.status}")
             if self.chunk_iterator:
-                self.chunk_iterator.stop()
+                self._awaiting_completion = True
             await self.send_status(
                 SessionStatus.PROCESSING,
                 "Input complete; draining translated audio",
             )
+            if self.chunk_iterator:
+                self.chunk_iterator.stop()
 
     def close(self) -> None:
         """Close the session without sending messages (for cleanup)."""
         self._closed = True
+        self._awaiting_completion = False
         if self.chunk_iterator:
             self.chunk_iterator.stop()
             self.chunk_iterator = None

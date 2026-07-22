@@ -5,6 +5,7 @@ export type SessionStatus =
   | 'connected'
   | 'listening'
   | 'processing'
+  | 'completed'
   | 'stopped'
   | 'error';
 

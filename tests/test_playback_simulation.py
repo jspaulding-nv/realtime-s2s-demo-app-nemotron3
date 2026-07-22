@@ -76,6 +76,16 @@ def test_fixed_playback_preserves_chunks_and_computes_exact_queue_time():
     assert result.summary.peak_queue_depth_seconds == 3.0
     assert result.summary.arrival_queue_p50_seconds == 2.0
     assert result.summary.arrival_queue_p95_seconds == 3.0
+    assert math.isclose(
+        result.summary.time_weighted_queue_p50_seconds,
+        1.5,
+        abs_tol=1e-12,
+    )
+    assert math.isclose(
+        result.summary.time_weighted_queue_p95_seconds,
+        2.8,
+        abs_tol=1e-12,
+    )
     assert result.summary.seconds_above_target == 3.0
     assert result.summary.percent_playback_window_above_target == 75.0
     assert [chunk.start_seconds for chunk in result.schedule] == [2.0, 4.0]
@@ -143,6 +153,25 @@ def test_idle_gap_starts_next_chunk_at_arrival_without_inventing_queue():
     assert result.summary.playback_end_seconds == 5.5
     assert result.summary.listener_tail_seconds == 0.5
     assert result.summary.seconds_above_target == 0.0
+
+
+def test_reports_longest_continuous_urgent_playback_interval():
+    chunks = [
+        AudioChunk(arrival_seconds=0.0, duration_seconds=8.0),
+        AudioChunk(arrival_seconds=0.0, duration_seconds=1.0),
+        AudioChunk(arrival_seconds=20.0, duration_seconds=8.0),
+    ]
+
+    result = simulate_playback(
+        chunks, input_end_seconds=20.0, adaptive=True
+    )
+
+    assert [chunk.playback_rate for chunk in result.schedule] == [1.1, 1.1, 1.1]
+    assert math.isclose(
+        result.summary.max_continuous_urgent_playback_seconds,
+        (8.0 + 1.0) / 1.1,
+        abs_tol=1e-12,
+    )
 
 
 @pytest.mark.parametrize(

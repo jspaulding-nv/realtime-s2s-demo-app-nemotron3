@@ -43,8 +43,6 @@ BYTES_PER_SAMPLE = 2
 CHUNK_SAMPLES = 4800
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE  # 9600
 CHUNK_DURATION = CHUNK_SAMPLES / SAMPLE_RATE      # 0.3 s
-DRAIN_MIN_SECONDS = 10
-DRAIN_IDLE_SECONDS = 5
 DRAIN_MAX_SECONDS = 300
 TARGET_LANGUAGE = "es-US"
 
@@ -96,6 +94,12 @@ class TestResult:
     duration_excess_sec: float = 0.0
     playback_tail_sec: float = 0.0
     post_input_responses: int = 0
+    input_completed: bool = False
+    connection_lost: bool = False
+    drain_timed_out: bool = False
+    drain_duration_sec: float = 0.0
+    translation_completed: bool = False
+    server_error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +207,9 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         total_recv_bytes = 0
         last_audio_time = time.monotonic()
         send_done = asyncio.Event()
+        translation_complete = asyncio.Event()
         connection_lost = False
+        server_error = ""
         last_print_time = 0.0
 
         def current_drift() -> float:
@@ -284,7 +290,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
 
         # -- Receive task ---------------------------------------------------
         async def receive_audio():
-            nonlocal audio_responses, total_recv_bytes, connection_lost, last_audio_time
+            nonlocal audio_responses, total_recv_bytes, connection_lost, last_audio_time, server_error
             recv_idx = 0
             try:
                 while True:
@@ -303,7 +309,19 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                             audio_bytes=len(raw),
                         ))
                         recv_idx += 1
-                    # JSON frames (level, status, pong, etc.) — just ignore
+                    elif isinstance(raw, str):
+                        try:
+                            control = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            control.get("type") == "status"
+                            and control.get("status") == "completed"
+                        ):
+                            translation_complete.set()
+                        elif control.get("type") == "error":
+                            server_error = control.get("message", "backend error")
+                            translation_complete.set()
             except websockets.exceptions.ConnectionClosed:
                 connection_lost = True
             except asyncio.CancelledError:
@@ -333,8 +351,8 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             await ws.send(json.dumps({"type": "end_input"}))
 
             print(
-                f"Draining translated tail (min {DRAIN_MIN_SECONDS}s, "
-                f"until {DRAIN_IDLE_SECONDS}s idle, max {DRAIN_MAX_SECONDS}s)...",
+                "Draining translated tail until Riva confirms completion "
+                f"(max {DRAIN_MAX_SECONDS}s)...",
                 flush=True,
             )
             drain_start = time.monotonic()
@@ -347,18 +365,25 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                 drift = current_drift()
                 print(
                     f"\rDraining: {elapsed:.0f}s | idle: {idle:.0f}s"
-                    f" | Recv: {audio_responses} | Drift: {drift:.1f}s   ",
+                    f" | Recv: {audio_responses} | Drift: {drift:.1f}s"
+                    f" | complete: {translation_complete.is_set()}   ",
                     end="", flush=True,
                 )
                 result.drift_samples.append(DriftSample(
                     elapsed_sec=time.monotonic() - test_start_time,
                     drift_sec=drift,
                 ))
-                if elapsed >= DRAIN_MIN_SECONDS and idle >= DRAIN_IDLE_SECONDS:
+                if translation_complete.is_set():
                     break
                 await asyncio.sleep(1.0)
             print()
 
+            result.drain_duration_sec = time.monotonic() - drain_start
+            result.translation_completed = (
+                translation_complete.is_set() and not server_error
+            )
+            result.server_error = server_error
+            result.drain_timed_out = not translation_complete.is_set()
             result.tail_lag_sec = max(0.0, last_audio_time - input_end_time)
             result.post_input_responses = audio_responses - responses_at_input_end
 
@@ -402,6 +427,8 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     result.chunks_sent = chunks_sent
     result.audio_responses = audio_responses
     result.total_received_bytes = total_recv_bytes
+    result.input_completed = chunks_sent == total_chunks
+    result.connection_lost = connection_lost
     result.output_duration_sec = total_recv_bytes / (
         SAMPLE_RATE * BYTES_PER_SAMPLE
     )
@@ -505,6 +532,12 @@ def generate_summary(result: TestResult, output_path: str):
         "duration_excess_sec": result.duration_excess_sec,
         "playback_tail_sec": result.playback_tail_sec,
         "post_input_responses": result.post_input_responses,
+        "input_completed": result.input_completed,
+        "connection_lost": result.connection_lost,
+        "drain_timed_out": result.drain_timed_out,
+        "drain_duration_sec": result.drain_duration_sec,
+        "translation_completed": result.translation_completed,
+        "server_error": result.server_error,
     }
     with open(output_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -546,6 +579,23 @@ async def run_preflight(backend_url: str) -> bool:
             f"\nPre-flight FAILED: No audio responses received."
             f" Sent {result.chunks_sent} chunks but got 0 translated audio back."
             f"\nCheck that Riva services are running at the configured RIVA_URI."
+        )
+        return False
+
+    if (
+        not result.input_completed
+        or result.connection_lost
+        or result.drain_timed_out
+        or not result.translation_completed
+        or result.server_error
+    ):
+        print(
+            "\nPre-flight FAILED: capture did not complete cleanly: "
+            f"input_completed={result.input_completed}, "
+            f"connection_lost={result.connection_lost}, "
+            f"drain_timed_out={result.drain_timed_out}, "
+            f"translation_completed={result.translation_completed}, "
+            f"server_error={result.server_error or 'none'}"
         )
         return False
 

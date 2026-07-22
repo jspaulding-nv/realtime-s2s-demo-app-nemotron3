@@ -268,13 +268,19 @@ def build_analysis(
 
 
 def _display_name(filename: str) -> str:
+    path = Path(filename)
+    filename = path.name
     if filename.startswith("long-form-01"):
-        return "Long-form sample 01"
-    if filename.startswith("long-form-02"):
-        return "Long-form sample 02"
-    if "long-form-03" in filename:
-        return "Long-form sample 03"
-    return filename.removesuffix("_results.csv")
+        display = "Long-form sample 01"
+    elif filename.startswith("long-form-02"):
+        display = "Long-form sample 02"
+    elif "long-form-03" in filename:
+        display = "Long-form sample 03"
+    else:
+        display = filename.removesuffix("_results.csv")
+    if path.parent.name.startswith("repeat-"):
+        return f"{display} ({path.parent.name})"
+    return display
 
 
 def render_markdown(analysis: dict[str, Any]) -> str:
@@ -326,7 +332,7 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         [
             "",
             (
-                "Across all three replays, listener tail fell from "
+                f"Across all {aggregate['trace_count']} replays, listener tail fell from "
                 f"{aggregate['fixed_listener_tail_seconds']:.3f}s to "
                 f"{aggregate['adaptive_listener_tail_seconds']:.3f}s "
                 f"({aggregate['listener_tail_reduction_percent']:.1f}% reduction)."
