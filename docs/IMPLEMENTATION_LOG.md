@@ -293,20 +293,50 @@ automatic punctuation, and the 800 ms EOU configuration. Detailed contracts,
 commands, limitations, and observed results are in
 [Staged pipeline foundation](STAGED_PIPELINE_FOUNDATION.md).
 
-## Remaining staged backend implementation
+## 2026-07-22: bounded staged NMT and TTS pipeline
 
-Not yet completed:
+Completed on the stacked `agent/staged-nmt-tts-pipeline` branch:
 
-- Bounded NMT and TTS queues with pipeline overlap.
-- Direct NMT/TTS application adapters and target-language validation.
-- Ordered outbound audio and a reorder buffer if worker counts exceed one.
-- Persisted per-stage queue residence and inference metrics.
-- Feature-flagged staged WebSocket integration and deterministic stage drain.
-- A live comparison of monolithic versus staged paths.
-- Server-side TTS prosody or pitch-preserving client time scaling.
+- Added direct one-segment NMT with an explicit unary deadline, exact-one and
+  nonempty-response validation, and an exact `es-US` language check.
+- Added direct Magpie TTS with Isabela voice selection, mono Int16 validation,
+  active-call cancellation, and atomic whole-segment PCM publication.
+- Confirmed live that blank NMT requests can hallucinate fluent output and
+  enforced a pre-RPC blank-input rejection.
+- Added one NMT worker and one TTS worker on separate executors so stages
+  overlap while output remains in source order without a reorder buffer.
+- Added bounded NMT, TTS, and output queues, exact natural sentinel drain,
+  first-failure ownership, deterministic cancellation, and model deadlines.
+- Added queue-depth, blocked-put, queue-residence, processing, first-audio,
+  provenance, and PCM-duration telemetry.
+- Added an opt-in end-to-end WAV smoke that emits raw PCM and a JSON report.
 
-The proposed architecture and lifecycle are in
-[Staged pipeline design](STAGED_PIPELINE_DESIGN.md).
+Validation:
+
+```text
+Direct NMT tests:                    24 passed
+Direct TTS tests:                    29 passed
+Staged orchestrator tests:           23 passed
+Full backend regression suite:      176 passed
+Full Python regression suite:       225 passed
+
+Live 60-second staged preflight:
+  terminal outcome:                 complete
+  first translated audio:           5.109 s
+  post-input tail drain:             1.307 s
+  translated audio segments:        23
+  max NMT / TTS / output depth:      2 / 2 / 2
+  blocked queue puts:                0
+  NMT average processing:          319.84 ms
+  TTS average first audio:         145.98 ms
+  TTS average full completion:     493.69 ms
+```
+
+The active browser route remains monolithic. The next staged milestone is an
+explicit default-off WebSocket integration with an ordered sender, followed
+by new Sample 01, Sample 02, and Sample 03 runs. Detailed contracts, commands,
+limitations, and the interpretation of the one-minute result are in
+[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md).
 
 ## Reproducible validation commands
 

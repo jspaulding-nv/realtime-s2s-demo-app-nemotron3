@@ -219,6 +219,10 @@ are separate required gates.
 
 ## Next milestone
 
+This historical next-milestone list is now implemented and validated in
+[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md). The next
+remaining integration is the default-off staged WebSocket route.
+
 Implement the staged text/audio worker path behind an explicit feature flag:
 
 1. Add direct NMT and streaming TTS adapters with target-language/non-empty

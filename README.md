@@ -26,15 +26,17 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Queue-aware test completion: file input ends independently, then Riva output and browser playback drain
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - A resumable one-command harness for sequential matched-policy runs across all three samples
-- A direct Nemotron ASR adapter, bounded event bridge, and punctuation segmenter foundation for the next staged backend
+- Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
+- A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
+- A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
-The active browser path still uses the monolithic Riva S2S endpoint and does
-not expose separate stage queues. Direct ASR and punctuation segmentation are
-implemented and live-smoke-tested in isolation. The direct-ASR worker uses a
-bounded ordered asyncio event handoff with tested backpressure and shutdown;
-bounded NMT/TTS parallelism and staged WebSocket integration remain the next
-client-orchestration work.
+The active browser path still uses the monolithic Riva S2S endpoint. The
+experimental backend now has direct ASR, NMT, and TTS adapters plus bounded
+queues, ordered NMT/TTS overlap, deterministic drain, and per-stage telemetry.
+That staged path completed a real-time one-minute live preflight, but is not
+wired into `/ws/translate` yet. Feature-flagged WebSocket integration remains
+the next client-orchestration milestone.
 
 ## Architecture
 
@@ -72,7 +74,10 @@ realtime-s2s-demo-app/
 │   ├── config.py            # Settings (Riva URI, audio params, languages)
 │   ├── riva_client.py       # Riva S2S wrapper
 │   ├── direct_asr_client.py # Direct staged Nemotron adapter
+│   ├── direct_nmt_client.py # Validated one-segment NMT adapter
+│   ├── direct_tts_client.py # Atomic Magpie PCM adapter
 │   ├── punctuation_segmenter.py # Ordered final-text segmentation
+│   ├── staged_pipeline.py   # Bounded ordered stage orchestration
 │   ├── staged_models.py     # Staged records and telemetry contract
 │   ├── websocket_handler.py # Session management
 │   ├── audio_processor.py   # Audio format utilities
@@ -101,6 +106,7 @@ realtime-s2s-demo-app/
 ├── realtime_s2s.py          # Original CLI-based translation script
 ├── direct_asr_smoke.py      # Opt-in direct Nemotron compatibility smoke
 ├── direct_asr_bridge_smoke.py # Opt-in bounded DirectASRStream smoke
+├── staged_pipeline_smoke.py # Opt-in direct ASR -> NMT -> TTS preflight
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
@@ -173,6 +179,18 @@ nvidia-smi
 
 The application connects to the NMT/S2S gRPC endpoint at `localhost:50051`. ASR and TTS are also exposed at `localhost:50052` and `localhost:50053` for direct tests.
 
+Optional: validate all three direct services and the bounded staged drain with
+a real-time one-minute WAV before starting the browser application:
+
+```bash
+python3 staged_pipeline_smoke.py \
+  --file test_audio/test-1min.wav \
+  --duration-seconds 60
+```
+
+This writes ignored raw PCM and JSON telemetry under `test_results_staged/`.
+It does not change the active browser route, which remains monolithic.
+
 ### 3. Start the web application
 
 ```bash
@@ -239,6 +257,15 @@ RIVA_ASR_WORD_TIMES=0
 RIVA_VERBOSE_CHUNKS=0
 STAGED_SEGMENT_MAX_CHARS=240
 STAGED_SEGMENT_MAX_AGE_MS=2000
+STAGED_ASR_EVENT_QUEUE_MAXSIZE=32
+STAGED_NMT_QUEUE_MAXSIZE=4
+STAGED_TTS_QUEUE_MAXSIZE=4
+STAGED_OUTPUT_QUEUE_MAXSIZE=4
+STAGED_NMT_RPC_TIMEOUT_SECONDS=15
+STAGED_TTS_RPC_TIMEOUT_SECONDS=60
+STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
+STAGED_CLOSE_TIMEOUT_SECONDS=10
+S2S_PIPELINE_MODE=monolithic
 ```
 
 ### Adding Languages
@@ -462,6 +489,7 @@ Detailed guides:
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sample acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)
+- [Bounded staged NMT/TTS pipeline and one-minute result](docs/STAGED_NMT_TTS_PIPELINE.md)
 - [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)
 - [Implementation and verification log](docs/IMPLEMENTATION_LOG.md)
 
