@@ -379,7 +379,7 @@ Python compile:   passed
 git diff check:   passed
 ```
 
-Live terminal-aware `/ws/translate` preflight with `test_audio/test-1min.wav`:
+Live terminal-aware `/ws/translate` preflight with the local `preflight.wav`:
 
 ```text
 mode:                            staged (reported by /api/config)

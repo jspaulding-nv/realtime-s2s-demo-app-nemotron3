@@ -516,6 +516,14 @@ def test_dry_run_never_checks_backend_or_writes_artifacts(monkeypatch, tmp_path)
         raise AssertionError("dry run contacted the backend")
 
     monkeypatch.setattr(experiment, "check_backend_ready", unexpected_backend_check)
+    local_audio = tmp_path / "audio"
+    local_audio.mkdir()
+    files = []
+    for index in range(1, 4):
+        path = local_audio / f"long-form-{index:02d}.mp3"
+        path.write_bytes(b"test audio")
+        files.append(str(path))
+    monkeypatch.setattr(experiment, "LONG_FORM_FILES", files)
     output_root = tmp_path / "experiments"
 
     exit_code = experiment.main(

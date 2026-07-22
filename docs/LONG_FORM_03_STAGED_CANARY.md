@@ -146,16 +146,16 @@ first 810 seconds completed in about 98 seconds:
 
 ```bash
 PYTHONPATH=.python-packages:backend python3 direct_asr_smoke.py \
-  --file test_audio/test-30min.wav \
+  --file "${S2S_TEST_AUDIO_DIR:-test_audio}/long-form-03-30min.wav" \
   --duration-seconds 810 \
   --fast \
   --json-output /tmp/sample_03-prefix-810-asr.json
 ```
 
-All three attempts remain auditable under `docs/results/staged-websocket/`.
-The successful run includes a compact result, compressed full JSON/CSV/logs,
-latency plot, and fixed/adaptive playback analysis. `SHA256SUMS` covers every
-prepared evidence record and the successful one-minute WebSocket preflight.
+The raw attempt captures were reviewed before being removed from public
+history. This report retains the aggregate measurements, failure analysis, and
+integrity conclusions; future full JSON/CSV/log/plot evidence remains local and
+ignored unless separately minimized and sanitized.
 
 ## Post-capture hardening and evidence boundary
 

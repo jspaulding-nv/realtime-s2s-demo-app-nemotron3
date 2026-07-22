@@ -192,7 +192,7 @@ In another shell:
 ```bash
 PYTHONPATH=.python-packages \
 python3 batch_latency_test.py \
-  --file test_audio/test-1min.wav \
+  --file "${S2S_TEST_AUDIO_DIR:-test_audio}/preflight.wav" \
   --backend http://127.0.0.1:8000 \
   --output-dir test_results_staged/websocket-preflight
 ```
@@ -257,18 +257,10 @@ The post-run GPU snapshot remained 32,217 MiB used and 65,034 MiB free out of
 97,887 MiB.
 
 This result is the hardened rerun after receive-order validation was added.
-The complete evidence set is prepared alongside the documentation so the integrity
-checks remain independently auditable after this VM is gone:
-
-- [full 535-event JSON](results/staged-websocket/one-minute-preflight-2026-07-22-full.json)
-- [client event CSV](results/staged-websocket/one-minute-preflight-2026-07-22.csv)
-- [latency plot](results/staged-websocket/one-minute-preflight-2026-07-22.png)
-- [SHA-256 manifest](results/staged-websocket/SHA256SUMS)
-
-The smaller [review digest](results/staged-websocket/one-minute-preflight-2026-07-22.json)
-summarizes the same run. The ignored copies under
-`test_results_staged/websocket-preflight-hardened-2026-07-22/` remain
-disposable local runner output.
+The raw JSON, CSV, plot, and runtime captures were reviewed before being
+removed from public history under the repository sanitization policy. The
+aggregate table above is retained; new raw captures stay in ignored local
+runner output.
 
 This is a short operational pass. The 6.996-second value is a fixed-rate replay
 from actual client arrival times, not an executed browser/Web Audio queue
@@ -307,12 +299,9 @@ expansion therefore matter even when the aggregate ratio is close to 1.00x.
 The under-one-second last-audio arrival tail is not the listener tail and does
 not answer when a translated joke becomes audible.
 
-See [Sample 03 staged full-sample canary](LONG_FORM_03_STAGED_CANARY.md). Its
-compressed [successful summary](results/staged-websocket/sample_03-attempt-3-success-summary-2026-07-22.json.gz),
-[client events](results/staged-websocket/sample_03-attempt-3-client-events-2026-07-22.csv.gz),
-[client log](results/staged-websocket/sample_03-attempt-3-client-log-2026-07-22.txt.gz),
-and [latency plot](results/staged-websocket/sample_03-attempt-3-latency-2026-07-22.png)
-are archived with the [SHA-256 manifest](results/staged-websocket/SHA256SUMS).
+See [Sample 03 staged full-sample canary](LONG_FORM_03_STAGED_CANARY.md). Raw
+event streams, client logs, plots, and runtime manifests are intentionally not
+published; the report retains the aggregate measurements and integrity result.
 
 The same hard gate now applies to Sample 01 and Sample 02:
 

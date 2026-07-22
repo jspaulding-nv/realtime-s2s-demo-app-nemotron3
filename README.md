@@ -196,7 +196,7 @@ a real-time one-minute WAV before starting the browser application:
 
 ```bash
 python3 staged_pipeline_smoke.py \
-  --file test_audio/test-1min.wav \
+  --file "${S2S_TEST_AUDIO_DIR:-test_audio}/preflight.wav" \
   --duration-seconds 60
 ```
 

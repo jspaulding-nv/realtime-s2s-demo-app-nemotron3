@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 import wave
@@ -15,6 +16,7 @@ from typing import Optional, Sequence
 
 
 ROOT = Path(__file__).resolve().parent
+AUDIO_DIR = Path(os.environ.get("S2S_TEST_AUDIO_DIR", ROOT / "test_audio")).expanduser()
 BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
@@ -43,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--file",
         type=Path,
-        default=Path("test_audio/test-1min.wav"),
+        default=AUDIO_DIR / "preflight.wav",
         help="16 kHz mono 16-bit PCM WAV input",
     )
     parser.add_argument(

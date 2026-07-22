@@ -155,7 +155,7 @@ key; it talks to the local gRPC ports:
 
 ```bash
 PYTHONPATH=.python-packages python3 staged_pipeline_smoke.py \
-  --file test_audio/test-1min.wav \
+  --file "${S2S_TEST_AUDIO_DIR:-test_audio}/preflight.wav" \
   --duration-seconds 60 \
   --pcm-output test_results_staged/staged-smoke-es-US.pcm \
   --json-output test_results_staged/staged-smoke-report.json
@@ -175,7 +175,7 @@ real-time source pacing.
 ## July 22, 2026 one-minute standalone result
 
 The pinned containers were healthy on the 96 GB RTX PRO 6000 Blackwell Server
-Edition. The preflight used 60 seconds from `test_audio/test-1min.wav`, real-
+Edition. The preflight used 60 seconds from the local `preflight.wav`, real-
 time pacing, English input, Spanish output, automatic punctuation, and 800 ms
 EOU.
 
@@ -238,12 +238,9 @@ so the long canary confirms the risk that Spanish playback can fall behind
 even while last-audio and completed-terminal arrival tails stay short.
 
 See [Sample 03 staged full-sample canary](LONG_FORM_03_STAGED_CANARY.md) for the
-failure investigations, corrective policies, and promotion record. The
-compressed [successful summary](results/staged-websocket/sample_03-attempt-3-success-summary-2026-07-22.json.gz),
-[client events](results/staged-websocket/sample_03-attempt-3-client-events-2026-07-22.csv.gz),
-[client log](results/staged-websocket/sample_03-attempt-3-client-log-2026-07-22.txt.gz),
-and [latency plot](results/staged-websocket/sample_03-attempt-3-latency-2026-07-22.png)
-are archived with the [SHA-256 manifest](results/staged-websocket/SHA256SUMS).
+failure investigations, corrective policies, and promotion record. Raw event
+streams, logs, plots, and runtime manifests are intentionally excluded from
+the public repository.
 
 ## Audience-delay interpretation
 
