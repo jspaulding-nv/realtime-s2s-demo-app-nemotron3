@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useTimingTracker } from '../hooks/useTimingTracker';
 
@@ -117,5 +117,54 @@ describe('useTimingTracker', () => {
     expect(result.current.logAudioReceived).toBe(logAudioReceived);
     expect(result.current.startTest).toBe(startTest);
     expect(result.current.getSendCount).toBe(getSendCount);
+  });
+
+  it('records playback schedule and queue sample telemetry', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logPlaybackScheduled({
+      timestampMs: performance.now(),
+      audioBytes: 3200,
+      sourceDurationSeconds: 0.1,
+      scheduledDurationSeconds: 0.095238,
+      waitBeforePlaybackSeconds: 5.2,
+      queueDepthSeconds: 5.295238,
+      playbackRate: 1.05,
+      playbackMode: 'catch-up',
+      modeChanged: true,
+      aboveTarget: true,
+      aboveLimit: false,
+    }));
+    act(() => result.current.logPlaybackQueueSample(5.1, 1.05, 'catch-up'));
+
+    expect(result.current.getEvents()).toEqual([
+      expect.objectContaining({
+        stage: 'playback_chunk_scheduled',
+        audioBytes: 3200,
+        queueDepthSec: 5.295238,
+        playbackRate: 1.05,
+        playbackMode: 'catch-up',
+      }),
+      expect.objectContaining({
+        stage: 'playback_queue_sample',
+        queueDepthSec: 5.1,
+        playbackRate: 1.05,
+      }),
+    ]);
+  });
+
+  it('records the playback condition at session start', () => {
+    const { result } = renderHook(() => useTimingTracker());
+
+    act(() => result.current.startTest({ adaptivePlaybackEnabled: false }));
+
+    expect(result.current.getEvents()).toEqual([
+      expect.objectContaining({
+        stage: 'playback_session_started',
+        timestamp: 0,
+        adaptivePlaybackEnabled: false,
+      }),
+    ]);
   });
 });

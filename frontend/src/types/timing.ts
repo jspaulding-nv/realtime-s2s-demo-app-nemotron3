@@ -5,6 +5,13 @@ export interface ClientTimingEvent {
   chunkIndex: number;
   sourcePositionSec: number;
   audioBytes: number;
+  mediaDurationSec?: number;
+  scheduledDurationSec?: number;
+  playbackWaitSec?: number;
+  queueDepthSec?: number;
+  playbackRate?: number;
+  playbackMode?: string;
+  adaptivePlaybackEnabled?: boolean;
 }
 
 /** Backend timing event received via /ws/metrics. */

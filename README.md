@@ -2,7 +2,7 @@
 
 A web-based real-time speech translation application using NVIDIA Riva services. Captures English audio from your microphone, translates it, and plays back synthesized speech in the target language.
 
-This repository preserves [Jonathan Gough's original demo](https://github.com/jgough-essextec/realtime-s2s-demo-app) and adds the Pellera/NVIDIA evaluation configuration for English-to-Spanish long-form speech. It uses Nemotron 3 streaming ASR in place of Parakeet CTC, pins all three NIM releases, and adds listener-tail measurements for sermon-length tests.
+This repository preserves [Jonathan Gough's original demo](https://github.com/jgough-essextec/realtime-s2s-demo-app) and adds the Pellera/NVIDIA evaluation configuration for English-to-Spanish long-form speech. It uses Nemotron 3 streaming ASR in place of Parakeet CTC, pins all three NIM releases, measures listener backlog for sermon-length tests, and includes an experimental adaptive playback controller that preserves every translated audio chunk while trying to keep the browser queue near 5-10 seconds.
 
 GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains Jonathan's full Git history as a standalone repository and records his project as the upstream source.
 
@@ -10,10 +10,14 @@ GitHub permits only one fork of a source repository per owner. Because `jspauldi
 
 - Nemotron ASR Streaming `1.2.0` with the English `batch_size=32` profile
 - Riva Translate 1.6B `1.5.2` and Magpie multilingual TTS `1.7.0`
+- NVIDIA Riva Python client `2.24.0`
 - Automatic ASR punctuation and an 800 ms final end-of-utterance window
 - Environment-based Riva configuration instead of a hardcoded server address
 - An `end_input` control message so the test harness can drain final translated audio
 - First-audio latency, output/input duration ratio, service tail, and simulated listener playback-tail metrics
+- Exact browser playback-queue telemetry with adaptive 1.00x, 1.05x, and 1.10x scheduling
+- Queue-aware test completion: file input ends independently, then Riva output and browser playback drain
+- A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
 The current monolithic Riva S2S endpoint does not expose separate ASR, NMT, and TTS stage queues. Explicit punctuation-boundary splitting and bounded NMT/TTS parallelism are therefore future client-orchestration work, not claims made by this version.
@@ -35,7 +39,8 @@ The current monolithic Riva S2S endpoint does not expose separate ASR, NMT, and 
 - Web Audio API microphone capture at 16kHz
 - WebSocket streaming for low-latency communication
 - Audio level visualization
-- Queue-based audio playback to prevent gaps
+- Queue-based audio playback with an experimental bounded-latency catch-up policy
+- Audience backlog metrics and CSV telemetry in the latency dashboard
 - Configurable target languages (based on Riva server capabilities)
 
 ## Project Structure
@@ -45,6 +50,7 @@ realtime-s2s-demo-app/
 ├── docker-compose.yaml     # Pinned Nemotron ASR, NMT, and TTS services
 ├── .env.example            # Compose and application configuration template
 ├── NEMOTRON_TEST_RESULTS.md
+├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
 ├── backend/
 │   ├── main.py              # FastAPI app + WebSocket endpoint
 │   ├── config.py            # Settings (Riva URI, audio params, languages)
@@ -66,8 +72,10 @@ realtime-s2s-demo-app/
 │   │   │   ├── useWebSocket.ts       # WebSocket connection
 │   │   │   ├── useAudioCapture.ts    # Mic capture via Web Audio API
 │   │   │   └── useAudioPlayback.ts   # Translated audio playback
-│   │   └── types/
-│   │       └── messages.ts           # TypeScript types
+│   │   ├── types/
+│   │   │   └── messages.ts           # TypeScript types
+│   │   └── utils/
+│   │       └── playbackPolicy.ts      # Adaptive queue policy and summaries
 │   ├── package.json
 │   └── vite.config.ts
 │
@@ -79,7 +87,7 @@ realtime-s2s-demo-app/
 ## Prerequisites
 
 - Python 3.9+
-- Node.js 18+
+- Node.js 20.19+ or 22.12+
 - Docker with NVIDIA Container Toolkit and a visible CDI GPU device
 - An NGC Personal Key with access to the NGC Catalog
 - An NVIDIA GPU with enough memory for all three selected profiles
@@ -293,7 +301,25 @@ python batch_latency_test.py \
 
 Generated event CSVs and plots stay ignored because they are large. Compact summaries from the July 8, 2026 runs are versioned under `docs/results/nemotron3/`; interpretation and comparison with Jonathan's earlier runs are in `NEMOTRON_TEST_RESULTS.md`.
 
-For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so the next architecture should cap the playback queue at roughly 5-10 seconds and evaluate adaptive playback/prosody speeds around 1.05x-1.10x.
+For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so this branch experiments with a 5-second catch-up target, an 8-second urgent threshold, and a 10-second soft ceiling. It schedules output at 1.00x, 1.05x, or 1.10x and never drops speech.
+
+The 10-second value is an audience-experience objective, not a guaranteed hard cap. If translated audio is generated faster than 1.10x playback can consume it, the queue can still exceed that value. Browser queue depth also excludes the upstream time spent waiting for ASR finalization, translation, and the first TTS audio; therefore it does not by itself equal the delay between an English joke and its Spanish rendering.
+
+A deterministic replay of the three saved Nemotron arrival traces reduced the combined fixed-rate listener tail by 82.2%, from 472.151 seconds to 84.001 seconds. It did not satisfy the queue objective: simulated peaks remained 23.8-53.1 seconds. These are offline policy projections, not new live Riva/browser runs or listening-quality results. Reproduce them when the ignored raw CSVs are present:
+
+```bash
+python analyze_playback_policy.py --input-dir test_results_nemotron
+```
+
+The compact replay report is [versioned with the Nemotron results](docs/results/nemotron3/playback_policy_analysis.md).
+
+Detailed guides:
+
+- [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
+- [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
+- [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
+- [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)
+- [Implementation and verification log](docs/IMPLEMENTATION_LOG.md)
 
 ## Troubleshooting
 

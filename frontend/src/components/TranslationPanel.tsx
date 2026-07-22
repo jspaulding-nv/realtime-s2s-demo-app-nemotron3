@@ -69,10 +69,20 @@ export function TranslationPanel() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [languages, setLanguages] = useState<Language[]>(DEFAULT_LANGUAGES);
   const [isTranslating, setIsTranslating] = useState(false);
-
+  const [playbackStatus, setPlaybackStatus] = useState({
+    queueDepthSeconds: 0,
+    playbackRate: 1,
+    aboveLimit: false,
+  });
   // Audio playback hook
-  const { queueAudio, start: startPlayback, stop: stopPlayback } = useAudioPlayback({
+  const {
+    queueAudio,
+    start: startPlayback,
+    stop: stopPlayback,
+    getPlaybackMetrics,
+  } = useAudioPlayback({
     sampleRate: AUDIO_CONFIG.sampleRate,
+    adaptivePlayback: true,
   });
 
   // WebSocket hook
@@ -137,6 +147,24 @@ export function TranslationPanel() {
     dispatch({ type: 'SET_CONNECTED', connected: isConnected });
   }, [isConnected]);
 
+  // The queue continues to decay while audio plays even when no new response
+  // arrives. Sample it so the display does not remain stuck at an old value.
+  useEffect(() => {
+    if (!isTranslating) return;
+
+    const updatePlaybackStatus = () => {
+      const metrics = getPlaybackMetrics();
+      setPlaybackStatus({
+        queueDepthSeconds: metrics.queueDepthSeconds,
+        playbackRate: metrics.playbackRate,
+        aboveLimit: metrics.aboveLimit,
+      });
+    };
+    updatePlaybackStatus();
+    const timer = setInterval(updatePlaybackStatus, 500);
+    return () => clearInterval(timer);
+  }, [isTranslating, getPlaybackMetrics]);
+
   // Handle start/stop translation
   const handleToggle = useCallback(async () => {
     if (isTranslating) {
@@ -147,6 +175,11 @@ export function TranslationPanel() {
       setIsTranslating(false);
     } else {
       // Start translation
+      setPlaybackStatus({
+        queueDepthSeconds: 0,
+        playbackRate: 1,
+        aboveLimit: false,
+      });
       startPlayback();
       sendMessage({ type: 'start_stream', targetLanguage: state.targetLanguage });
       await startCapture();
@@ -222,6 +255,32 @@ export function TranslationPanel() {
             disabled={!isConnected}
           />
         </div>
+
+        {isTranslating && (
+          <div
+            aria-label="Spanish playback queue"
+            className={`rounded-lg border p-3 mb-6 text-sm ${
+              playbackStatus.aboveLimit
+                ? 'bg-red-50 border-red-200 text-red-700'
+                : playbackStatus.queueDepthSeconds > 5
+                  ? 'bg-amber-50 border-amber-200 text-amber-700'
+                  : 'bg-green-50 border-green-200 text-green-700'
+            }`}
+          >
+            <div className="flex justify-between gap-4">
+              <span>Spanish playback queue</span>
+              <span className="font-mono font-semibold">
+                {playbackStatus.queueDepthSeconds.toFixed(1)}s at{' '}
+                {playbackStatus.playbackRate.toFixed(2)}x
+              </span>
+            </div>
+            {playbackStatus.aboveLimit && (
+              <p className="text-xs mt-1">
+                Queue exceeded the 10-second target; all speech is still preserved.
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Error Message */}
         {state.errorMessage && (

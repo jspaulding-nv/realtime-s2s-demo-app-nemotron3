@@ -1,0 +1,313 @@
+{
+  "schema_version": 1,
+  "source_format": "batch_latency_test client event CSV",
+  "audio_format": {
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "bytes_per_sample": 2
+  },
+  "policy": {
+    "target_queue_seconds": 5.0,
+    "urgent_queue_seconds": 8.0,
+    "limit_queue_seconds": 10.0,
+    "catch_up_release_seconds": 4.0,
+    "urgent_release_seconds": 7.0,
+    "normal_rate": 1.0,
+    "catch_up_rate": 1.05,
+    "urgent_rate": 1.1
+  },
+  "semantics": {
+    "preserve_every_chunk": true,
+    "limit_is_sla_alarm_not_drop_boundary": true,
+    "queue_time_above_threshold_is_exact_between_arrivals": true,
+    "arrival_queue_percentiles_use_nearest_rank": true
+  },
+  "traces": [
+    {
+      "trace_csv": "200108_SpiritandPresenceofGod_results.csv",
+      "trace_sha256": "7946f094e1ee7ae1e518bd895745ec0137f2bc774fb030e5dad984c1dfc92bb1",
+      "input_end_seconds": 1908.32855,
+      "translated_audio_seconds": 2015.921812,
+      "recorded_fixed_listener_tail_seconds": 172.77,
+      "reproduced_fixed_tail_delta_seconds": 0.000245,
+      "fixed_1x": {
+        "adaptive": false,
+        "chunks_received": 14178,
+        "chunks_scheduled": 14178,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 2015.921812,
+        "total_scheduled_duration_seconds": 2015.921812,
+        "first_arrival_seconds": 16.09848,
+        "input_end_seconds": 1908.32855,
+        "playback_end_seconds": 2081.098795,
+        "listener_tail_seconds": 172.770245,
+        "peak_queue_depth_seconds": 173.063035,
+        "arrival_queue_p50_seconds": 89.021407,
+        "arrival_queue_p95_seconds": 157.1185,
+        "seconds_above_target": 1926.194895,
+        "seconds_above_limit": 1838.845862,
+        "percent_playback_window_above_target": 93.278189,
+        "percent_playback_window_above_limit": 89.048212,
+        "limit_breach_entries": 0,
+        "accelerated_source_duration_seconds": 0.0,
+        "accelerated_source_percent": 0.0,
+        "urgent_source_duration_seconds": 0.0,
+        "urgent_source_percent": 0.0,
+        "rate_chunk_counts": {
+          "1.00x": 14178,
+          "1.05x": 0,
+          "1.10x": 0
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 2015.921812,
+          "1.05x": 0.0,
+          "1.10x": 0.0
+        },
+        "mode_chunk_counts": {
+          "normal": 14178,
+          "catch-up": 0,
+          "urgent": 0,
+          "over-limit": 0
+        }
+      },
+      "adaptive": {
+        "adaptive": true,
+        "chunks_received": 14178,
+        "chunks_scheduled": 14178,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 2015.921812,
+        "total_scheduled_duration_seconds": 1849.295499,
+        "first_arrival_seconds": 16.09848,
+        "input_end_seconds": 1908.32855,
+        "playback_end_seconds": 1935.511196,
+        "listener_tail_seconds": 27.182646,
+        "peak_queue_depth_seconds": 46.541019,
+        "arrival_queue_p50_seconds": 22.373673,
+        "arrival_queue_p95_seconds": 38.313811,
+        "seconds_above_target": 1706.91579,
+        "seconds_above_limit": 1535.768269,
+        "percent_playback_window_above_target": 88.929065,
+        "percent_playback_window_above_limit": 80.012405,
+        "limit_breach_entries": 36,
+        "accelerated_source_duration_seconds": 1878.644125,
+        "accelerated_source_percent": 93.190327,
+        "urgent_source_duration_seconds": 1782.559312,
+        "urgent_source_percent": 88.42403,
+        "rate_chunk_counts": {
+          "1.00x": 953,
+          "1.05x": 702,
+          "1.10x": 12523
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 137.277688,
+          "1.05x": 96.084813,
+          "1.10x": 1782.559312
+        },
+        "mode_chunk_counts": {
+          "normal": 953,
+          "catch-up": 702,
+          "urgent": 628,
+          "over-limit": 11895
+        }
+      },
+      "comparison": {
+        "listener_tail_reduction_seconds": 145.587599,
+        "listener_tail_reduction_percent": 84.266593,
+        "peak_queue_reduction_seconds": 126.522016
+      }
+    },
+    {
+      "trace_csv": "Blessed_Self-Forgetfulness_results.csv",
+      "trace_sha256": "e0b3b3d2d077d0edb474495484711c0fcd2a48afe395996ada44ac72650298bd",
+      "input_end_seconds": 2427.03727,
+      "translated_audio_seconds": 2624.196812,
+      "recorded_fixed_listener_tail_seconds": 228.782,
+      "reproduced_fixed_tail_delta_seconds": 0.000255,
+      "fixed_1x": {
+        "adaptive": false,
+        "chunks_received": 18584,
+        "chunks_scheduled": 18584,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 2624.196812,
+        "total_scheduled_duration_seconds": 2624.196812,
+        "first_arrival_seconds": 2.33471,
+        "input_end_seconds": 2427.03727,
+        "playback_end_seconds": 2655.819525,
+        "listener_tail_seconds": 228.782255,
+        "peak_queue_depth_seconds": 235.243625,
+        "arrival_queue_p50_seconds": 86.465585,
+        "arrival_queue_p95_seconds": 221.544077,
+        "seconds_above_target": 2503.346185,
+        "seconds_above_limit": 2390.361885,
+        "percent_playback_window_above_target": 94.341832,
+        "percent_playback_window_above_limit": 90.083873,
+        "limit_breach_entries": 0,
+        "accelerated_source_duration_seconds": 0.0,
+        "accelerated_source_percent": 0.0,
+        "urgent_source_duration_seconds": 0.0,
+        "urgent_source_percent": 0.0,
+        "rate_chunk_counts": {
+          "1.00x": 18584,
+          "1.05x": 0,
+          "1.10x": 0
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 2624.196812,
+          "1.05x": 0.0,
+          "1.10x": 0.0
+        },
+        "mode_chunk_counts": {
+          "normal": 18584,
+          "catch-up": 0,
+          "urgent": 0,
+          "over-limit": 0
+        }
+      },
+      "adaptive": {
+        "adaptive": true,
+        "chunks_received": 18584,
+        "chunks_scheduled": 18584,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 2624.196812,
+        "total_scheduled_duration_seconds": 2410.817341,
+        "first_arrival_seconds": 2.33471,
+        "input_end_seconds": 2427.03727,
+        "playback_end_seconds": 2467.243199,
+        "listener_tail_seconds": 40.205929,
+        "peak_queue_depth_seconds": 53.109845,
+        "arrival_queue_p50_seconds": 20.913795,
+        "arrival_queue_p95_seconds": 44.948824,
+        "seconds_above_target": 2212.66848,
+        "seconds_above_limit": 1905.986148,
+        "percent_playback_window_above_target": 89.76676,
+        "percent_playback_window_above_limit": 77.324824,
+        "limit_breach_entries": 53,
+        "accelerated_source_duration_seconds": 2435.742312,
+        "accelerated_source_percent": 92.818584,
+        "urgent_source_duration_seconds": 2249.74925,
+        "urgent_source_percent": 85.730965,
+        "rate_chunk_counts": {
+          "1.00x": 1339,
+          "1.05x": 1321,
+          "1.10x": 15924
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 188.4545,
+          "1.05x": 185.993062,
+          "1.10x": 2249.74925
+        },
+        "mode_chunk_counts": {
+          "normal": 1339,
+          "catch-up": 1321,
+          "urgent": 1039,
+          "over-limit": 14885
+        }
+      },
+      "comparison": {
+        "listener_tail_reduction_seconds": 188.576326,
+        "listener_tail_reduction_percent": 82.426116,
+        "peak_queue_reduction_seconds": 182.13378
+      }
+    },
+    {
+      "trace_csv": "gospel_in_life_tk_1-john-part-2-mp3_Beholding_the_Love_of_God_results.csv",
+      "trace_sha256": "4427809d35f4b252dde839ccbac0bcb40b91953b328ba373e44a1d7e8ef8f564",
+      "input_end_seconds": 1887.94678,
+      "translated_audio_seconds": 1919.514187,
+      "recorded_fixed_listener_tail_seconds": 70.598,
+      "reproduced_fixed_tail_delta_seconds": 4.5e-05,
+      "fixed_1x": {
+        "adaptive": false,
+        "chunks_received": 13229,
+        "chunks_scheduled": 13229,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 1919.514187,
+        "total_scheduled_duration_seconds": 1919.514187,
+        "first_arrival_seconds": 4.66527,
+        "input_end_seconds": 1887.94678,
+        "playback_end_seconds": 1958.544825,
+        "listener_tail_seconds": 70.598045,
+        "peak_queue_depth_seconds": 85.309472,
+        "arrival_queue_p50_seconds": 52.171817,
+        "arrival_queue_p95_seconds": 73.047735,
+        "seconds_above_target": 1828.661845,
+        "seconds_above_limit": 1785.63357,
+        "percent_playback_window_above_target": 93.591329,
+        "percent_playback_window_above_limit": 91.389132,
+        "limit_breach_entries": 0,
+        "accelerated_source_duration_seconds": 0.0,
+        "accelerated_source_percent": 0.0,
+        "urgent_source_duration_seconds": 0.0,
+        "urgent_source_percent": 0.0,
+        "rate_chunk_counts": {
+          "1.00x": 13229,
+          "1.05x": 0,
+          "1.10x": 0
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 1919.514187,
+          "1.05x": 0.0,
+          "1.10x": 0.0
+        },
+        "mode_chunk_counts": {
+          "normal": 13229,
+          "catch-up": 0,
+          "urgent": 0,
+          "over-limit": 0
+        }
+      },
+      "adaptive": {
+        "adaptive": true,
+        "chunks_received": 13229,
+        "chunks_scheduled": 13229,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 1919.514187,
+        "total_scheduled_duration_seconds": 1787.932968,
+        "first_arrival_seconds": 4.66527,
+        "input_end_seconds": 1887.94678,
+        "playback_end_seconds": 1904.559539,
+        "listener_tail_seconds": 16.612759,
+        "peak_queue_depth_seconds": 23.813946,
+        "arrival_queue_p50_seconds": 10.03768,
+        "arrival_queue_p95_seconds": 19.479068,
+        "seconds_above_target": 1448.518224,
+        "seconds_above_limit": 867.003322,
+        "percent_playback_window_above_target": 76.242044,
+        "percent_playback_window_above_limit": 45.634293,
+        "limit_breach_entries": 114,
+        "accelerated_source_duration_seconds": 1600.004875,
+        "accelerated_source_percent": 83.354678,
+        "urgent_source_duration_seconds": 1279.520812,
+        "urgent_source_percent": 66.658575,
+        "rate_chunk_counts": {
+          "1.00x": 2221,
+          "1.05x": 2173,
+          "1.10x": 8835
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 319.509313,
+          "1.05x": 320.484062,
+          "1.10x": 1279.520812
+        },
+        "mode_chunk_counts": {
+          "normal": 2221,
+          "catch-up": 2173,
+          "urgent": 2171,
+          "over-limit": 6664
+        }
+      },
+      "comparison": {
+        "listener_tail_reduction_seconds": 53.985286,
+        "listener_tail_reduction_percent": 76.468528,
+        "peak_queue_reduction_seconds": 61.495527
+      }
+    }
+  ],
+  "aggregate": {
+    "trace_count": 3,
+    "fixed_listener_tail_seconds": 472.150545,
+    "adaptive_listener_tail_seconds": 84.001334,
+    "listener_tail_reduction_seconds": 388.149211,
+    "listener_tail_reduction_percent": 82.208782
+  }
+}

@@ -18,6 +18,7 @@ let createdSources: Array<{
   connect: ReturnType<typeof vi.fn>;
   start: ReturnType<typeof vi.fn>;
   onended: (() => void) | null;
+  playbackRate: { value: number };
 }>;
 
 function setupMockAudioContext() {
@@ -55,6 +56,7 @@ function setupMockAudioContext() {
         connect: vi.fn(),
         start: vi.fn(),
         onended: null as (() => void) | null,
+        playbackRate: { value: 1 },
       };
       createdSources.push(source);
       return source;
@@ -175,6 +177,18 @@ describe('useAudioPlayback', () => {
     expect(mockGainNode.gain.value).toBe(1);
   });
 
+  it('preserves the selected mute state across playback sessions', () => {
+    const { result } = renderHook(() => useAudioPlayback());
+
+    act(() => result.current.start());
+    act(() => result.current.setMuted(true));
+    act(() => result.current.stop());
+    act(() => result.current.start());
+
+    expect(result.current.isMuted).toBe(true);
+    expect(mockGainNode.gain.value).toBe(0);
+  });
+
   // --- queueAudio ---
 
   it('queueAudio ignores data when not active', () => {
@@ -275,5 +289,106 @@ describe('useAudioPlayback', () => {
     act(() => createdSources[0].onended?.());
 
     expect(result.current.getPlaybackPosition()).toBeCloseTo(0.1, 2);
+  });
+
+  // --- Adaptive bounded-target playback ---
+
+  it('keeps 1.00x playback when adaptation is disabled', () => {
+    const { result } = renderHook(() => useAudioPlayback());
+    act(() => result.current.start());
+
+    act(() => result.current.queueAudio(new Int16Array(160000).buffer));
+
+    expect(createdSources[0].playbackRate.value).toBe(1);
+    expect(result.current.getPlaybackMetrics().playbackMode).toBe('normal');
+  });
+
+  it('selects 1.05x when the projected queue reaches five seconds', () => {
+    const { result } = renderHook(() =>
+      useAudioPlayback({ adaptivePlayback: true }),
+    );
+    act(() => result.current.start());
+
+    act(() => result.current.queueAudio(new Int16Array(80000).buffer));
+
+    expect(createdSources[0].playbackRate.value).toBe(1.05);
+    expect(result.current.getPlaybackMetrics().playbackMode).toBe('catch-up');
+    expect(result.current.getPlaybackMetrics().queueDepthSeconds).toBeCloseTo(
+      5 / 1.05,
+      5,
+    );
+  });
+
+  it('selects 1.10x when the projected queue reaches eight seconds', () => {
+    const { result } = renderHook(() =>
+      useAudioPlayback({ adaptivePlayback: true }),
+    );
+    act(() => result.current.start());
+
+    act(() => result.current.queueAudio(new Int16Array(128000).buffer));
+
+    expect(createdSources[0].playbackRate.value).toBe(1.1);
+    expect(result.current.getPlaybackMetrics().playbackMode).toBe('urgent');
+  });
+
+  it('advances the schedule by media duration divided by playback rate', () => {
+    const { result } = renderHook(() =>
+      useAudioPlayback({ adaptivePlayback: true }),
+    );
+    act(() => result.current.start());
+
+    const fiveSeconds = new Int16Array(80000).buffer;
+    act(() => result.current.queueAudio(fiveSeconds));
+    act(() => result.current.queueAudio(new Int16Array(1600).buffer));
+
+    expect(createdSources[1].start).toHaveBeenCalledWith(5 / 1.05);
+  });
+
+  it('reports queue decay as AudioContext time advances', () => {
+    const { result } = renderHook(() => useAudioPlayback());
+    act(() => result.current.start());
+    act(() => result.current.queueAudio(new Int16Array(16000).buffer));
+
+    expect(result.current.getPlaybackMetrics().queueDepthSeconds).toBeCloseTo(1);
+    mockCtxCurrentTime = 0.4;
+    expect(result.current.getPlaybackMetrics().queueDepthSeconds).toBeCloseTo(0.6);
+  });
+
+  it('preserves all buffers and edge-counts an over-limit breach', () => {
+    const onSchedule = vi.fn();
+    const { result } = renderHook(() =>
+      useAudioPlayback({ adaptivePlayback: true, onSchedule }),
+    );
+    act(() => result.current.start());
+
+    act(() => result.current.queueAudio(new Int16Array(192000).buffer));
+    act(() => result.current.queueAudio(new Int16Array(1600).buffer));
+
+    expect(createdSources).toHaveLength(2);
+    expect(createdSources[0].playbackRate.value).toBe(1.1);
+    expect(createdSources[1].playbackRate.value).toBe(1.1);
+    expect(result.current.getPlaybackMetrics().limitExceededCount).toBe(1);
+    expect(onSchedule).toHaveBeenCalledTimes(2);
+    expect(onSchedule.mock.calls[0][0].aboveLimit).toBe(true);
+  });
+
+  it('resets adaptive metrics when a new playback session starts', () => {
+    const { result } = renderHook(() =>
+      useAudioPlayback({ adaptivePlayback: true }),
+    );
+    act(() => result.current.start());
+    act(() => result.current.queueAudio(new Int16Array(192000).buffer));
+    expect(result.current.getPlaybackMetrics().limitExceededCount).toBe(1);
+
+    act(() => result.current.stop());
+    act(() => result.current.start());
+
+    expect(result.current.getPlaybackMetrics()).toMatchObject({
+      queueDepthSeconds: 0,
+      peakQueueDepthSeconds: 0,
+      playbackRate: 1,
+      playbackMode: 'normal',
+      limitExceededCount: 0,
+    });
   });
 });

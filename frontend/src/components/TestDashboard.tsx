@@ -7,15 +7,24 @@ import { useAudioPlayback } from '../hooks/useAudioPlayback';
 import { DriftChart } from './DriftChart';
 import { exportTimingDataAsCSV } from '../utils/csvExport';
 import type { DriftDataPoint } from '../types/timing';
+import {
+  DEFAULT_PLAYBACK_POLICY,
+  summarizePlaybackQueue,
+  type PlaybackQueueSample,
+} from '../utils/playbackPolicy';
 
 type TestPhase = 'idle' | 'running' | 'draining' | 'completed';
 
-const DRAIN_QUIET_SEC = 30;
+const DRAIN_MIN_SEC = 10;
+const DRAIN_IDLE_SEC = 5;
+const DRAIN_MAX_SEC = 300;
+const PLAYBACK_DRAIN_EPSILON_SEC = 0.1;
 
 export function TestDashboard() {
   const [phase, setPhase] = useState<TestPhase>('idle');
+  const [adaptivePlaybackEnabled, setAdaptivePlaybackEnabled] = useState(true);
   const [driftData, setDriftData] = useState<DriftDataPoint[]>([]);
-  const [drainCountdown, setDrainCountdown] = useState(DRAIN_QUIET_SEC);
+  const [drainCountdown, setDrainCountdown] = useState(DRAIN_IDLE_SEC);
   const [stats, setStats] = useState({
     currentDrift: 0,
     avgDrift: 0,
@@ -23,28 +32,49 @@ export function TestDashboard() {
     elapsedSec: 0,
     chunksSent: 0,
     responsesReceived: 0,
+    queueDepth: 0,
+    queueP95: 0,
+    peakQueueDepth: 0,
+    playbackRate: 1,
+    secondsAboveTarget: 0,
+    secondsAboveLimit: 0,
+    limitBreaches: 0,
   });
 
   const testStartTimeRef = useRef(0);
   const driftUpdateTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastReceiveChangeRef = useRef(0);
+  const drainStartTimeRef = useRef(0);
   const phaseRef = useRef<TestPhase>('idle');
   const driftDataRef = useRef<DriftDataPoint[]>([]);
+  const queueSamplesRef = useRef<PlaybackQueueSample[]>([]);
 
   const tracker = useTimingTracker();
   const trackerRef = useRef(tracker);
-  trackerRef.current = tracker;
   const metrics = useMetricsSocket();
 
   // Audio playback: input (English) starts muted, output (Spanish) starts muted
-  const inputPlayback = useAudioPlayback({ sampleRate: 16000, initialMuted: true });
-  const outputPlayback = useAudioPlayback({ sampleRate: 16000, initialMuted: true });
+  const inputPlayback = useAudioPlayback({
+    sampleRate: 16000,
+    initialMuted: true,
+    adaptivePlayback: false,
+  });
+  const outputPlayback = useAudioPlayback({
+    sampleRate: 16000,
+    initialMuted: true,
+    adaptivePlayback: adaptivePlaybackEnabled,
+    onSchedule: (event) => trackerRef.current.logPlaybackScheduled(event),
+  });
 
   // Stable refs for playback instances
   const inputPlaybackRef = useRef(inputPlayback);
-  inputPlaybackRef.current = inputPlayback;
   const outputPlaybackRef = useRef(outputPlayback);
-  outputPlaybackRef.current = outputPlayback;
+
+  useEffect(() => {
+    trackerRef.current = tracker;
+    inputPlaybackRef.current = inputPlayback;
+    outputPlaybackRef.current = outputPlayback;
+  }, [tracker, inputPlayback, outputPlayback]);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -75,7 +105,10 @@ export function TestDashboard() {
       outputPlaybackRef.current.queueAudio(audio);
     },
   });
-  wsRef.current = ws;
+
+  useEffect(() => {
+    wsRef.current = ws;
+  }, [ws]);
 
   // File audio source
   const fileSource = useFileAudioSource({
@@ -92,15 +125,21 @@ export function TestDashboard() {
     onComplete: () => {
       console.log('[TestDashboard] onComplete fired. phaseRef.current =', phaseRef.current);
       if (phaseRef.current === 'running') {
-        wsRef.current.sendMessage({ type: 'stop_stream' });
+        // Close the request-audio side while leaving the WebSocket open for
+        // final Riva responses and the browser playback queue to drain.
+        wsRef.current.sendMessage({ type: 'end_input' });
         lastReceiveChangeRef.current = performance.now();
+        drainStartTimeRef.current = performance.now();
         setPhase('draining');
       }
     },
   });
-  fileSourceRef.current = fileSource;
 
-  // -- Drift data update (playback-based) --
+  useEffect(() => {
+    fileSourceRef.current = fileSource;
+  }, [fileSource]);
+
+  // -- Queue sampling plus the historical cross-language duration comparison --
   const updateDriftData = useCallback(() => {
     const t = trackerRef.current;
     const elapsedMs = performance.now() - testStartTimeRef.current;
@@ -108,10 +147,25 @@ export function TestDashboard() {
     const sendCount = t.getSendCount();
     const recvCount = t.getReceiveCount();
 
-    // Playback-based drift: how far the listener is behind the speaker
+    // Legacy duration drift compares unlike English and Spanish media
+    // positions. Keep it for continuity; the browser queue below is the
+    // listener-backlog metric.
     const inputPosition = fileSourceRef.current.position;
     const playbackPosition = outputPlaybackRef.current.getPlaybackPosition();
     const drift = inputPosition - playbackPosition;
+    const playbackMetrics = outputPlaybackRef.current.getPlaybackMetrics();
+    const queueSample: PlaybackQueueSample = {
+      timestampSeconds: elapsedSec,
+      queueDepthSeconds: playbackMetrics.queueDepthSeconds,
+      playbackRate: playbackMetrics.playbackRate,
+    };
+    queueSamplesRef.current.push(queueSample);
+    const queueSummary = summarizePlaybackQueue(queueSamplesRef.current);
+    trackerRef.current.logPlaybackQueueSample(
+      playbackMetrics.queueDepthSeconds,
+      playbackMetrics.playbackRate,
+      playbackMetrics.playbackMode,
+    );
 
     // Log every 5 seconds
     if (Math.floor(elapsedSec) % 5 === 0) {
@@ -139,6 +193,13 @@ export function TestDashboard() {
       elapsedSec,
       chunksSent: sendCount,
       responsesReceived: recvCount,
+      queueDepth: playbackMetrics.queueDepthSeconds,
+      queueP95: queueSummary.p95QueueDepthSeconds,
+      peakQueueDepth: playbackMetrics.peakQueueDepthSeconds,
+      playbackRate: playbackMetrics.playbackRate,
+      secondsAboveTarget: queueSummary.secondsAboveTarget,
+      secondsAboveLimit: queueSummary.secondsAboveLimit,
+      limitBreaches: playbackMetrics.limitExceededCount,
     });
   }, []);
 
@@ -147,10 +208,12 @@ export function TestDashboard() {
     console.log('[TestDashboard] handleStart called');
     setDriftData([]);
     driftDataRef.current = [];
+    queueSamplesRef.current = [];
     testStartTimeRef.current = performance.now();
     lastReceiveChangeRef.current = performance.now();
     chunkLogCountRef.current = 0;
     audioLogCountRef.current = 0;
+    setDrainCountdown(DRAIN_IDLE_SEC);
 
     console.log('[TestDashboard] Calling /api/test/start...');
     await fetch('/api/test/start', { method: 'POST' });
@@ -158,7 +221,7 @@ export function TestDashboard() {
 
     metrics.connect();
     metrics.clearEvents();
-    trackerRef.current.startTest();
+    trackerRef.current.startTest({ adaptivePlaybackEnabled });
 
     // Start both playback instances
     inputPlaybackRef.current.start();
@@ -167,7 +230,7 @@ export function TestDashboard() {
     console.log('[TestDashboard] Calling ws.connect()...');
     wsRef.current.connect();
     setPhase('running');
-  }, [metrics]);
+  }, [metrics, adaptivePlaybackEnabled]);
 
   // -- Once WS connects, start stream + file source --
   const hasStartedStreamRef = useRef(false);
@@ -200,9 +263,10 @@ export function TestDashboard() {
   }, [phase, updateDriftData]);
 
   // -- Finish: disconnect everything, move to completed --
-  const finishTestRef = useRef<() => Promise<void>>();
-  finishTestRef.current = async () => {
+  const finishTestRef = useRef<(() => Promise<void>) | null>(null);
+  const finishTest = useCallback(async () => {
     console.log('[TestDashboard] finishTest called');
+    wsRef.current.sendMessage({ type: 'stop_stream' });
     wsRef.current.disconnect();
     metrics.disconnect();
 
@@ -216,21 +280,45 @@ export function TestDashboard() {
       driftUpdateTimerRef.current = null;
     }
     setPhase('completed');
-  };
+  }, [metrics]);
 
-  // -- Draining: auto-stop after DRAIN_QUIET_SEC with no new audio --
+  useEffect(() => {
+    finishTestRef.current = finishTest;
+  }, [finishTest]);
+
+  // -- Draining: require both network quiet and an empty playback queue --
   useEffect(() => {
     if (phase !== 'draining') return;
 
-    console.log('[TestDashboard] Draining phase started, will auto-stop after', DRAIN_QUIET_SEC, 's of silence');
+    console.log(
+      '[TestDashboard] Draining phase started; waiting for network and playback queue',
+    );
     const checkInterval = setInterval(() => {
+      const drainElapsedSec = (
+        performance.now() - drainStartTimeRef.current
+      ) / 1000;
       const silenceSec = (performance.now() - lastReceiveChangeRef.current) / 1000;
-      const remaining = Math.max(0, Math.ceil(DRAIN_QUIET_SEC - silenceSec));
-      console.log(`[TestDashboard] Drain check: silence=${silenceSec.toFixed(1)}s, remaining=${remaining}s`);
+      const queueDepthSec = outputPlaybackRef.current.getPlaybackMetrics()
+        .queueDepthSeconds;
+      const remaining = Math.max(0, Math.ceil(DRAIN_IDLE_SEC - silenceSec));
+      console.log(
+        `[TestDashboard] Drain check: elapsed=${drainElapsedSec.toFixed(1)}s, `
+        + `silence=${silenceSec.toFixed(1)}s, queue=${queueDepthSec.toFixed(1)}s`,
+      );
       setDrainCountdown(remaining);
 
-      if (silenceSec >= DRAIN_QUIET_SEC) {
-        console.log('[TestDashboard] Drain timeout reached, finishing test');
+      const fullyDrained =
+        drainElapsedSec >= DRAIN_MIN_SEC
+        && silenceSec >= DRAIN_IDLE_SEC
+        && queueDepthSec <= PLAYBACK_DRAIN_EPSILON_SEC;
+      const timedOut = drainElapsedSec >= DRAIN_MAX_SEC;
+
+      if (fullyDrained || timedOut) {
+        console.log(
+          fullyDrained
+            ? '[TestDashboard] Network and playback queue drained'
+            : '[TestDashboard] Maximum drain time reached',
+        );
         clearInterval(checkInterval);
         finishTestRef.current?.();
       }
@@ -243,7 +331,6 @@ export function TestDashboard() {
   const handleStop = useCallback(async () => {
     console.log('[TestDashboard] handleStop called');
     fileSourceRef.current.stopStreaming();
-    wsRef.current.sendMessage({ type: 'stop_stream' });
     await finishTestRef.current?.();
   }, []);
 
@@ -288,7 +375,7 @@ export function TestDashboard() {
             <div>
               <h1 className="text-2xl font-bold text-gray-800">Latency Test Dashboard</h1>
               <p className="text-gray-500 text-sm mt-1">
-                Measure drift between input and output audio over time
+                Measure audience playback backlog and legacy duration drift
               </p>
             </div>
             <a href="#/" className="text-blue-500 hover:text-blue-700 text-sm underline">
@@ -348,6 +435,22 @@ export function TestDashboard() {
             )}
           </div>
 
+          <label className="mt-4 flex items-start gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={adaptivePlaybackEnabled}
+              onChange={(event) => setAdaptivePlaybackEnabled(event.target.checked)}
+              disabled={phase !== 'idle'}
+              className="mt-0.5 h-4 w-4"
+            />
+            <span>
+              Adaptive Spanish playback (1.00x / 1.05x / 1.10x)
+              <span className="block text-xs text-gray-500">
+                Turn off before starting to capture the fixed 1.00x control.
+              </span>
+            </span>
+          </label>
+
           {/* File Info */}
           {fileSource.isLoaded && (
             <p className="mt-2 text-xs text-gray-400">
@@ -401,10 +504,13 @@ export function TestDashboard() {
           {phase === 'draining' && (
             <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
               <p className="text-amber-700 text-sm">
-                File finished sending. Waiting for remaining translated audio...
-                Auto-stopping in{' '}
-                <span className="font-mono font-bold">{drainCountdown}s</span> if no new audio
-                arrives.
+                File input ended. Waiting for Riva output and the listener queue
+                to drain. Network-idle countdown:{' '}
+                <span className="font-mono font-bold">{drainCountdown}s</span>;
+                playback queue:{' '}
+                <span className="font-mono font-bold">
+                  {stats.queueDepth.toFixed(1)}s
+                </span>.
               </p>
             </div>
           )}
@@ -413,7 +519,9 @@ export function TestDashboard() {
         {/* Drift Chart */}
         {(phase === 'running' || phase === 'draining' || phase === 'completed') && (
           <div className="bg-white rounded-2xl shadow-xl p-6">
-            <h2 className="text-lg font-semibold text-gray-800 mb-4">Drift Over Time</h2>
+            <h2 className="text-lg font-semibold text-gray-800 mb-4">
+              Legacy Duration Drift Over Time
+            </h2>
             <DriftChart data={driftData} />
           </div>
         )}
@@ -421,8 +529,57 @@ export function TestDashboard() {
         {/* Stats Panel */}
         {(phase === 'running' || phase === 'draining' || phase === 'completed') && (
           <div className="bg-white rounded-2xl shadow-xl p-6">
-            <h2 className="text-lg font-semibold text-gray-800 mb-4">Statistics</h2>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <h2 className="text-lg font-semibold text-gray-800 mb-1">
+              Audience Playback Statistics
+            </h2>
+            <p className="text-xs text-gray-500 mb-4">
+              Queue depth is exact browser backlog. Legacy duration drift is not
+              utterance-aligned end-to-end latency.
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <StatCard
+                label="Current Queue"
+                value={`${stats.queueDepth.toFixed(2)}s`}
+                warn={stats.queueDepth > DEFAULT_PLAYBACK_POLICY.targetQueueSeconds}
+                danger={stats.queueDepth > DEFAULT_PLAYBACK_POLICY.limitQueueSeconds}
+              />
+              <StatCard
+                label="Queue p95"
+                value={`${stats.queueP95.toFixed(2)}s`}
+                warn={stats.queueP95 > DEFAULT_PLAYBACK_POLICY.targetQueueSeconds}
+                danger={stats.queueP95 > DEFAULT_PLAYBACK_POLICY.limitQueueSeconds}
+              />
+              <StatCard
+                label="Peak Queue"
+                value={`${stats.peakQueueDepth.toFixed(2)}s`}
+                warn={stats.peakQueueDepth > DEFAULT_PLAYBACK_POLICY.targetQueueSeconds}
+                danger={stats.peakQueueDepth > DEFAULT_PLAYBACK_POLICY.limitQueueSeconds}
+              />
+              <StatCard
+                label="Playback Rate"
+                value={`${stats.playbackRate.toFixed(2)}x`}
+              />
+              <StatCard
+                label="Time >5s"
+                value={`${stats.secondsAboveTarget.toFixed(0)}s`}
+              />
+              <StatCard
+                label="Time >10s"
+                value={`${stats.secondsAboveLimit.toFixed(0)}s`}
+                danger={stats.secondsAboveLimit > 0}
+              />
+              <StatCard
+                label="Limit Breaches"
+                value={stats.limitBreaches.toString()}
+                danger={stats.limitBreaches > 0}
+              />
+              <StatCard label="Responses" value={stats.responsesReceived.toString()} />
+            </div>
+
+            <h3 className="text-sm font-semibold text-gray-600 mt-6 mb-3">
+              Legacy Duration Comparison
+            </h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <StatCard
                 label="Current Drift"
                 value={`${stats.currentDrift.toFixed(2)}s`}
@@ -438,7 +595,6 @@ export function TestDashboard() {
               />
               <StatCard label="Elapsed" value={`${(stats.elapsedSec / 60).toFixed(1)} min`} />
               <StatCard label="Chunks Sent" value={stats.chunksSent.toString()} />
-              <StatCard label="Responses" value={stats.responsesReceived.toString()} />
             </div>
           </div>
         )}
