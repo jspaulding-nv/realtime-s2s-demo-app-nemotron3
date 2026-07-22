@@ -13,7 +13,7 @@ Microphone/File -> Backend (WebSocket) -> Riva ASR (en-US) -> NMT -> TTS (es-US)
 - Audio format: 16kHz mono int16, 4800 samples/chunk (300ms)
 - Translation model: `megatronnmt_any_any_1b`
 - TTS voice: `Magpie-Multilingual.ES-US.Isabela`
-- gRPC endpoint: `riva-host:50051`
+- gRPC endpoint: configured with `RIVA_URI` (default: `localhost:50051`)
 
 ## Drift Definition
 
@@ -141,7 +141,7 @@ The Test Dashboard (`frontend/src/components/TestDashboard.tsx`) provides:
 - CSV export of all timing events (client + backend)
 - Automatic drain detection (stops after 30s of silence)
 
-Test audio files are located in `test_audio/`:
-- `test-1min.wav` (1.8 MB) — short test
-- `test-30min.wav` (58 MB) — long-duration test
-- `long-form-03.mp3` (14 MB) — real-world sample audio
+Consent-cleared audio stays local and ignored. The default neutral fixtures are
+`test_audio/preflight.wav`, `test_audio/long-form-01.mp3` through
+`long-form-03.mp3`, and `test_audio/long-form-03-30min.wav`. See
+`test_audio/README.md`; `S2S_TEST_AUDIO_DIR` can select an external directory.

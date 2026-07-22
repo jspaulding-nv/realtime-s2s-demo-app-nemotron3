@@ -38,8 +38,9 @@ duration expansion, and is the closest metric to what a listener experiences.
 
 ## Comparison with @jgough-essextec's three prior runs
 
-Playback tails were reconstructed from the original event CSVs with the same
-queue simulation used for the new run.
+Playback tails were reconstructed before raw captures were removed from public
+history, using the same queue simulation as the new run. Only aggregate values
+are retained here.
 
 | File | Prior tails | Prior mean | Nemotron run | Change vs. mean |
 |---|---|---:|---:|---:|

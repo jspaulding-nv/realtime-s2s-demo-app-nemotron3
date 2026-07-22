@@ -19,6 +19,7 @@ Usage:
 Press Ctrl+C to stop.
 """
 
+import os
 import sys
 import threading
 import numpy as np
@@ -39,7 +40,7 @@ SOURCE_LANGUAGE = 'en-US'
 TARGET_LANGUAGE = 'es-US'
 
 # Riva service endpoint
-NMT_URI = 'riva-host:50051'
+NMT_URI = os.environ.get('RIVA_URI', 'localhost:50051')
 
 
 class MicrophoneStream:

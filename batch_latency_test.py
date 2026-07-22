@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -47,12 +48,13 @@ DRAIN_IDLE_SECONDS = 5
 DRAIN_MAX_SECONDS = 300
 TARGET_LANGUAGE = "es-US"
 
-TEST_FILES = [
-    "test_audio/long-form-01.mp3",
-    "test_audio/long-form-02.mp3",
-    "test_audio/long-form-03.mp3",
+AUDIO_DIR = Path(os.environ.get("S2S_TEST_AUDIO_DIR", "test_audio")).expanduser()
+LONG_FORM_FILES = [
+    str(AUDIO_DIR / "long-form-01.mp3"),
+    str(AUDIO_DIR / "long-form-02.mp3"),
+    str(AUDIO_DIR / "long-form-03.mp3"),
 ]
-PREFLIGHT_FILE = "test_audio/test-1min.wav"
+PREFLIGHT_FILE = str(AUDIO_DIR / "preflight.wav")
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +529,7 @@ def check_backend(backend_url: str):
 
 
 async def run_preflight(backend_url: str) -> bool:
-    """Run pre-flight validation with test-1min.wav."""
+    """Run pre-flight validation with the local neutral fixture."""
     print("\n=== Pre-flight Validation ===")
     if not Path(PREFLIGHT_FILE).exists():
         print(f"ERROR: Pre-flight file not found: {PREFLIGHT_FILE}")
@@ -605,7 +607,7 @@ def main():
     )
     parser.add_argument(
         "--preflight", action="store_true",
-        help="Run pre-flight validation only (test-1min.wav)",
+        help="Run pre-flight validation only (preflight.wav)",
     )
     parser.add_argument(
         "--file", type=str,
@@ -631,7 +633,7 @@ def main():
     if args.file:
         asyncio.run(run_batch([args.file], args.backend, args.output_dir))
     else:
-        asyncio.run(run_batch(TEST_FILES, args.backend, args.output_dir))
+        asyncio.run(run_batch(LONG_FORM_FILES, args.backend, args.output_dir))
 
 
 if __name__ == "__main__":

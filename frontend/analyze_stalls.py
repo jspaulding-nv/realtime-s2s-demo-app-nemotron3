@@ -5,11 +5,10 @@ Finds gaps > 3s between consecutive client audio_received events
 and examines all pipeline stages to determine root cause.
 """
 
+import argparse
 import csv
 import sys
 from collections import defaultdict
-
-CSV_PATH = "timing-export.csv"
 
 def load_data(path):
     rows = []
@@ -27,11 +26,15 @@ def load_data(path):
     return rows
 
 def main():
+    parser = argparse.ArgumentParser(description="Analyze stalls in a timing CSV export")
+    parser.add_argument("csv_path", help="Path to a local timing CSV export")
+    args = parser.parse_args()
+
     print("=" * 90)
-    print("STALL ANALYSIS: timing-export-2026-02-12T23-01-42-038Z.csv")
+    print("STALL ANALYSIS")
     print("=" * 90)
 
-    rows = load_data(CSV_PATH)
+    rows = load_data(args.csv_path)
     print(f"\nTotal events: {len(rows)}")
 
     # Separate by source+stage

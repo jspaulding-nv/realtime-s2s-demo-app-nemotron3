@@ -9,16 +9,21 @@ Runs two S2S streaming tests with the first 60 seconds of audio:
 Compares response timing to determine if endpointing config is respected.
 """
 
+import os
 import time
 import wave
 import sys
+from pathlib import Path
 
 import riva.client
 import riva.client.proto.riva_asr_pb2 as riva_asr_pb2
 import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
-RIVA_URI = "riva-host:50051"
-AUDIO_FILE = "test_audio/long-form-03-30min.wav"
+RIVA_URI = os.environ.get("RIVA_URI", "localhost:50051")
+AUDIO_FILE = os.environ.get(
+    "S2S_ENDPOINT_AUDIO",
+    str(Path(os.environ.get("S2S_TEST_AUDIO_DIR", "test_audio")) / "long-form-03-30min.wav"),
+)
 CHUNK_SIZE = 9600  # bytes (4800 samples * 2 bytes/sample = 300ms at 16kHz)
 CHUNK_INTERVAL = 0.3  # seconds between chunks
 AUDIO_DURATION_SEC = 60  # use first 60 seconds

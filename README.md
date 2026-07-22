@@ -4,7 +4,11 @@ A web-based real-time speech translation application using NVIDIA Riva services.
 
 This repository preserves [@jgough-essextec's original demo](https://github.com/jgough-essextec/realtime-s2s-demo-app) and adds the Riva evaluation configuration for English-to-Spanish long-form speech. It uses Nemotron 3 streaming ASR in place of Parakeet CTC, pins all three NIM releases, and adds listener-tail measurements for sample-length tests.
 
-GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains @jgough-essextec's full Git history as a standalone repository and records his project as the upstream source.
+GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains the sanitized upstream history as a standalone repository and records that project as the upstream source.
+
+Recorded inputs and raw runtime captures are intentionally excluded from Git.
+See the [sanitization policy](docs/SANITIZATION.md) and
+[local-audio instructions](test_audio/README.md) before running evaluations.
 
 ## What Changed
 
@@ -45,6 +49,8 @@ realtime-s2s-demo-app/
 ├── docker-compose.yaml     # Pinned Nemotron ASR, NMT, and TTS services
 ├── .env.example            # Compose and application configuration template
 ├── NEMOTRON_TEST_RESULTS.md
+├── test_audio/README.md     # Local-only, ignored evaluation fixtures
+├── docs/SANITIZATION.md     # Public-data and evidence policy
 ├── backend/
 │   ├── main.py              # FastAPI app + WebSocket endpoint
 │   ├── config.py            # Settings (Riva URI, audio params, languages)
@@ -92,7 +98,7 @@ The selected profiles allocate approximately 26.4 GB of GPU memory in total: 6 G
 
 ```bash
 cp .env.example .env
-mkdir -p .cache/nim
+mkdir -p .cache/nim test_audio
 chmod 777 .cache/nim
 ```
 
@@ -108,6 +114,11 @@ printf '%s' "$NGC_API_KEY" | \
 ```
 
 Never commit `.env`. If login returns `unauthorized`, confirm the key is active, unexpired, and includes the NGC Catalog service.
+
+Place consent-cleared evaluation fixtures under `test_audio/` using the neutral
+names documented in `test_audio/README.md`, or set `S2S_TEST_AUDIO_DIR` to a
+private directory outside the repository. Audio and raw result directories are
+ignored and must not be force-added.
 
 ### 2. Start the pinned Riva services
 
@@ -287,11 +298,14 @@ With the Riva services and backend running, execute a one-minute preflight befor
 ```bash
 python batch_latency_test.py --preflight
 python batch_latency_test.py \
-  --file test_audio/long-form-01.mp3 \
+  --file "${S2S_TEST_AUDIO_DIR:-test_audio}/long-form-01.mp3" \
   --output-dir test_results_nemotron
 ```
 
-Generated event CSVs and plots stay ignored because they are large. Compact summaries from the July 8, 2026 runs are versioned under `docs/results/nemotron3/`; interpretation and comparison with @jgough-essextec's earlier runs are in `NEMOTRON_TEST_RESULTS.md`.
+Generated event CSVs, plots, logs, and audio stay ignored because they can
+contain identifying metadata in addition to being large. Sanitized aggregate
+interpretation and comparison with @jgough-essextec's earlier runs are in
+`NEMOTRON_TEST_RESULTS.md`.
 
 For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so the next architecture should cap the playback queue at roughly 5-10 seconds and evaluate adaptive playback/prosody speeds around 1.05x-1.10x.
 

@@ -49,7 +49,14 @@ logs/
 .coverage
 htmlcov/
 .pytest_cache/
+test_audio/*
+!test_audio/README.md
+test_results/
+test_results_2/
+test_results_3/
 test_results_nemotron/
+experiment_results/
+docs/results/raw/
 
 # Temporary files
 *.tmp

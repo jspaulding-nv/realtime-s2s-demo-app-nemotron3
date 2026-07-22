@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import struct
 import time
 import wave
@@ -339,14 +340,15 @@ def main():
     )
     parser.add_argument(
         "--file", type=str, default=None,
-        help="Path to WAV file (default: test_audio/test-1min.wav)",
+        help="Path to WAV file (default: $S2S_TEST_AUDIO_DIR/preflight.wav)",
     )
     args = parser.parse_args()
 
     if args.file:
         wav_path = Path(args.file)
     else:
-        wav_path = SCRIPT_DIR / "test_audio" / "test-1min.wav"
+        audio_dir = Path(os.environ.get("S2S_TEST_AUDIO_DIR", SCRIPT_DIR / "test_audio"))
+        wav_path = audio_dir.expanduser() / "preflight.wav"
 
     if not wav_path.exists():
         print(f"ERROR: WAV file not found: {wav_path}")

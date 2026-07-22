@@ -12,15 +12,20 @@ under three configurations:
   C) Very aggressive endpointing
 """
 
+import os
 import time
 import wave
+from pathlib import Path
 import riva.client
 import riva.client.proto.riva_asr_pb2 as riva_asr_pb2
 import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
 # -- Configuration -----------------------------------------------------------
-RIVA_URI = "riva-host:50051"
-WAV_PATH = "test_audio/long-form-03-30min.wav"
+RIVA_URI = os.environ.get("RIVA_URI", "localhost:50051")
+WAV_PATH = os.environ.get(
+    "S2S_ENDPOINT_AUDIO",
+    str(Path(os.environ.get("S2S_TEST_AUDIO_DIR", "test_audio")) / "long-form-03-30min.wav"),
+)
 SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 4800          # 300 ms
 CHUNK_BYTES = CHUNK_SAMPLES * 2  # int16 = 2 bytes/sample

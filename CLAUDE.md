@@ -35,7 +35,8 @@ python test_mic_stream.py              # Test microphone stream class
 Microphone → Riva ASR (en-US) → NMT → TTS (es-US) → Speakers
 ```
 
-All Riva services accessed via single gRPC endpoint at `riva-host:50051`.
+All Riva services are accessed through the gRPC endpoint configured by
+`RIVA_URI` (default: `localhost:50051`).
 
 ### Key Classes (realtime_s2s.py)
 
