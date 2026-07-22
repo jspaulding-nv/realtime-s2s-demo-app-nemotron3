@@ -5,8 +5,11 @@
 The first foundation milestone is implemented and documented in
 [Staged pipeline foundation](STAGED_PIPELINE_FOUNDATION.md). It adds direct
 Nemotron streaming ASR, typed final/segment records, deterministic punctuation
-segmentation, and an opt-in live smoke. The active browser path remains
-monolithic, and no staged sermon run has been performed.
+segmentation, and an opt-in live smoke. The second milestone now also provides
+direct NMT/TTS adapters, bounded overlapping workers, ordered drain, and a
+successful one-minute live preflight; see
+[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md). The active
+browser path remains monolithic, and no staged sermon run has been performed.
 
 The current backend calls the monolithic streaming S2S operation on the NMT
 service. That endpoint connects to remote ASR and TTS services, but the
@@ -146,8 +149,10 @@ configuration values and expose both item count and residence time. A sensible
 initial experiment is a small number of sentence segments, then tune from
 measured processing time rather than guessing a production limit.
 
-The direct-ASR event queue is implemented and defaults to 32 events per stream.
-The NMT, TTS, and outbound queues described below are not implemented yet.
+The direct-ASR event queue defaults to 32 events per stream. Bounded NMT, TTS,
+and atomic-audio output queues are also implemented with default data
+capacities of four items each. The output path reserves one additional control
+slot so an error/completion record cannot deadlock behind full audio data.
 
 When a queue is full, the producer must await capacity and emit an overload
 metric. It must not allocate an unbounded list or discard speech. Because a
@@ -280,14 +285,16 @@ offset measurement.
 2. **Completed:** add typed ASR-stream/final, segment, and telemetry models,
    the punctuation segmenter, a bounded ASR event bridge, deterministic
    cancellation/lifecycle handling, and unit tests.
-3. Add application-owned direct NMT/TTS adapters and single-worker bounded
-   queues with fake-client tests.
-4. Add ordered outbound audio and deterministic sentinel-based drain tests.
-5. Persist stage telemetry and session summaries.
+3. **Completed:** add application-owned direct NMT/TTS adapters and
+   single-worker bounded queues with fake-client tests.
+4. **Completed:** add ordered atomic audio and deterministic sentinel-based
+   drain tests.
+5. **Completed:** retain stage telemetry and expose session summaries/reports.
 6. Integrate the existing WebSocket API behind a staged feature flag while
    retaining `end_input` and
    `stop_stream` semantics.
-7. Run the one-minute preflight, then one sermon, before the full matrix.
+7. **One-minute preflight completed:** run one staged sermon next, before the
+   full matrix.
 8. Compare monolithic and staged paths with identical models, input, EOU, and
    browser playback policy.
 9. Increase workers only if stage telemetry justifies it.

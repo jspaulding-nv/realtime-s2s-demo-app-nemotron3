@@ -24,6 +24,14 @@ class ASRStreamEventKind(str, Enum):
     ERROR = "error"
 
 
+class StagedOutputEventKind(str, Enum):
+    """Terminal-safe events exposed to a staged-pipeline consumer."""
+
+    AUDIO = "audio"
+    COMPLETE = "complete"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class ASRTranscript:
     """One interim or final result returned by streaming ASR."""
@@ -120,6 +128,149 @@ class TextSegment:
 
 
 @dataclass(frozen=True)
+class TranslatedSegment:
+    """One translated segment with its source identity and NMT timing."""
+
+    segment: TextSegment
+    text: str
+    language: str
+    started_monotonic_ms: float
+    completed_monotonic_ms: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segment, TextSegment):
+            raise ValueError("segment must be a TextSegment")
+        if not self.text.strip():
+            raise ValueError("translated text must contain non-whitespace content")
+        if not self.language.strip():
+            raise ValueError("translated language is required")
+        _validate_nonnegative_finite(
+            "started_monotonic_ms", self.started_monotonic_ms
+        )
+        _validate_nonnegative_finite(
+            "completed_monotonic_ms", self.completed_monotonic_ms
+        )
+        if self.completed_monotonic_ms < self.started_monotonic_ms:
+            raise ValueError("NMT completion cannot precede its start")
+
+    @property
+    def sequence_id(self) -> int:
+        return self.segment.sequence_id
+
+    @property
+    def processing_duration_ms(self) -> float:
+        return self.completed_monotonic_ms - self.started_monotonic_ms
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "segment": self.segment.to_dict(),
+            "text": self.text,
+            "language": self.language,
+            "started_monotonic_ms": self.started_monotonic_ms,
+            "completed_monotonic_ms": self.completed_monotonic_ms,
+            "processing_duration_ms": self.processing_duration_ms,
+        }
+
+
+@dataclass(frozen=True)
+class SynthesizedSegment:
+    """Atomic PCM output for one translated segment plus TTS timing."""
+
+    translation: TranslatedSegment
+    audio: bytes
+    sample_rate_hz: int
+    channels: int
+    bytes_per_sample: int
+    started_monotonic_ms: float
+    first_audio_monotonic_ms: float
+    completed_monotonic_ms: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.translation, TranslatedSegment):
+            raise ValueError("translation must be a TranslatedSegment")
+        if not isinstance(self.audio, bytes) or not self.audio:
+            raise ValueError("synthesized audio must be non-empty bytes")
+        for name, value in (
+            ("sample_rate_hz", self.sample_rate_hz),
+            ("channels", self.channels),
+            ("bytes_per_sample", self.bytes_per_sample),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, value in (
+            ("started_monotonic_ms", self.started_monotonic_ms),
+            ("first_audio_monotonic_ms", self.first_audio_monotonic_ms),
+            ("completed_monotonic_ms", self.completed_monotonic_ms),
+        ):
+            _validate_nonnegative_finite(name, value)
+        if self.first_audio_monotonic_ms < self.started_monotonic_ms:
+            raise ValueError("first TTS audio cannot precede its start")
+        if self.completed_monotonic_ms < self.first_audio_monotonic_ms:
+            raise ValueError("TTS completion cannot precede first audio")
+
+    @property
+    def sequence_id(self) -> int:
+        return self.translation.sequence_id
+
+    @property
+    def processing_duration_ms(self) -> float:
+        return self.completed_monotonic_ms - self.started_monotonic_ms
+
+    @property
+    def first_audio_latency_ms(self) -> float:
+        return self.first_audio_monotonic_ms - self.started_monotonic_ms
+
+    @property
+    def audio_duration_ms(self) -> float:
+        bytes_per_second = (
+            self.sample_rate_hz * self.channels * self.bytes_per_sample
+        )
+        return len(self.audio) / bytes_per_second * 1_000
+
+    def to_dict(self, *, include_audio: bool = False) -> Dict[str, Any]:
+        payload = {
+            "translation": self.translation.to_dict(),
+            "audio_bytes": len(self.audio),
+            "sample_rate_hz": self.sample_rate_hz,
+            "channels": self.channels,
+            "bytes_per_sample": self.bytes_per_sample,
+            "audio_duration_ms": self.audio_duration_ms,
+            "started_monotonic_ms": self.started_monotonic_ms,
+            "first_audio_monotonic_ms": self.first_audio_monotonic_ms,
+            "completed_monotonic_ms": self.completed_monotonic_ms,
+            "processing_duration_ms": self.processing_duration_ms,
+            "first_audio_latency_ms": self.first_audio_latency_ms,
+        }
+        if include_audio:
+            payload["audio"] = self.audio
+        return payload
+
+
+@dataclass(frozen=True)
+class StagedOutputEvent:
+    """One ordered audio result or the single terminal pipeline event."""
+
+    kind: StagedOutputEventKind
+    segment: Optional[SynthesizedSegment] = None
+    stage: str = ""
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, StagedOutputEventKind):
+            raise ValueError("kind must be a StagedOutputEventKind")
+        if self.kind is StagedOutputEventKind.AUDIO:
+            if not isinstance(self.segment, SynthesizedSegment):
+                raise ValueError("audio output requires a synthesized segment")
+            if self.stage or self.error:
+                raise ValueError("audio output cannot carry terminal error fields")
+        elif self.kind is StagedOutputEventKind.ERROR:
+            if self.segment is not None or not self.stage.strip() or not self.error.strip():
+                raise ValueError("error output requires only stage and error text")
+        elif self.segment is not None or self.stage or self.error:
+            raise ValueError("complete output cannot carry a payload")
+
+
+@dataclass(frozen=True)
 class ASRStreamEvent:
     """One FIFO event crossing from the blocking ASR worker to asyncio."""
 
@@ -163,6 +314,10 @@ class PipelineEvent:
     source_start_ms: Optional[float] = None
     source_end_ms: Optional[float] = None
     queue_depth: Optional[int] = None
+    queue_capacity: Optional[int] = None
+    queue_residence_ms: float = 0.0
+    processing_duration_ms: float = 0.0
+    blocked_put_ms: float = 0.0
     text_chars: int = 0
     audio_bytes: int = 0
     audio_duration_ms: float = 0.0
@@ -190,9 +345,24 @@ class PipelineEvent:
             raise ValueError("emission_reason must be an EmissionReason")
         if self.queue_depth is not None and self.queue_depth < 0:
             raise ValueError("queue_depth must be non-negative")
+        if self.queue_capacity is not None and self.queue_capacity <= 0:
+            raise ValueError("queue_capacity must be positive")
+        if (
+            self.queue_depth is not None
+            and self.queue_capacity is not None
+            and self.queue_depth > self.queue_capacity
+        ):
+            raise ValueError("queue_depth cannot exceed queue_capacity")
         if min(self.text_chars, self.audio_bytes, self.retry_count) < 0:
             raise ValueError("event counters must be non-negative")
         _validate_nonnegative_finite("audio_duration_ms", self.audio_duration_ms)
+        _validate_nonnegative_finite(
+            "queue_residence_ms", self.queue_residence_ms
+        )
+        _validate_nonnegative_finite(
+            "processing_duration_ms", self.processing_duration_ms
+        )
+        _validate_nonnegative_finite("blocked_put_ms", self.blocked_put_ms)
         _validate_source_range(self.source_start_ms, self.source_end_ms)
 
     def to_dict(self) -> Dict[str, Any]:
