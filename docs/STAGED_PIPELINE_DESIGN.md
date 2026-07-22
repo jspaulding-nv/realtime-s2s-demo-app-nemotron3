@@ -2,8 +2,11 @@
 
 ## Status
 
-This document is a design for the next backend iteration. It has **not** been
-implemented or validated by a new live sample run in this branch.
+The first foundation milestone is implemented and documented in
+[Staged pipeline foundation](STAGED_PIPELINE_FOUNDATION.md). It adds direct
+Nemotron streaming ASR, typed final/segment records, deterministic punctuation
+segmentation, and an opt-in live smoke. The active browser path remains
+monolithic, and no staged sample run has been performed.
 
 The current backend calls the monolithic streaming S2S operation on the NMT
 service. That endpoint connects to remote ASR and TTS services, but the
@@ -57,9 +60,12 @@ match the three pinned NIM releases.
 English PCM stream
       |
       v
-Nemotron streaming ASR -- interim text --> observability only
+Nemotron streaming ASR
       |
-      +-- final text (sequence ID, source timing)
+      +-- INTERIM / FINAL / COMPLETE / ERROR
+      v
+bounded ordered ASR event queue (implemented; interims are observability-only)
+      |
       v
 punctuation-aware segmenter
       |
@@ -102,9 +108,16 @@ fragment syntax, increase NMT/TTS work, and worsen queue growth. The Riva team
 found 800 ms plus punctuation splitting preferable to 300 ms without
 punctuation handling for these sample files.
 
-Every final must receive a monotonically increasing sequence ID plus source
+Every final must receive a monotonically increasing ASR-final ID plus source
 start/end timing when available. Interims may update a transcript UI but must
 not enter NMT.
+
+The implemented direct-ASR adapter runs blocking Riva I/O on one worker and
+hands `INTERIM`, `FINAL`, `COMPLETE`, and `ERROR` records to the event loop
+through one bounded FIFO. Its worker blocks on a full queue, preserves event
+order, verifies natural input-sentinel consumption, and has tested cancellation
+and channel/executor cleanup. The synchronous WAV iterator is an exclusive
+smoke-test path, not the application integration API.
 
 ## Punctuation-aware segmentation
 
@@ -132,6 +145,9 @@ Use bounded `asyncio.Queue` instances between stages. Make capacities
 configuration values and expose both item count and residence time. A sensible
 initial experiment is a small number of sentence segments, then tune from
 measured processing time rather than guessing a production limit.
+
+The direct-ASR event queue is implemented and defaults to 32 events per stream.
+The NMT, TTS, and outbound queues described below are not implemented yet.
 
 When a queue is full, the producer must await capacity and emit an overload
 metric. It must not allocate an unbounded list or discard speech. Because a
@@ -217,6 +233,9 @@ record should include:
 ```text
 session_id
 sequence_id
+asr_final_id
+contributing_final_ids
+emission_reason
 stage
 event
 monotonic_ms
@@ -256,14 +275,17 @@ offset measurement.
 
 ## Implementation sequence
 
-1. Use the pinned Riva Python client `2.24.0` and add direct ASR, NMT, and TTS
-   smoke tests.
-2. Add typed segment/event models and the punctuation segmenter with unit
-   tests.
-3. Add single-worker bounded NMT and TTS queues with fake-client tests.
+1. **Completed:** validate the pinned Riva Python client `2.24.0` against the
+   direct ASR endpoint and add a repeatable live ASR smoke.
+2. **Completed:** add typed ASR-stream/final, segment, and telemetry models,
+   the punctuation segmenter, a bounded ASR event bridge, deterministic
+   cancellation/lifecycle handling, and unit tests.
+3. Add application-owned direct NMT/TTS adapters and single-worker bounded
+   queues with fake-client tests.
 4. Add ordered outbound audio and deterministic sentinel-based drain tests.
-5. Add stage telemetry and session summaries.
-6. Integrate the existing WebSocket API while retaining `end_input` and
+5. Persist stage telemetry and session summaries.
+6. Integrate the existing WebSocket API behind a staged feature flag while
+   retaining `end_input` and
    `stop_stream` semantics.
 7. Run the one-minute preflight, then one sample, before the full matrix.
 8. Compare monolithic and staged paths with identical models, input, EOU, and
@@ -272,8 +294,10 @@ offset measurement.
 
 ## Validation gates
 
-- All input sequence IDs produce exactly one ordered translated segment or an
-  explicit error record.
+- Every nonempty ASR final is represented in emitted-segment provenance or the
+  terminal residual.
+- Every emitted segment ID reaches ordered output or has an explicit error
+  record.
 - End-of-input drains every stage and the browser without a fixed arbitrary
   sleep.
 - Queue bounds hold under injected slow-NMT and slow-TTS tests.

@@ -26,9 +26,15 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Queue-aware test completion: file input ends independently, then Riva output and browser playback drain
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - A resumable one-command harness for sequential matched-policy runs across all three samples
+- A direct Nemotron ASR adapter, bounded event bridge, and punctuation segmenter foundation for the next staged backend
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
-The current monolithic Riva S2S endpoint does not expose separate ASR, NMT, and TTS stage queues. Explicit punctuation-boundary splitting and bounded NMT/TTS parallelism are therefore future client-orchestration work, not claims made by this version.
+The active browser path still uses the monolithic Riva S2S endpoint and does
+not expose separate stage queues. Direct ASR and punctuation segmentation are
+implemented and live-smoke-tested in isolation. The direct-ASR worker uses a
+bounded ordered asyncio event handoff with tested backpressure and shutdown;
+bounded NMT/TTS parallelism and staged WebSocket integration remain the next
+client-orchestration work.
 
 ## Architecture
 
@@ -65,6 +71,9 @@ realtime-s2s-demo-app/
 │   ├── main.py              # FastAPI app + WebSocket endpoint
 │   ├── config.py            # Settings (Riva URI, audio params, languages)
 │   ├── riva_client.py       # Riva S2S wrapper
+│   ├── direct_asr_client.py # Direct staged Nemotron adapter
+│   ├── punctuation_segmenter.py # Ordered final-text segmentation
+│   ├── staged_models.py     # Staged records and telemetry contract
 │   ├── websocket_handler.py # Session management
 │   ├── audio_processor.py   # Audio format utilities
 │   └── requirements.txt
@@ -90,6 +99,8 @@ realtime-s2s-demo-app/
 │   └── vite.config.ts
 │
 ├── realtime_s2s.py          # Original CLI-based translation script
+├── direct_asr_smoke.py      # Opt-in direct Nemotron compatibility smoke
+├── direct_asr_bridge_smoke.py # Opt-in bounded DirectASRStream smoke
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
@@ -219,10 +230,15 @@ Copy `.env.example` to `.env` and set these values when the defaults do not matc
 
 ```dotenv
 RIVA_URI=localhost:50051
+RIVA_ASR_URI=localhost:50052
+RIVA_TTS_URI=localhost:50053
 RIVA_NMT_MODEL=megatronnmt_any_any_1b
 RIVA_SOURCE_LANGUAGE=en-US
 RIVA_EOU_MS=800
+RIVA_ASR_WORD_TIMES=0
 RIVA_VERBOSE_CHUNKS=0
+STAGED_SEGMENT_MAX_CHARS=240
+STAGED_SEGMENT_MAX_AGE_MS=2000
 ```
 
 ### Adding Languages
@@ -445,6 +461,7 @@ Detailed guides:
 - [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sample acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
+- [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)
 - [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)
 - [Implementation and verification log](docs/IMPLEMENTATION_LOG.md)
 
