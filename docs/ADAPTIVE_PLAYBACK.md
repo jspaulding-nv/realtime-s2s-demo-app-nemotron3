@@ -33,9 +33,9 @@ playback, but it does not support calling the queue bounded at 10 seconds. It
 also reinforces the need for staged upstream work and a long-form quality
 evaluation.
 
-The generated report and machine-readable details are in
-[`results/nemotron3/playback_policy_analysis.md`](results/nemotron3/playback_policy_analysis.md)
-and `results/nemotron3/playback_policy_analysis.json`.
+Sanitized aggregate findings are retained in
+[`NEMOTRON_TEST_RESULTS.md`](../NEMOTRON_TEST_RESULTS.md). Generated reports and
+machine-readable details remain under ignored local result directories.
 
 ## Policy
 

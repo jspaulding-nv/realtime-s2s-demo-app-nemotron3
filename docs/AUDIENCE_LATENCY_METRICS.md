@@ -88,9 +88,9 @@ Time from source input completion until the final translated audio would
 finish playing through a gapless playback queue. It includes startup latency,
 delivery stalls, and media-duration expansion.
 
-Historical `playback_tail_sec` values in `docs/results/nemotron3/` were
-reconstructed at fixed 1.00x. They are not results from the new adaptive
-browser controller.
+Historical `playback_tail_sec` aggregate values in
+[`NEMOTRON_TEST_RESULTS.md`](../NEMOTRON_TEST_RESULTS.md) were reconstructed at
+fixed 1.00x. They are not results from the new adaptive browser controller.
 
 ### Output/input duration ratio
 
@@ -154,9 +154,8 @@ remained 19-45 seconds, peaks remained 24-53 seconds, and the queue exceeded
 soft queue ceiling on any saved trace. Staged upstream work therefore remains
 necessary even if live adaptive playback matches the simulation.
 
-See
-[`results/nemotron3/playback_policy_analysis.md`](results/nemotron3/playback_policy_analysis.md)
-for the generated replay report.
+See [`NEMOTRON_TEST_RESULTS.md`](../NEMOTRON_TEST_RESULTS.md) for the retained
+aggregate results. Raw replay reports remain in ignored local output folders.
 
 ## Measuring a joke or other marked phrase
 

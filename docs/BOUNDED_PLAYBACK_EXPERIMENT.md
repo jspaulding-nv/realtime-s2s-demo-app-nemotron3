@@ -149,8 +149,8 @@ Reproduce the offline analysis when the ignored event CSVs are available:
 ```bash
 python analyze_playback_policy.py \
   --input-dir test_results_nemotron \
-  --json-output docs/results/nemotron3/playback_policy_analysis.json \
-  --markdown-output docs/results/nemotron3/playback_policy_analysis.md
+  --json-output test_results_nemotron/playback_policy_analysis.json \
+  --markdown-output test_results_nemotron/playback_policy_analysis.md
 ```
 
 Run its focused regression tests with:
@@ -161,8 +161,8 @@ python -m pytest \
   tests/test_analyze_playback_policy.py -q
 ```
 
-The generated report is
-[`results/nemotron3/playback_policy_analysis.md`](results/nemotron3/playback_policy_analysis.md).
+The generated report stays in the ignored local result directory. Retained
+aggregate values are in [`NEMOTRON_TEST_RESULTS.md`](../NEMOTRON_TEST_RESULTS.md).
 
 ## Automated three-sample matched-trace run
 

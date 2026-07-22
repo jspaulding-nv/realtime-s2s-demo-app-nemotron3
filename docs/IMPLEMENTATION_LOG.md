@@ -40,8 +40,8 @@ Historical results:
 
 The short service flush tail did not eliminate the listener tail. Spanish
 media was longer than the source, and response timing left substantial audio
-queued for fixed-rate playback. Detailed artifacts are in
-`docs/results/nemotron3/` and `NEMOTRON_TEST_RESULTS.md`.
+queued for fixed-rate playback. Sanitized aggregate findings are retained in
+`NEMOTRON_TEST_RESULTS.md`; raw captures are intentionally excluded.
 
 Benefit observed from Nemotron 3:
 
@@ -113,8 +113,8 @@ soft ceiling for substantial periods. The output also predicts that most
 translated media would be accelerated, so a live browser run and native
 listener review remain mandatory.
 
-Generated replay artifacts are under `docs/results/nemotron3/`. They are
-deterministic simulations from saved July 8 arrival traces, not modified live
+Generated replay artifacts remain under ignored local result directories. They
+are deterministic simulations from saved arrival traces, not modified live
 Riva results.
 
 Completed experiment automation:

@@ -435,7 +435,9 @@ A deterministic replay of the three saved Nemotron arrival traces reduced the co
 python analyze_playback_policy.py --input-dir test_results_nemotron
 ```
 
-The compact replay report is [versioned with the Nemotron results](docs/results/nemotron3/playback_policy_analysis.md).
+Sanitized aggregate replay findings are retained in
+[`NEMOTRON_TEST_RESULTS.md`](NEMOTRON_TEST_RESULTS.md); raw reports remain in
+ignored local output directories.
 
 Detailed guides:
 

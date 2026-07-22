@@ -270,14 +270,12 @@ def build_analysis(
 def _display_name(filename: str) -> str:
     path = Path(filename)
     filename = path.name
-    if filename.startswith("long-form-01"):
-        display = "Long-form sample 01"
-    elif filename.startswith("long-form-02"):
-        display = "Long-form sample 02"
-    elif "long-form-03" in filename:
-        display = "Long-form sample 03"
-    else:
-        display = filename.removesuffix("_results.csv")
+    normalized = filename.lower().replace("_", "-")
+    display = filename.removesuffix("_results.csv")
+    for index in range(1, 4):
+        if f"long-form-{index:02d}" in normalized or f"sample-{index:02d}" in normalized:
+            display = f"Long-form sample {index:02d}"
+            break
     if path.parent.name.startswith("repeat-"):
         return f"{display} ({path.parent.name})"
     return display
@@ -369,12 +367,12 @@ def main() -> None:
     parser.add_argument(
         "--json-output",
         type=Path,
-        default=Path("docs/results/nemotron3/playback_policy_analysis.json"),
+        default=Path("test_results_nemotron/playback_policy_analysis.json"),
     )
     parser.add_argument(
         "--markdown-output",
         type=Path,
-        default=Path("docs/results/nemotron3/playback_policy_analysis.md"),
+        default=Path("test_results_nemotron/playback_policy_analysis.md"),
     )
     parser.add_argument(
         "--skip-recorded-validation",
