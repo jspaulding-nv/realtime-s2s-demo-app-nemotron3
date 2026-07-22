@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { TestDashboard } from '../components/TestDashboard';
+import type { PlaybackMetrics } from '../hooks/useAudioPlayback';
 
 // --- Mocks ---
 
@@ -9,16 +10,33 @@ const mockGetPlaybackPosition = vi.fn(() => 0);
 const mockPlaybackStart = vi.fn();
 const mockPlaybackStop = vi.fn();
 const mockQueueAudio = vi.fn();
+const mockTrackerStartTest = vi.fn();
+const mockGetPlaybackMetrics = vi.fn<() => PlaybackMetrics>(() => ({
+  queueDepthSeconds: 0,
+  peakQueueDepthSeconds: 0,
+  playbackRate: 1,
+  playbackMode: 'normal',
+  totalSourceDurationSeconds: 0,
+  totalScheduledDurationSeconds: 0,
+  aboveTarget: false,
+  aboveLimit: false,
+  limitExceededCount: 0,
+}));
 
 // Track which instances were created (input first, output second)
 let playbackInstances: Array<{
   isMuted: boolean;
   setMuted: ReturnType<typeof vi.fn>;
   getPlaybackPosition: ReturnType<typeof vi.fn>;
+  getPlaybackMetrics: ReturnType<typeof vi.fn>;
 }>;
 
 vi.mock('../hooks/useAudioPlayback', () => ({
-  useAudioPlayback: vi.fn((opts?: { initialMuted?: boolean }) => {
+  useAudioPlayback: vi.fn((opts?: {
+    initialMuted?: boolean;
+    adaptivePlayback?: boolean;
+    onSchedule?: (event: unknown) => void;
+  }) => {
     const instance = {
       isPlaying: false,
       isMuted: opts?.initialMuted ?? false,
@@ -27,6 +45,7 @@ vi.mock('../hooks/useAudioPlayback', () => ({
       stop: mockPlaybackStop,
       setMuted: mockSetMuted,
       getPlaybackPosition: mockGetPlaybackPosition,
+      getPlaybackMetrics: mockGetPlaybackMetrics,
     };
     playbackInstances.push(instance);
     return instance;
@@ -58,9 +77,11 @@ vi.mock('../hooks/useFileAudioSource', () => ({
 
 vi.mock('../hooks/useTimingTracker', () => ({
   useTimingTracker: vi.fn(() => ({
-    startTest: vi.fn(),
+    startTest: mockTrackerStartTest,
     logChunkSent: vi.fn(),
     logAudioReceived: vi.fn(),
+    logPlaybackScheduled: vi.fn(),
+    logPlaybackQueueSample: vi.fn(),
     getEvents: vi.fn(() => []),
     getSendCount: vi.fn(() => 0),
     getReceiveCount: vi.fn(() => 0),
@@ -133,7 +154,7 @@ describe('TestDashboard', () => {
 
   it('does not show stats panel when idle', () => {
     render(<TestDashboard />);
-    expect(screen.queryByText('Statistics')).not.toBeInTheDocument();
+    expect(screen.queryByText('Audience Playback Statistics')).not.toBeInTheDocument();
   });
 
   it('does not show drift chart when idle', () => {
@@ -173,8 +194,53 @@ describe('TestDashboard', () => {
     expect(calls.length).toBeGreaterThanOrEqual(2);
 
     // First call = inputPlayback, second = outputPlayback
-    expect(calls[0][0]).toEqual({ sampleRate: 16000, initialMuted: true });
-    expect(calls[1][0]).toEqual({ sampleRate: 16000, initialMuted: true });
+    expect(calls[0][0]).toEqual({
+      sampleRate: 16000,
+      initialMuted: true,
+      adaptivePlayback: false,
+    });
+    expect(calls[1][0]).toEqual(expect.objectContaining({
+      sampleRate: 16000,
+      initialMuted: true,
+      adaptivePlayback: true,
+      onSchedule: expect.any(Function),
+    }));
+  });
+
+  it('can select a fixed 1.00x control before a run starts', async () => {
+    const { useAudioPlayback } = await import('../hooks/useAudioPlayback');
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+    render(<TestDashboard />);
+    const checkbox = screen.getByRole('checkbox', {
+      name: /Adaptive Spanish playback/,
+    });
+
+    expect(checkbox).toBeChecked();
+    fireEvent.click(checkbox);
+    expect(checkbox).not.toBeChecked();
+
+    const outputCalls = vi.mocked(useAudioPlayback).mock.calls.filter(
+      ([options]) => options?.onSchedule !== undefined,
+    );
+    expect(outputCalls.at(-1)?.[0]).toEqual(expect.objectContaining({
+      adaptivePlayback: false,
+    }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    expect(mockTrackerStartTest).toHaveBeenCalledWith({
+      adaptivePlaybackEnabled: false,
+    });
   });
 
   it('does not show audio toggle buttons when idle', () => {
@@ -279,7 +345,122 @@ describe('TestDashboard', () => {
     });
 
     expect(screen.getByText('Stop Test')).toBeInTheDocument();
-    expect(screen.getByText('Statistics')).toBeInTheDocument();
+    expect(screen.getByText('Audience Playback Statistics')).toBeInTheDocument();
+    expect(screen.getByText('Current Queue')).toBeInTheDocument();
+    expect(screen.getByText('Playback Rate')).toBeInTheDocument();
     expect(screen.getByTestId('drift-chart')).toBeInTheDocument();
+  });
+
+  it('sends end_input when the source file completes naturally', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    let completeSource: (() => void) | undefined;
+    const sendMessage = vi.fn();
+
+    vi.mocked(useFileAudioSource).mockImplementation((options) => {
+      completeSource = options.onComplete;
+      return {
+        isLoaded: true,
+        isStreaming: false,
+        duration: 60,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming: vi.fn(),
+        stopStreaming: vi.fn(),
+      };
+    });
+    vi.mocked(useWebSocket).mockReturnValue({
+      isConnected: false,
+      status: 'disconnected',
+      sendMessage,
+      sendAudio: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    act(() => completeSource?.());
+
+    expect(sendMessage).toHaveBeenCalledWith({ type: 'end_input' });
+    expect(screen.getByText(/File input ended/)).toBeInTheDocument();
+  });
+
+  it('waits for the playback queue to empty before finishing a natural run', async () => {
+    vi.useFakeTimers();
+    try {
+      const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+      const { useWebSocket } = await import('../hooks/useWebSocket');
+      let completeSource: (() => void) | undefined;
+      const sendMessage = vi.fn();
+      const disconnect = vi.fn();
+
+      vi.mocked(useFileAudioSource).mockImplementation((options) => {
+        completeSource = options.onComplete;
+        return {
+          isLoaded: true,
+          isStreaming: false,
+          duration: 60,
+          position: 60,
+          loadFile: vi.fn(),
+          startStreaming: vi.fn(),
+          stopStreaming: vi.fn(),
+        };
+      });
+      vi.mocked(useWebSocket).mockReturnValue({
+        isConnected: false,
+        status: 'disconnected',
+        sendMessage,
+        sendAudio: vi.fn(),
+        connect: vi.fn(),
+        disconnect,
+      });
+      mockGetPlaybackMetrics.mockReturnValue({
+        queueDepthSeconds: 12,
+        peakQueueDepthSeconds: 12,
+        playbackRate: 1.1,
+        playbackMode: 'over-limit',
+        totalSourceDurationSeconds: 60,
+        totalScheduledDurationSeconds: 55,
+        aboveTarget: true,
+        aboveLimit: true,
+        limitExceededCount: 1,
+      });
+
+      render(<TestDashboard />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Start Test'));
+      });
+      act(() => completeSource?.());
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(11_000);
+      });
+      expect(disconnect).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalledWith({ type: 'stop_stream' });
+
+      mockGetPlaybackMetrics.mockReturnValue({
+        queueDepthSeconds: 0,
+        peakQueueDepthSeconds: 12,
+        playbackRate: 1.1,
+        playbackMode: 'urgent',
+        totalSourceDurationSeconds: 60,
+        totalScheduledDurationSeconds: 55,
+        aboveTarget: false,
+        aboveLimit: false,
+        limitExceededCount: 1,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith({ type: 'stop_stream' });
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('Export CSV')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

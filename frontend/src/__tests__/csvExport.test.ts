@@ -3,6 +3,21 @@ import { exportTimingDataAsCSV } from '../utils/csvExport';
 import type { ClientTimingEvent, BackendTimingEvent } from '../types/timing';
 
 describe('exportTimingDataAsCSV', () => {
+  const expectedHeader = [
+    'source',
+    'stage',
+    'timestamp_ms',
+    'chunk_index',
+    'source_position_sec',
+    'audio_bytes',
+    'media_duration_sec',
+    'scheduled_duration_sec',
+    'playback_wait_sec',
+    'queue_depth_sec',
+    'playback_rate',
+    'playback_mode',
+    'adaptive_playback_enabled',
+  ].join(',');
   let capturedCsvText: string;
   let mockAnchor: {
     href: string;
@@ -69,7 +84,7 @@ describe('exportTimingDataAsCSV', () => {
     exportTimingDataAsCSV(clientEvents, []);
 
     const lines = capturedCsvText.split('\n');
-    expect(lines[0]).toBe('source,stage,timestamp_ms,chunk_index,source_position_sec,audio_bytes');
+    expect(lines[0]).toBe(expectedHeader);
     expect(lines[1]).toContain('client,chunk_sent');
     expect(lines[2]).toContain('client,audio_received');
     expect(lines).toHaveLength(3);
@@ -83,7 +98,7 @@ describe('exportTimingDataAsCSV', () => {
     exportTimingDataAsCSV([], backendEvents);
 
     const lines = capturedCsvText.split('\n');
-    expect(lines[0]).toBe('source,stage,timestamp_ms,chunk_index,source_position_sec,audio_bytes');
+    expect(lines[0]).toBe(expectedHeader);
     expect(lines[1]).toContain('backend,audio_received');
     expect(lines).toHaveLength(2);
   });
@@ -93,7 +108,7 @@ describe('exportTimingDataAsCSV', () => {
 
     const lines = capturedCsvText.split('\n');
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toBe('source,stage,timestamp_ms,chunk_index,source_position_sec,audio_bytes');
+    expect(lines[0]).toBe(expectedHeader);
   });
 
   it('includes both client and backend events together', () => {
@@ -110,5 +125,35 @@ describe('exportTimingDataAsCSV', () => {
     expect(lines).toHaveLength(3); // header + 1 client + 1 backend
     expect(lines[1]).toContain('client,');
     expect(lines[2]).toContain('backend,');
+  });
+
+  it('exports adaptive playback telemetry columns', () => {
+    const clientEvents: ClientTimingEvent[] = [{
+      stage: 'playback_chunk_scheduled',
+      timestamp: 250,
+      chunkIndex: 3,
+      sourcePositionSec: 0,
+      audioBytes: 3200,
+      mediaDurationSec: 0.1,
+      scheduledDurationSec: 0.095238,
+      playbackWaitSec: 5.2,
+      queueDepthSec: 5.295238,
+      playbackRate: 1.05,
+      playbackMode: 'catch-up',
+      adaptivePlaybackEnabled: true,
+    }];
+
+    exportTimingDataAsCSV(clientEvents, []);
+
+    const fields = capturedCsvText.split('\n')[1].split(',');
+    expect(fields.slice(6)).toEqual([
+      '0.100000',
+      '0.095238',
+      '5.200000',
+      '5.295238',
+      '1.05',
+      'catch-up',
+      'true',
+    ]);
   });
 });

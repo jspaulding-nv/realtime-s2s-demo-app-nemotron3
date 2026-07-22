@@ -33,6 +33,7 @@ export function useWebSocket({
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const shouldReconnectRef = useRef(false);
+  const connectRef = useRef<() => void>(() => undefined);
 
   // Store callbacks in refs to avoid dependency issues
   const onStatusRef = useRef(onStatus);
@@ -78,7 +79,7 @@ export function useWebSocket({
       // Attempt to reconnect if we should
       if (shouldReconnectRef.current) {
         reconnectTimeoutRef.current = window.setTimeout(() => {
-          connect();
+          connectRef.current();
         }, reconnectInterval);
       }
     };
@@ -91,7 +92,6 @@ export function useWebSocket({
     ws.onmessage = (event) => {
       // Binary data is translated audio
       if (event.data instanceof ArrayBuffer) {
-        console.log('WebSocket: received audio data, bytes:', event.data.byteLength);
         onAudioRef.current?.(event.data);
         return;
       }
@@ -123,6 +123,10 @@ export function useWebSocket({
 
     wsRef.current = ws;
   }, [url, reconnectInterval]);
+
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
 
   const disconnect = useCallback(() => {
     shouldReconnectRef.current = false;

@@ -40,11 +40,19 @@ export interface StopStreamMessage {
   type: 'stop_stream';
 }
 
+export interface EndInputMessage {
+  type: 'end_input';
+}
+
 export interface PingMessage {
   type: 'ping';
 }
 
-export type ClientMessage = StartStreamMessage | StopStreamMessage | PingMessage;
+export type ClientMessage =
+  | StartStreamMessage
+  | EndInputMessage
+  | StopStreamMessage
+  | PingMessage;
 
 // Language configuration
 export interface Language {

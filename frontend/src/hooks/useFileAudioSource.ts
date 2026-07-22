@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface UseFileAudioSourceOptions {
   sampleRate?: number;
@@ -35,8 +35,11 @@ export function useFileAudioSource({
 
   const onChunkRef = useRef(onChunk);
   const onCompleteRef = useRef(onComplete);
-  onChunkRef.current = onChunk;
-  onCompleteRef.current = onComplete;
+
+  useEffect(() => {
+    onChunkRef.current = onChunk;
+    onCompleteRef.current = onComplete;
+  }, [onChunk, onComplete]);
 
   const loadFile = useCallback(async (file: File) => {
     const arrayBuffer = await file.arrayBuffer();

@@ -20,7 +20,7 @@ class MockAudioBuffer {
     }
   }
 
-  getChannelData(_channel: number): Float32Array {
+  getChannelData(): Float32Array {
     return this.data;
   }
 }

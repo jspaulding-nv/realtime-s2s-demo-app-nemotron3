@@ -18,9 +18,8 @@ describe('DriftChart', () => {
 
     const { container } = render(<DriftChart data={data} />);
     expect(container).toBeTruthy();
-    // Recharts renders SVG elements
-    const svg = container.querySelector('svg');
-    // ResponsiveContainer may not render svg in jsdom, but component should not crash
+    // ResponsiveContainer may not render SVG in jsdom; rendering without a
+    // thrown error is the behavior under test.
   });
 
   it('renders with large drift values (warning/danger thresholds)', () => {

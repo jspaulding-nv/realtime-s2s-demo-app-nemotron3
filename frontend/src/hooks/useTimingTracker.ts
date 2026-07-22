@@ -1,10 +1,18 @@
 import { useCallback, useMemo, useRef } from 'react';
 import type { ClientTimingEvent } from '../types/timing';
+import type { PlaybackScheduleEvent } from './useAudioPlayback';
+import type { PlaybackMode } from '../utils/playbackPolicy';
 
 interface UseTimingTrackerReturn {
-  startTest: () => void;
+  startTest: (configuration?: { adaptivePlaybackEnabled: boolean }) => void;
   logChunkSent: (audioBytes: number) => void;
   logAudioReceived: (audioBytes: number) => void;
+  logPlaybackScheduled: (event: PlaybackScheduleEvent) => void;
+  logPlaybackQueueSample: (
+    queueDepthSec: number,
+    playbackRate: number,
+    playbackMode: PlaybackMode,
+  ) => void;
   getEvents: () => ClientTimingEvent[];
   getSendCount: () => number;
   getReceiveCount: () => number;
@@ -23,12 +31,24 @@ export function useTimingTracker(): UseTimingTrackerReturn {
   const cumulativeOutputSamplesRef = useRef(0);
   const testStartRef = useRef(0);
 
-  const startTest = useCallback(() => {
+  const startTest = useCallback((configuration?: {
+    adaptivePlaybackEnabled: boolean;
+  }) => {
     eventsRef.current = [];
     sendCountRef.current = 0;
     receiveCountRef.current = 0;
     cumulativeOutputSamplesRef.current = 0;
     testStartRef.current = performance.now();
+    if (configuration) {
+      eventsRef.current.push({
+        stage: 'playback_session_started',
+        timestamp: 0,
+        chunkIndex: -1,
+        sourcePositionSec: 0,
+        audioBytes: 0,
+        adaptivePlaybackEnabled: configuration.adaptivePlaybackEnabled,
+      });
+    }
   }, []);
 
   const logChunkSent = useCallback((audioBytes: number) => {
@@ -57,6 +77,39 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     });
   }, []);
 
+  const logPlaybackScheduled = useCallback((event: PlaybackScheduleEvent) => {
+    eventsRef.current.push({
+      stage: 'playback_chunk_scheduled',
+      timestamp: performance.now() - testStartRef.current,
+      chunkIndex: receiveCountRef.current - 1,
+      sourcePositionSec: 0,
+      audioBytes: event.audioBytes,
+      mediaDurationSec: event.sourceDurationSeconds,
+      scheduledDurationSec: event.scheduledDurationSeconds,
+      playbackWaitSec: event.waitBeforePlaybackSeconds,
+      queueDepthSec: event.queueDepthSeconds,
+      playbackRate: event.playbackRate,
+      playbackMode: event.playbackMode,
+    });
+  }, []);
+
+  const logPlaybackQueueSample = useCallback((
+    queueDepthSec: number,
+    playbackRate: number,
+    playbackMode: PlaybackMode,
+  ) => {
+    eventsRef.current.push({
+      stage: 'playback_queue_sample',
+      timestamp: performance.now() - testStartRef.current,
+      chunkIndex: -1,
+      sourcePositionSec: 0,
+      audioBytes: 0,
+      queueDepthSec,
+      playbackRate,
+      playbackMode,
+    });
+  }, []);
+
   const getEvents = useCallback(() => [...eventsRef.current], []);
   const getSendCount = useCallback(() => sendCountRef.current, []);
   const getReceiveCount = useCallback(() => receiveCountRef.current, []);
@@ -73,10 +126,12 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     startTest,
     logChunkSent,
     logAudioReceived,
+    logPlaybackScheduled,
+    logPlaybackQueueSample,
     getEvents,
     getSendCount,
     getReceiveCount,
     getSourcePosition,
     getCumulativeOutputDuration,
-  }), [startTest, logChunkSent, logAudioReceived, getEvents, getSendCount, getReceiveCount, getSourcePosition, getCumulativeOutputDuration]);
+  }), [startTest, logChunkSent, logAudioReceived, logPlaybackScheduled, logPlaybackQueueSample, getEvents, getSendCount, getReceiveCount, getSourcePosition, getCumulativeOutputDuration]);
 }

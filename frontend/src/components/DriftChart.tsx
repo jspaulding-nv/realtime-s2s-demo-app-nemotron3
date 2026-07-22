@@ -26,12 +26,15 @@ export function DriftChart({ data }: DriftChartProps) {
           fontSize={12}
         />
         <YAxis
-          label={{ value: 'Translation Delay (s)', angle: -90, position: 'insideLeft' }}
+          label={{ value: 'Legacy Drift (s)', angle: -90, position: 'insideLeft' }}
           stroke="#6b7280"
           fontSize={12}
         />
         <Tooltip
-          formatter={(value: number) => [`${value.toFixed(2)}s`, 'Translation Delay']}
+          formatter={(value: number | undefined) => [
+            `${(value ?? 0).toFixed(2)}s`,
+            'Legacy Duration Drift',
+          ]}
           labelFormatter={(label) => `${Number(label).toFixed(1)} min`}
         />
         <ReferenceLine y={20} stroke="#f59e0b" strokeDasharray="6 3" label="Warning (20s)" />
@@ -42,7 +45,7 @@ export function DriftChart({ data }: DriftChartProps) {
           stroke="#3b82f6"
           dot={false}
           isAnimationActive={false}
-          name="Translation Delay"
+          name="Legacy Duration Drift"
           strokeWidth={2}
         />
       </LineChart>
