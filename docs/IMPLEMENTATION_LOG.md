@@ -217,6 +217,46 @@ Known experimental limitation:
 - Browser queue depth is exact playback backlog, but it is only one component
   of semantic English-to-Spanish delay.
 
+## 2026-07-22: one-repeat live acceptance run
+
+Completed:
+
+- Started all three pinned NIMs on one NVIDIA RTX PRO 6000 Blackwell Server
+  Edition and confirmed final usage of 32,217 MiB with 65,034 MiB free.
+- Passed the one-minute preflight and captured one new real-time Riva arrival
+  trace for Sample 01, Sample 02, and Sample 03.
+- Verified terminal completion, summary/CSV consistency, manifest artifact
+  hashes, empty staging state, and final service readiness.
+- Exercised strict resume after one Sample 02 TTS failure. The harness
+  retained verified work, discarded incomplete staging output, and reran only
+  the failed and pending work.
+
+Measured fixed 1.00x versus adaptive playback:
+
+| Sample | Fixed tail | Adaptive tail | Reduction | Adaptive p95 | Time above 10 s |
+|---|---:|---:|---:|---:|---:|
+| Sample 01 | 142.565 s | 36.788 s | 74.2% | 35.823 s | 69.377% |
+| Sample 02 | 204.155 s | 30.520 s | 85.1% | 37.460 s | 78.620% |
+| Sample 03 | 42.011 s | 18.001 s | 57.2% | 18.622 s | 41.569% |
+
+Aggregate tail fell 78.1%, from 388.731 to 85.310 seconds, with no translated
+chunks dropped. Every sample trace nevertheless missed the overall candidate
+gate set. The data does not support treating the 10-second value as a bounded
+audience experience at the current 1.10x maximum rate.
+
+The first Sample 02 attempt exposed a separate robustness issue. Magpie's logs
+showed that the text reaching TTS contained Chinese `阿门。` for a final
+"Amen." fragment despite the Spanish target; the NMT logs did not expose the
+translated text directly. The Magpie ensemble failed while mapping it. Direct
+TTS, concurrency, and 30-second end-of-file S2S isolation probes later
+succeeded, ruling out a simple permanent inability to synthesize the text but
+not isolating the cause. Target-language/non-empty validation before TTS is
+still required in the staged design.
+
+The detailed procedure, metrics, failure diagnosis, evidence boundaries,
+artifact hashes, and next recommendations are in
+[Three-sample acceptance run](ACCEPTANCE_RUN_2026-07-22.md).
+
 ## Planned next implementation: staged backend
 
 Not yet completed:
@@ -339,11 +379,12 @@ Artifact locations:
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
-- [ ] Commit and push the adaptive branch with these documents
-- [ ] Run the automated harness with at least three live traces per sample
-- [ ] Verify each trace produces the matched fixed/adaptive comparison
-- [ ] Verify terminal completion, PCM-send drain, staged promotion, and hashes
-- [ ] Verify resume provenance and backend lock behavior
+- [x] Commit and push the adaptive branch with the initial experiment documents
+- [x] Run one automated live trace for all three samples
+- [x] Verify each completed trace produces the matched fixed/adaptive comparison
+- [x] Verify terminal completion, PCM-send drain, staged promotion, and hashes
+- [x] Verify resume provenance and backend lock behavior after a live failure
+- [ ] Run three repeats per sample after the staged design improves the queue
 - [ ] Cross-check replay scheduling with an actual browser/Web Audio run
 - [ ] Capture synchronized phrase/punchline delay, not only queue depth
 - [ ] Review 1.05x and 1.10x quality with native Spanish listeners

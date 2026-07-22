@@ -12,6 +12,11 @@ phrases. Queue depth alone cannot answer the live-audience joke question.
 The 10-second threshold is a soft/SLA ceiling. No condition in this experiment
 authorizes dropping translated speech.
 
+The completed one-repeat live capture and deterministic matched-trace replay
+from July 22, 2026 are documented in
+[Three-sample acceptance run](ACCEPTANCE_RUN_2026-07-22.md). The service path
+completed, but all three sample traces missed the overall candidate gate set.
+
 ## Fixed test configuration
 
 Use the repository's pinned images for every comparable run:
