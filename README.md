@@ -418,6 +418,7 @@ Detailed guides:
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
 - [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
+- [July 22 three-sermon acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)
 - [Implementation and verification log](docs/IMPLEMENTATION_LOG.md)
 
