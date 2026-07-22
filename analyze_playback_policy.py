@@ -268,13 +268,19 @@ def build_analysis(
 
 
 def _display_name(filename: str) -> str:
+    path = Path(filename)
+    filename = path.name
     if filename.startswith("200108_Spirit"):
-        return "Spirit and Presence of God"
-    if filename.startswith("Blessed_Self"):
-        return "Blessed Self-Forgetfulness"
-    if "Beholding_the_Love_of_God" in filename:
-        return "Beholding the Love of God"
-    return filename.removesuffix("_results.csv")
+        display = "Spirit and Presence of God"
+    elif filename.startswith("Blessed_Self"):
+        display = "Blessed Self-Forgetfulness"
+    elif "Beholding_the_Love_of_God" in filename:
+        display = "Beholding the Love of God"
+    else:
+        display = filename.removesuffix("_results.csv")
+    if path.parent.name.startswith("repeat-"):
+        return f"{display} ({path.parent.name})"
+    return display
 
 
 def render_markdown(analysis: dict[str, Any]) -> str:
@@ -326,7 +332,7 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         [
             "",
             (
-                "Across all three replays, listener tail fell from "
+                f"Across all {aggregate['trace_count']} replays, listener tail fell from "
                 f"{aggregate['fixed_listener_tail_seconds']:.3f}s to "
                 f"{aggregate['adaptive_listener_tail_seconds']:.3f}s "
                 f"({aggregate['listener_tail_reduction_percent']:.1f}% reduction)."

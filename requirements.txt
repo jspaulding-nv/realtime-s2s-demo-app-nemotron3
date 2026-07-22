@@ -19,3 +19,8 @@ protobuf==5.29.5
 certifi==2026.1.4
 requests==2.32.5
 urllib3==2.6.3
+
+# Long-form latency experiment runner
+websockets==15.0.1
+matplotlib==3.10.9
+imageio-ffmpeg==0.6.0

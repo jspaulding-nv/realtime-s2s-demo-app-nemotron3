@@ -14,10 +14,12 @@ GitHub permits only one fork of a source repository per owner. Because `jspauldi
 - Automatic ASR punctuation and an 800 ms final end-of-utterance window
 - Environment-based Riva configuration instead of a hardcoded server address
 - An `end_input` control message so the test harness can drain final translated audio
+- A terminal `completed` status only after all source input, Riva output, and pending PCM sends finish
 - First-audio latency, output/input duration ratio, service tail, and simulated listener playback-tail metrics
 - Exact browser playback-queue telemetry with adaptive 1.00x, 1.05x, and 1.10x scheduling
 - Queue-aware test completion: file input ends independently, then Riva output and browser playback drain
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
+- A resumable one-command harness for sequential matched-policy runs across all three sermons
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
 The current monolithic Riva S2S endpoint does not expose separate ASR, NMT, and TTS stage queues. Explicit punctuation-boundary splitting and bounded NMT/TTS parallelism are therefore future client-orchestration work, not claims made by this version.
@@ -80,6 +82,7 @@ realtime-s2s-demo-app/
 │   └── vite.config.ts
 │
 ├── realtime_s2s.py          # Original CLI-based translation script
+├── run_three_sermon_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
 ```
@@ -259,12 +262,20 @@ Client → Server:
 {"type": "ping"}
 ```
 
-`end_input` closes the request-audio iterator while leaving the WebSocket open so final translated audio can drain. `stop_stream` ends the session after that drain.
+`end_input` closes the request-audio iterator while leaving the WebSocket open
+so final translated audio can drain. The server sends `completed` only after
+the request iterator consumes its stop sentinel, the Riva response generator
+exhausts successfully, and every pending PCM WebSocket send finishes. Consuming
+the sentinel proves all queued source chunks were read. If ASR endpointing ends
+a generator sooner, the client restarts it to drain the remaining input.
+Generator/final-flush errors or audio-send failures emit `error` instead;
+`stop_stream` then ends the session.
 Plus binary audio frames (Int16 PCM)
 
 Server → Client:
 ```json
 {"type": "status", "status": "listening", "message": "..."}
+{"type": "status", "status": "completed", "message": "Riva translated-audio stream complete"}
 {"type": "error", "message": "..."}
 {"type": "level", "rms": 0.5}
 {"type": "pong"}
@@ -290,14 +301,103 @@ python realtime_s2s.py --translate 5
 
 ## Long-Form Latency Test
 
-With the Riva services and backend running, execute a one-minute preflight before a sermon file:
+Install the root test dependencies once:
 
 ```bash
-python batch_latency_test.py --preflight
-python batch_latency_test.py \
-  --file test_audio/200108_SpiritandPresenceofGod.mp3 \
-  --output-dir test_results_nemotron
+pip install -r requirements.txt
 ```
+
+The root requirements pin the harness-specific `websockets==15.0.1`,
+`matplotlib==3.10.9`, and `imageio-ffmpeg==0.6.0` dependencies.
+
+With the pinned Riva services and FastAPI backend already running, the
+three-sermon experiment can then be launched with one command:
+
+```bash
+python run_three_sermon_experiment.py
+```
+
+The harness performs its health checks and one-minute preflight, then streams
+Spirit, Blessed, and Beholding sequentially at real-time pace. Use a dry run to
+validate the plan without calling the backend, request repeated live traces, or
+resume an interrupted experiment directory:
+
+```bash
+python run_three_sermon_experiment.py --dry-run
+python run_three_sermon_experiment.py --repeats 3
+python run_three_sermon_experiment.py --resume-dir experiment_results/<run-id>
+```
+
+`--dry-run` prints the resolved run directory, backend, preflight setting,
+repeat count, files, and execution order without contacting the backend or
+creating a run directory. A new live run is stored under the ignored
+`experiment_results/` root:
+
+```text
+experiment_results/YYYYMMDDTHHMMSSZ_<git-short-sha>/
+├── manifest.json
+├── playback_policy_analysis.json
+├── playback_policy_analysis.md
+├── preflight/
+│   ├── test-1min_results.csv
+│   ├── test-1min_summary.json
+│   └── test-1min_latency.png
+└── repeat-01/
+    ├── <sermon-stem>_results.csv
+    ├── <sermon-stem>_summary.json
+    └── <sermon-stem>_latency.png
+```
+
+Each `repeat-NN` directory contains that three-file set for each of the three
+sermon stems. The manifest is also the resumable status/checkpoint record.
+
+`--resume-dir` must name an existing compatible harness run. Resume requires
+the same clean Git commit and unchanged sermon files, verified by size and
+SHA-256. It also revalidates each artifact's manifest hash and its CSV event
+counts and received-byte total against the summary before skipping a completed
+capture. Backend and repeat settings are recovered from the manifest; explicit
+values must match. `--output-root`, `--run-id`, and `--skip-preflight` control
+new runs, and `--skip-preflight` cannot alter a resumed run.
+
+Commit the intended code and start from a clean worktree if the run may need to
+be resumed; a run whose original manifest records a dirty worktree is
+intentionally not resumable.
+
+Captures are written under `.staging` and promoted only after their CSV,
+summary, and plot validate; their SHA-256 hashes are then stored in the
+manifest. The CLI waits for the backend's terminal `completed` status rather
+than treating five seconds of silence as success. Failure to receive that
+status within the 300-second drain maximum fails the capture. A Riva
+generator/final-flush error or any pending PCM WebSocket send failure also
+emits `error` and invalidates the capture. A backend-keyed local file lock
+prevents two harness processes on the same machine from using the
+single-session backend concurrently.
+
+One repeat represents one live Riva pass through each sermon and contains
+about 103.7 minutes (roughly 1 hour 45 minutes) of source audio. A new
+experiment also adds a single one-minute preflight, and every capture adds its
+tail drain time. Runs are intentionally sequential: the backend has one active
+S2S session and one global timing logger.
+
+The harness does not start or stop Docker Compose or the FastAPI backend; it
+checks the services that are already running and leaves them in their original
+state. Queue-SLA misses are recorded in the reports but do not make an
+otherwise complete experiment an operational failure.
+
+Each live translated-audio arrival trace is replayed through both the fixed
+1.00x and adaptive 1.00x/1.05x/1.10x policies. This is a matched comparison:
+both policies see identical audio bytes and arrival timing, so playback policy
+is the only difference and a second Riva inference run is unnecessary. The
+result is still a deterministic Python simulation of browser scheduling. It is
+not an actual browser/Web Audio run, a native-Spanish-listener quality result,
+or a measurement of semantic delay from an English joke to its Spanish
+punchline. Those validations remain separate manual or browser-instrumented
+experiments.
+
+Candidate queue p95 is the exact time-weighted p95 over the simulated playback
+window, not a percentile sampled only at chunk arrivals. The reports also show
+exact time above 10 seconds and the longest continuous interval scheduled at
+1.10x.
 
 Generated event CSVs and plots stay ignored because they are large. Compact summaries from the July 8, 2026 runs are versioned under `docs/results/nemotron3/`; interpretation and comparison with Jonathan's earlier runs are in `NEMOTRON_TEST_RESULTS.md`.
 

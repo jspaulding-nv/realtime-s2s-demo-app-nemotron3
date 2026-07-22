@@ -99,6 +99,8 @@ class PlaybackSummary:
     peak_queue_depth_seconds: float
     arrival_queue_p50_seconds: float
     arrival_queue_p95_seconds: float
+    time_weighted_queue_p50_seconds: float
+    time_weighted_queue_p95_seconds: float
     seconds_above_target: float
     seconds_above_limit: float
     percent_playback_window_above_target: float
@@ -108,6 +110,7 @@ class PlaybackSummary:
     accelerated_source_percent: float
     urgent_source_duration_seconds: float
     urgent_source_percent: float
+    max_continuous_urgent_playback_seconds: float
     rate_chunk_counts: dict[str, int]
     rate_source_duration_seconds: dict[str, float]
     mode_chunk_counts: dict[str, int]
@@ -193,6 +196,30 @@ def _seconds_above_threshold(
             max(0.0, chunk.queue_depth_seconds - threshold_seconds),
         )
     return total
+
+
+def _time_weighted_queue_percentile(
+    schedule: Sequence[ScheduledChunk],
+    playback_window_seconds: float,
+    quantile: float,
+) -> float:
+    """Calculate an exact wall-clock percentile of listener queue depth."""
+
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be between zero and one")
+    if not schedule or playback_window_seconds <= 0:
+        return 0.0
+
+    target_seconds_above = (1.0 - quantile) * playback_window_seconds
+    low = 0.0
+    high = max(chunk.queue_depth_seconds for chunk in schedule)
+    for _ in range(64):
+        midpoint = (low + high) / 2.0
+        if _seconds_above_threshold(schedule, midpoint) > target_seconds_above:
+            low = midpoint
+        else:
+            high = midpoint
+    return high
 
 
 def _rate_label(rate: float) -> str:
@@ -310,6 +337,9 @@ def simulate_playback(
     }
     accelerated_source_duration = 0.0
     urgent_source_duration = 0.0
+    max_continuous_urgent_playback = 0.0
+    continuous_urgent_playback = 0.0
+    previous_scheduled_end: float | None = None
 
     for chunk in scheduled:
         label = _rate_label(chunk.playback_rate)
@@ -323,6 +353,28 @@ def simulate_playback(
             accelerated_source_duration += chunk.source_duration_seconds
         if chunk.playback_rate >= policy.urgent_rate:
             urgent_source_duration += chunk.source_duration_seconds
+            scheduled_duration = chunk.end_seconds - chunk.start_seconds
+            is_contiguous = (
+                previous_scheduled_end is not None
+                and math.isclose(
+                    chunk.start_seconds,
+                    previous_scheduled_end,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            continuous_urgent_playback = (
+                continuous_urgent_playback + scheduled_duration
+                if is_contiguous
+                else scheduled_duration
+            )
+            max_continuous_urgent_playback = max(
+                max_continuous_urgent_playback,
+                continuous_urgent_playback,
+            )
+        else:
+            continuous_urgent_playback = 0.0
+        previous_scheduled_end = chunk.end_seconds
 
     summary = PlaybackSummary(
         adaptive=adaptive,
@@ -338,6 +390,12 @@ def simulate_playback(
         peak_queue_depth_seconds=max(queue_depths),
         arrival_queue_p50_seconds=_nearest_rank_percentile(queue_depths, 0.50),
         arrival_queue_p95_seconds=_nearest_rank_percentile(queue_depths, 0.95),
+        time_weighted_queue_p50_seconds=_time_weighted_queue_percentile(
+            scheduled, playback_window, 0.50
+        ),
+        time_weighted_queue_p95_seconds=_time_weighted_queue_percentile(
+            scheduled, playback_window, 0.95
+        ),
         seconds_above_target=seconds_above_target,
         seconds_above_limit=seconds_above_limit,
         percent_playback_window_above_target=(
@@ -358,6 +416,9 @@ def simulate_playback(
         urgent_source_duration_seconds=urgent_source_duration,
         urgent_source_percent=(
             urgent_source_duration / total_source_duration * 100.0
+        ),
+        max_continuous_urgent_playback_seconds=(
+            max_continuous_urgent_playback
         ),
         rate_chunk_counts=rate_chunk_counts,
         rate_source_duration_seconds=rate_source_durations,

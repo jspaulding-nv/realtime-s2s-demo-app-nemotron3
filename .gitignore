@@ -50,6 +50,7 @@ logs/
 htmlcov/
 .pytest_cache/
 test_results_nemotron/
+experiment_results/
 
 # Temporary files
 *.tmp

@@ -12,6 +12,7 @@ const statusConfig: Record<
   connected: { label: 'Connected', color: 'bg-blue-500', pulse: false },
   listening: { label: 'Listening', color: 'bg-green-500', pulse: true },
   processing: { label: 'Processing', color: 'bg-yellow-500', pulse: true },
+  completed: { label: 'Completed', color: 'bg-green-600', pulse: false },
   stopped: { label: 'Stopped', color: 'bg-gray-500', pulse: false },
   error: { label: 'Error', color: 'bg-red-500', pulse: false },
 };
