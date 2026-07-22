@@ -7,9 +7,9 @@ from queue import Queue, Empty
 from typing import Optional, Callable
 
 import riva.client
-import riva.client.proto.riva_asr_pb2 as riva_asr_pb2
 import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
+from asr_config import create_streaming_asr_config
 from config import audio_config, riva_config, SUPPORTED_LANGUAGES
 
 
@@ -102,30 +102,9 @@ class RivaS2SClient:
 
         print(f"[Riva] Creating config: {riva_config.source_language} -> {target_language}, voice: {voice_name}")
 
-        # Nemotron streaming final EOU configuration. The Riva team's measured
-        # starting point is an 800 ms finalization window. Do not set the
-        # two-pass stop_history_eou fields here: NVIDIA documents those as
-        # supported only by Parakeet/Conformer CTC models, not Nemotron RNNT.
-        endpointing_config = riva_asr_pb2.EndpointingConfig(
-            start_history=300,
-            start_threshold=0.2,
-            stop_history=riva_config.endpointing_history_ms,
-            stop_threshold=0.98,
-        )
-
-        # ASR config for speech recognition
-        asr_config = riva_asr_pb2.StreamingRecognitionConfig(
-            config=riva_asr_pb2.RecognitionConfig(
-                encoding=riva.client.AudioEncoding.LINEAR_PCM,
-                sample_rate_hertz=audio_config.sample_rate,
-                language_code=riva_config.source_language,
-                max_alternatives=1,
-                enable_automatic_punctuation=True,
-                audio_channel_count=audio_config.channels,
-                endpointing_config=endpointing_config,
-            ),
-            interim_results=True
-        )
+        # Shared with the staged direct-ASR adapter so both paths use the same
+        # Nemotron RNNT endpointing and punctuation request.
+        asr_config = create_streaming_asr_config()
 
         # NMT config for translation
         translation_config = riva_nmt_pb2.TranslationConfig(

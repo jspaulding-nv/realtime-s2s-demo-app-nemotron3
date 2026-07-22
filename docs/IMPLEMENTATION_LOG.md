@@ -257,15 +257,51 @@ The detailed procedure, metrics, failure diagnosis, evidence boundaries,
 artifact hashes, and next recommendations are in
 [Three-sermon acceptance run](ACCEPTANCE_RUN_2026-07-22.md).
 
-## Planned next implementation: staged backend
+## 2026-07-22: staged pipeline foundation
+
+Completed on the stacked `agent/staged-s2s-pipeline` branch:
+
+- Added a direct Nemotron streaming-ASR adapter on `localhost:50052` while
+  leaving the active monolithic WebSocket path unchanged.
+- Added a bounded ordered ASR event bridge whose blocking worker backpressures
+  on a full asyncio queue, with tested terminal events, cancellation, active
+  stream exclusion, channel close, and owned-executor cleanup.
+- Factored the tested 16 kHz mono, automatic-punctuation, 800 ms RNNT EOU
+  request into one builder shared with the existing S2S client.
+- Added separate ASR-final and emitted-segment identities with provenance and
+  a future stage-event telemetry contract.
+- Added deterministic punctuation segmentation across finals, abbreviation
+  and decimal protection, Unicode boundaries, exact-once final flush, and
+  configurable 240-character/2,000 ms safety valves.
+- Added strict direct-ASR completion: early server termination before the
+  input sentinel is consumed reports an error rather than success.
+- Added a standalone real-time WAV smoke command.
+
+Validation:
+
+```text
+Focused staged foundation tests: 79 passed
+Full Python regression suite:     149 passed
+Live direct ASR smoke:             20.0 s audio, 59 interims,
+                                   5 finals, 4 segments, input complete
+Live bounded event bridge:         59 INTERIM, 5 FINAL, 1 COMPLETE,
+                                   0 ERROR
+```
+
+The smoke used the pinned Nemotron ASR Streaming `1.2.0`, Riva client `2.24.0`,
+automatic punctuation, and the 800 ms EOU configuration. Detailed contracts,
+commands, limitations, and observed results are in
+[Staged pipeline foundation](STAGED_PIPELINE_FOUNDATION.md).
+
+## Remaining staged backend implementation
 
 Not yet completed:
 
-- Direct Nemotron streaming ASR consumption.
-- Explicit splitting of ASR finals at punctuation boundaries.
 - Bounded NMT and TTS queues with pipeline overlap.
-- Ordered segment IDs and a reorder buffer if worker counts exceed one.
-- Per-stage queue residence and inference metrics.
+- Direct NMT/TTS application adapters and target-language validation.
+- Ordered outbound audio and a reorder buffer if worker counts exceed one.
+- Persisted per-stage queue residence and inference metrics.
+- Feature-flagged staged WebSocket integration and deterministic stage drain.
 - A live comparison of monolithic versus staged paths.
 - Server-side TTS prosody or pitch-preserving client time scaling.
 
@@ -388,7 +424,7 @@ Artifact locations:
 - [ ] Cross-check replay scheduling with an actual browser/Web Audio run
 - [ ] Capture synchronized phrase/punchline delay, not only queue depth
 - [ ] Review 1.05x and 1.10x quality with native Spanish listeners
-- [ ] Implement and unit-test punctuation splitting before staged live tests
+- [x] Implement and unit-test punctuation splitting before staged live tests
 - [ ] Add bounded NMT/TTS queues and ordered drain behavior
 - [ ] Keep the private `nvidian/tegra-audio` image reference out of external
   documentation unless NVIDIA explicitly grants Pellera access

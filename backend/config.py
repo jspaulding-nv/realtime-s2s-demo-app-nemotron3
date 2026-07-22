@@ -18,9 +18,20 @@ class AudioConfig:
 class RivaConfig:
     """Riva service configuration."""
     uri: str = os.getenv("RIVA_URI", "localhost:50051")
+    asr_uri: str = os.getenv("RIVA_ASR_URI", "localhost:50052")
+    tts_uri: str = os.getenv("RIVA_TTS_URI", "localhost:50053")
     model: str = os.getenv("RIVA_NMT_MODEL", "megatronnmt_any_any_1b")
     source_language: str = os.getenv("RIVA_SOURCE_LANGUAGE", "en-US")
     endpointing_history_ms: int = int(os.getenv("RIVA_EOU_MS", "800"))
+    asr_word_time_offsets: bool = os.getenv("RIVA_ASR_WORD_TIMES", "0") == "1"
+
+
+@dataclass
+class StagedPipelineConfig:
+    """Experimental text segmentation settings for the staged path."""
+
+    segment_max_chars: int = int(os.getenv("STAGED_SEGMENT_MAX_CHARS", "240"))
+    segment_max_age_ms: int = int(os.getenv("STAGED_SEGMENT_MAX_AGE_MS", "2000"))
 
 
 # Supported target languages with their TTS voice names
@@ -43,3 +54,4 @@ SUPPORTED_LANGUAGES: Dict[str, dict] = {
 # Default configuration instances
 audio_config = AudioConfig()
 riva_config = RivaConfig()
+staged_pipeline_config = StagedPipelineConfig()
