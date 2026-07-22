@@ -22,15 +22,27 @@ GitHub permits only one fork of a source repository per owner. Because `jspauldi
 - A resumable one-command harness for sequential matched-policy runs across all three sermons
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
+- Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
+- Browser acceptance that requires server completion as well as an empty Web Audio queue
+- Standalone hesitation-filler suppression before sequence allocation, narrow Spanish `OK`/`Okay`/`Amen` overrides, and fail-closed target-script validation before TTS
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
-The active browser path still uses the monolithic Riva S2S endpoint. The
-experimental backend now has direct ASR, NMT, and TTS adapters plus bounded
-queues, ordered NMT/TTS overlap, deterministic drain, and per-stage telemetry.
-That staged path completed a real-time one-minute live preflight, but is not
-wired into `/ws/translate` yet. Feature-flagged WebSocket integration remains
-the next client-orchestration milestone.
+The safe default browser path still uses the monolithic Riva S2S operation.
+Set `S2S_PIPELINE_MODE=staged` and restart FastAPI to route the same WebSocket
+protocol through the direct bounded pipeline. The staged path has completed a
+real-time one-minute direct preflight and a separate terminal-aware one-minute
+WebSocket preflight. It also passed a real-time 31:28 Beholding full-sermon
+operational canary with 646 ordered segments and no missing IDs or stage
+errors. The staged Spirit/Blessed matrix, actual browser queue, marked-phrase
+delay, and native-listener speed/quality gates remain open before it should be
+treated as the preferred live path.
+
+That live canary predates the final edge-case hardening. Its raw trace satisfies
+the newly added terminal-order and PCM count/byte checks, but the final code
+snapshot has deterministic test coverage rather than a repeated full GPU
+canary. Its saved summary is historical and cannot resume under the tightened
+provenance schema.
 
 ## Architecture
 
@@ -169,7 +181,24 @@ python3 staged_pipeline_smoke.py \
 ```
 
 This writes ignored raw PCM and JSON telemetry under `test_results_staged/`.
-It does not change the active browser route, which remains monolithic.
+It exercises the direct pipeline without the WebSocket or browser.
+
+To opt into that staged pipeline through `/ws/translate`, set the following in
+`.env` and restart the backend:
+
+```dotenv
+S2S_PIPELINE_MODE=staged
+```
+
+Confirm the selected mode before recording a result:
+
+```bash
+curl --fail --silent http://localhost:8000/api/config | python3 -m json.tool
+```
+
+See [the staged WebSocket integration guide](docs/STAGED_WEBSOCKET_INTEGRATION.md)
+for the terminal-aware one-minute gate, retained telemetry, rollback, and
+full-sermon promotion order.
 
 ### 3. Start the web application
 
@@ -289,7 +318,8 @@ class AudioConfig:
 
 - `GET /` - Health check
 - `GET /api/languages` - List available target languages
-- `GET /api/config` - Get audio configuration
+- `GET /api/config` - Get audio configuration, active pipeline mode, staged limits, and declared ASR/NMT/TTS model provenance
+- `GET /api/test/export` - Get timing events plus retained staged pipeline evidence
 
 ### WebSocket
 
@@ -313,6 +343,10 @@ the sentinel proves all queued source chunks were read. If ASR endpointing ends
 a generator sooner, the client restarts it to drain the remaining input.
 Generator/final-flush errors or audio-send failures emit `error` instead;
 `stop_stream` then ends the session.
+
+In staged mode, the same terminal contract additionally requires all ASR, NMT,
+and TTS workers to close cleanly, no emitted sequence to remain incomplete, and
+dequeued sequence IDs to match successful WebSocket sends exactly.
 Plus binary audio frames (Int16 PCM)
 
 Server → Client:
@@ -402,6 +436,16 @@ capture. Backend and repeat settings are recovered from the manifest; explicit
 values must match. `--output-root`, `--run-id`, and `--skip-preflight` control
 new runs, and `--skip-preflight` cannot alter a resumed run.
 
+New runs also freeze the complete `/api/config.modelConfig` snapshot: ASR,
+NMT, and TTS endpoints, image references, optional digests and profiles, model
+and voice, source/target languages, ASR EOU, and word-time setting. Every
+promoted capture must match it. These values are supplied by the backend's
+environment; the harness does not inspect the Docker daemon. For immutable
+provenance, use digest-qualified image references, populate and independently
+verify the digest fields, and keep the resulting manifest. Older manifests
+without `modelConfig` are historical evidence and intentionally cannot resume
+under the stricter schema.
+
 Commit the intended code and start from a clean worktree if the run may need to
 be resumed; a run whose original manifest records a dirty worktree is
 intentionally not resumable.
@@ -412,7 +456,11 @@ manifest. The CLI waits for the backend's terminal `completed` status rather
 than treating five seconds of silence as success. Failure to receive that
 status within the 300-second drain maximum fails the capture. A Riva
 generator/final-flush error or any pending PCM WebSocket send failure also
-emits `error` and invalidates the capture. A backend-keyed local file lock
+emits `error` and invalidates the capture. Staged validation also rejects a
+completion before `end_input`, PCM after completion, or any frame-count/byte
+mismatch between successful server sends and client receives. The summary
+records completed-terminal arrival lag separately from the longer harness
+polling/settle observation. A backend-keyed local file lock
 prevents two harness processes on the same machine from using the
 single-session backend concurrently.
 
@@ -448,7 +496,7 @@ For a live audience, the remaining listener-visible delay matters more than serv
 
 The 10-second value is an audience-experience objective, not a guaranteed hard cap. If translated audio is generated faster than 1.10x playback can consume it, the queue can still exceed that value. Browser queue depth also excludes the upstream time spent waiting for ASR finalization, translation, and the first TTS audio; therefore it does not by itself equal the delay between an English joke and its Spanish rendering.
 
-A deterministic replay of the three saved Nemotron arrival traces reduced the combined fixed-rate listener tail by 82.2%, from 472.151 seconds to 84.001 seconds. It did not satisfy the queue objective: simulated peaks remained 23.8-53.1 seconds. These are offline policy projections, not new live Riva/browser runs or listening-quality results. Reproduce them when the ignored raw CSVs are present:
+A deterministic replay of the three saved Nemotron arrival traces reduced the combined fixed-rate listener tail by 82.3%, from 471.803 seconds to 83.654 seconds. It did not satisfy the queue objective: simulated peaks remained 23.8-53.1 seconds. These are offline policy projections, not new live Riva/browser runs or listening-quality results. Reproduce them when the ignored raw CSVs are present:
 
 ```bash
 python analyze_playback_policy.py --input-dir test_results_nemotron
@@ -463,7 +511,10 @@ Detailed guides:
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sermon acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)
-- [Bounded staged NMT/TTS pipeline and one-minute result](docs/STAGED_NMT_TTS_PIPELINE.md)
+- [Bounded staged NMT/TTS pipeline, preflight, and full canary](docs/STAGED_NMT_TTS_PIPELINE.md)
+- [Feature-flagged staged WebSocket integration](docs/STAGED_WEBSOCKET_INTEGRATION.md)
+- [Beholding full-sermon staged canary](docs/BEHOLDING_STAGED_CANARY.md)
+- [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)
 - [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)
 - [Implementation and verification log](docs/IMPLEMENTATION_LOG.md)
 

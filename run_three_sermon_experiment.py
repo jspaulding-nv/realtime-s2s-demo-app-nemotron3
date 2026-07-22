@@ -18,6 +18,7 @@ import csv
 import fcntl
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -170,6 +171,9 @@ def build_manifest(
         "updated_at_utc": utc_now(),
         "completed_at_utc": None,
         "backend_url": backend_url.rstrip("/"),
+        # Filled atomically with the first successful backend readiness check.
+        # Resumes and every capture summary must match this frozen snapshot.
+        "pipeline_provenance": None,
         "requested_repeats": repeats,
         "git": git_metadata(),
         "preflight": {
@@ -288,7 +292,132 @@ def experiment_lock(backend_url: str):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def validate_summary(path: Path) -> tuple[bool, str]:
+def _validated_model_config(
+    value: Any,
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(value, dict):
+        return None, "modelConfig is missing or invalid"
+    required_fields = {
+        "asr": (
+            "endpoint",
+            "image",
+            "imageDigest",
+            "profile",
+            "eouMs",
+            "wordTimeOffsets",
+            "sourceLanguage",
+        ),
+        "nmt": (
+            "endpoint",
+            "image",
+            "imageDigest",
+            "profile",
+            "model",
+            "sourceLanguage",
+            "targetLanguage",
+        ),
+        "tts": (
+            "endpoint",
+            "image",
+            "imageDigest",
+            "profile",
+            "targetLanguage",
+            "voice",
+        ),
+    }
+    for stage, fields in required_fields.items():
+        stage_config = value.get(stage)
+        if not isinstance(stage_config, dict):
+            return None, f"modelConfig.{stage} is missing or invalid"
+        missing = [field for field in fields if field not in stage_config]
+        if missing:
+            return None, (
+                f"modelConfig.{stage} is missing fields: "
+                + ", ".join(missing)
+            )
+        for field in ("endpoint", "image"):
+            field_value = stage_config[field]
+            if not isinstance(field_value, str) or not field_value.strip():
+                return None, f"modelConfig.{stage}.{field} is invalid"
+        for field in ("imageDigest", "profile"):
+            field_value = stage_config[field]
+            if field_value is not None and (
+                not isinstance(field_value, str) or not field_value.strip()
+            ):
+                return None, f"modelConfig.{stage}.{field} is invalid"
+
+    asr = value["asr"]
+    nmt = value["nmt"]
+    tts = value["tts"]
+    if (
+        not isinstance(asr["eouMs"], int)
+        or isinstance(asr["eouMs"], bool)
+        or asr["eouMs"] <= 0
+    ):
+        return None, "modelConfig.asr.eouMs is invalid"
+    if not isinstance(asr["wordTimeOffsets"], bool):
+        return None, "modelConfig.asr.wordTimeOffsets is invalid"
+    for stage, field in (
+        (asr, "sourceLanguage"),
+        (nmt, "model"),
+        (nmt, "sourceLanguage"),
+        (nmt, "targetLanguage"),
+        (tts, "targetLanguage"),
+        (tts, "voice"),
+    ):
+        if not isinstance(stage[field], str) or not stage[field].strip():
+            return None, f"modelConfig field {field} is invalid"
+    if asr["sourceLanguage"] != nmt["sourceLanguage"]:
+        return None, "modelConfig source languages disagree"
+    if nmt["targetLanguage"] != tts["targetLanguage"]:
+        return None, "modelConfig target languages disagree"
+    return json.loads(json.dumps(value)), "ok"
+
+
+def _summary_pipeline_provenance(summary: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    mode = summary.get("pipeline_mode", "monolithic")
+    if mode not in {"monolithic", "staged"}:
+        return None, f"summary has invalid pipeline mode: {mode!r}"
+    backend_config = summary.get("backend_config")
+    if not isinstance(backend_config, dict):
+        return None, "summary backend_config is missing or invalid"
+    config_mode = backend_config.get("pipelineMode")
+    if config_mode != mode:
+        return None, (
+            "summary pipeline mode/config mismatch: "
+            f"pipeline_mode={mode!r}, backend_config={config_mode!r}"
+        )
+    model_config, reason = _validated_model_config(
+        backend_config.get("modelConfig")
+    )
+    if model_config is None:
+        return None, f"summary {reason}"
+    target_language = summary.get("target_language")
+    expected_target = model_config["nmt"]["targetLanguage"]
+    if target_language != expected_target:
+        return None, (
+            "summary target language/config mismatch: "
+            f"target_language={target_language!r}, configured={expected_target!r}"
+        )
+    staged_config = None
+    if mode == "staged":
+        if not isinstance(backend_config, dict):
+            return None, "staged summary backend_config is missing or invalid"
+        staged_config = backend_config.get("stagedConfig")
+        if not isinstance(staged_config, dict):
+            return None, "staged summary stagedConfig is missing or invalid"
+    return {
+        "pipeline_mode": mode,
+        "stagedConfig": staged_config,
+        "modelConfig": model_config,
+    }, "ok"
+
+
+def validate_summary(
+    path: Path,
+    *,
+    expected_pipeline: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"missing summary: {path}"
     try:
@@ -302,6 +431,71 @@ def validate_summary(path: Path) -> tuple[bool, str]:
         total_received_bytes = int(summary.get("total_received_bytes", 0))
     except (TypeError, ValueError):
         return False, "capture counters are invalid"
+
+    input_end_timestamp_ms = summary.get("input_end_timestamp_ms")
+    terminal_timestamp_ms = summary.get("terminal_arrival_timestamp_ms")
+    terminal_lag_sec = summary.get("terminal_arrival_lag_sec")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        for value in (
+            input_end_timestamp_ms,
+            terminal_timestamp_ms,
+            terminal_lag_sec,
+        )
+    ):
+        return False, "terminal timing evidence is missing or invalid"
+    if input_end_timestamp_ms <= 0 or terminal_timestamp_ms <= 0:
+        return False, "terminal timing timestamps must be positive"
+    if terminal_timestamp_ms < input_end_timestamp_ms:
+        return False, "completed terminal arrived before end_input"
+    expected_terminal_lag = (
+        terminal_timestamp_ms - input_end_timestamp_ms
+    ) / 1000
+    if not math.isclose(
+        terminal_lag_sec,
+        expected_terminal_lag,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        return False, "terminal arrival lag is inconsistent with timestamps"
+
+    pipeline_provenance, reason = _summary_pipeline_provenance(summary)
+    if pipeline_provenance is None:
+        return False, reason
+
+    staged_integrity = summary.get("staged_integrity")
+    if staged_integrity is not None:
+        if not isinstance(staged_integrity, dict):
+            return False, "staged pipeline integrity result is invalid"
+        staged_errors = staged_integrity.get("errors")
+        if not isinstance(staged_errors, list):
+            return False, "staged pipeline integrity errors are invalid"
+        if staged_errors:
+            return False, (
+                "staged pipeline integrity failed: "
+                + "; ".join(str(error) for error in staged_errors)
+            )
+        if summary.get("pipeline_mode") == "staged":
+            if staged_integrity.get("applicable") is not True:
+                return False, "staged pipeline integrity was not applied"
+            if staged_integrity.get("passed") is not True:
+                return False, "staged pipeline integrity did not pass"
+    elif summary.get("pipeline_mode") == "staged":
+        return False, "staged pipeline integrity result is missing"
+
+    if pipeline_provenance["pipeline_mode"] == "staged":
+        if not isinstance(summary.get("staged_pipeline"), dict):
+            return False, "staged pipeline raw evidence is missing or invalid"
+        if not isinstance(summary.get("websocket_receive_events"), list):
+            return False, "staged WebSocket receive evidence is missing or invalid"
+
+    if expected_pipeline is not None and pipeline_provenance != expected_pipeline:
+        return False, (
+            "capture pipeline provenance differs from manifest: "
+            f"expected {expected_pipeline!r}, got {pipeline_provenance!r}"
+        )
 
     checks = (
         (summary.get("input_completed") is True, "input did not complete"),
@@ -332,8 +526,12 @@ def validate_artifact_set(
     plot_path: Path,
     *,
     expected_hashes: dict[str, str] | None = None,
+    expected_pipeline: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    summary_valid, reason = validate_summary(summary_path)
+    summary_valid, reason = validate_summary(
+        summary_path,
+        expected_pipeline=expected_pipeline,
+    )
     if not summary_valid:
         return False, reason
     if not csv_path.is_file() or csv_path.stat().st_size == 0:
@@ -392,30 +590,117 @@ def validate_artifact_set(
     return True, "ok"
 
 
-def capture_artifacts_valid(run_dir: Path, entry: dict[str, Any]) -> tuple[bool, str]:
+def capture_artifacts_valid(
+    run_dir: Path,
+    entry: dict[str, Any],
+    *,
+    expected_pipeline: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     return validate_artifact_set(
         run_dir / entry["csv"],
         run_dir / entry["summary"],
         run_dir / entry["plot"],
         expected_hashes=entry.get("artifact_sha256"),
+        expected_pipeline=expected_pipeline,
     )
 
 
 def check_backend_ready(backend_url: str) -> dict[str, Any]:
+    root_url = f"{backend_url.rstrip('/')}/"
     try:
-        response = requests.get(f"{backend_url.rstrip('/')}/", timeout=10)
+        response = requests.get(root_url, timeout=10)
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
         raise ExperimentError(f"backend readiness check failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ExperimentError("backend readiness response must be a JSON object")
     if payload.get("status") != "ok":
         raise ExperimentError(f"backend returned unexpected status: {payload}")
-    if payload.get("riva_connected") is not True:
+
+    pipeline_mode = payload.get("pipeline_mode", "monolithic")
+    if pipeline_mode not in {"monolithic", "staged"}:
+        raise ExperimentError(
+            f"backend returned invalid pipeline mode: {pipeline_mode!r}"
+        )
+
+    if pipeline_mode == "monolithic" and payload.get("riva_connected") is not True:
         raise ExperimentError(
             "backend is reachable but not connected to Riva; start and verify "
             "ASR, NMT, TTS, and the FastAPI backend before retrying"
         )
+
+    config_url = f"{backend_url.rstrip('/')}/api/config"
+    try:
+        config_response = requests.get(config_url, timeout=10)
+        config_response.raise_for_status()
+        config = config_response.json()
+    except Exception as exc:
+        raise ExperimentError(
+            f"backend configuration check failed: {exc}"
+        ) from exc
+    if not isinstance(config, dict) or config.get("pipelineMode") != pipeline_mode:
+        raise ExperimentError(
+            "backend readiness/config mode mismatch: "
+            f"root={pipeline_mode!r}, config={config!r}"
+        )
+    model_config, reason = _validated_model_config(config.get("modelConfig"))
+    if model_config is None:
+        raise ExperimentError(f"backend configuration {reason}")
+    payload = dict(payload)
+    payload["config"] = config
+
     return payload
+
+
+def _pipeline_provenance_from_readiness(
+    readiness: dict[str, Any],
+) -> dict[str, Any]:
+    mode = readiness.get("pipeline_mode", "monolithic")
+    if mode not in {"monolithic", "staged"}:
+        raise ExperimentError(
+            f"backend returned invalid pipeline mode: {mode!r}"
+        )
+    staged_config = None
+    config = readiness.get("config")
+    if not isinstance(config, dict):
+        raise ExperimentError("backend readiness config is missing")
+    if mode == "staged":
+        staged_config = config.get("stagedConfig")
+        if not isinstance(staged_config, dict):
+            raise ExperimentError("staged backend readiness stagedConfig is missing")
+    model_config, reason = _validated_model_config(config.get("modelConfig"))
+    if model_config is None:
+        raise ExperimentError(f"backend readiness {reason}")
+    return {
+        "pipeline_mode": mode,
+        # Round-trip to detach the immutable manifest snapshot from any
+        # mutable response/test object retained elsewhere.
+        "stagedConfig": json.loads(json.dumps(staged_config)),
+        "modelConfig": model_config,
+    }
+
+
+def freeze_or_validate_pipeline_provenance(
+    manifest: dict[str, Any],
+    readiness: dict[str, Any],
+) -> dict[str, Any]:
+    observed = _pipeline_provenance_from_readiness(readiness)
+    frozen = manifest.get("pipeline_provenance")
+    if frozen is None:
+        if manifest.get("backend_readiness") is not None:
+            raise ExperimentError(
+                "resume manifest has backend readiness evidence but no frozen "
+                "pipeline provenance; start a new run to prevent mixed captures"
+            )
+        manifest["pipeline_provenance"] = observed
+        return observed
+    if frozen != observed:
+        raise ExperimentError(
+            "backend pipeline provenance differs from the frozen manifest: "
+            f"expected {frozen!r}, got {observed!r}"
+        )
+    return frozen
 
 
 def validate_result(result: TestResult) -> None:
@@ -432,6 +717,33 @@ def validate_result(result: TestResult) -> None:
         failures.append(f"backend error: {result.server_error}")
     if result.audio_responses <= 0 or result.total_received_bytes <= 0:
         failures.append("no translated audio was received")
+    if result.translation_completed:
+        if result.input_end_timestamp_ms <= 0:
+            failures.append("input end timestamp is missing")
+        if result.terminal_arrival_timestamp_ms <= 0:
+            failures.append("terminal arrival timestamp is missing")
+        elif result.terminal_arrival_timestamp_ms < result.input_end_timestamp_ms:
+            failures.append("completed terminal arrived before end_input")
+        expected_lag = max(
+            0.0,
+            (
+                result.terminal_arrival_timestamp_ms
+                - result.input_end_timestamp_ms
+            )
+            / 1000,
+        )
+        if not math.isclose(
+            result.terminal_arrival_lag_sec,
+            expected_lag,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            failures.append("terminal arrival lag is inconsistent with timestamps")
+    if result.staged_integrity_errors:
+        failures.append(
+            "staged pipeline integrity failed: "
+            + "; ".join(str(error) for error in result.staged_integrity_errors)
+        )
     if failures:
         raise ExperimentError("; ".join(failures))
 
@@ -468,6 +780,7 @@ async def capture_and_promote(
     backend_url: str,
     run_dir: Path,
     entry: dict[str, Any],
+    expected_pipeline: dict[str, Any],
 ) -> None:
     staging_root = run_dir / ".staging"
     staging_root.mkdir(parents=True, exist_ok=True)
@@ -479,6 +792,7 @@ async def capture_and_promote(
             Path(artifacts["csv"]),
             Path(artifacts["summary"]),
             Path(artifacts["plot"]),
+            expected_pipeline=expected_pipeline,
         )
         if not valid:
             raise ExperimentError(reason)
@@ -489,7 +803,11 @@ async def capture_and_promote(
             Path(artifacts[key]).replace(destination)
 
     entry["artifact_sha256"] = _artifact_hashes(run_dir, entry)
-    valid, reason = capture_artifacts_valid(run_dir, entry)
+    valid, reason = capture_artifacts_valid(
+        run_dir,
+        entry,
+        expected_pipeline=expected_pipeline,
+    )
     if not valid:
         raise ExperimentError(f"promoted artifact validation failed: {reason}")
 
@@ -586,6 +904,7 @@ def write_analysis(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "run_id": manifest["run_id"],
         "backend_url": manifest["backend_url"],
         "git": manifest["git"],
+        "pipeline": manifest.get("pipeline_provenance"),
         "paired_policy_comparison_from_identical_live_trace": True,
         "browser_web_audio_executed": False,
     }
@@ -639,12 +958,20 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
 
     try:
         readiness = check_backend_ready(manifest["backend_url"])
+        pipeline_provenance = freeze_or_validate_pipeline_provenance(
+            manifest,
+            readiness,
+        )
         manifest["backend_readiness"] = readiness
         write_manifest(run_dir, manifest)
 
         preflight = manifest["preflight"]
         if preflight["required"]:
-            valid, _ = capture_artifacts_valid(run_dir, preflight)
+            valid, _ = capture_artifacts_valid(
+                run_dir,
+                preflight,
+                expected_pipeline=pipeline_provenance,
+            )
             if valid:
                 preflight["status"] = "completed"
                 preflight["error"] = None
@@ -664,6 +991,7 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
                         manifest["backend_url"],
                         run_dir,
                         preflight,
+                        pipeline_provenance,
                     )
                 except Exception as exc:
                     preflight["status"] = "failed"
@@ -674,7 +1002,11 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
 
         total = len(manifest["runs"])
         for index, entry in enumerate(manifest["runs"], start=1):
-            valid, reason = capture_artifacts_valid(run_dir, entry)
+            valid, reason = capture_artifacts_valid(
+                run_dir,
+                entry,
+                expected_pipeline=pipeline_provenance,
+            )
             if valid:
                 entry["status"] = "completed"
                 entry["error"] = None
@@ -704,8 +1036,13 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
                     manifest["backend_url"],
                     run_dir,
                     entry,
+                    pipeline_provenance,
                 )
-                valid, reason = capture_artifacts_valid(run_dir, entry)
+                valid, reason = capture_artifacts_valid(
+                    run_dir,
+                    entry,
+                    expected_pipeline=pipeline_provenance,
+                )
                 if not valid:
                     raise ExperimentError(reason)
             except Exception as exc:

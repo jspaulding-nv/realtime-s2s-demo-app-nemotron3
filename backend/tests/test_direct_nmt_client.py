@@ -5,6 +5,7 @@ import pytest
 
 from direct_nmt_client import DirectNMTClient, DirectNMTResponseError
 from staged_models import EmissionReason, TextSegment, TranslatedSegment
+from target_text_validation import TargetTextValidationError
 
 
 def make_segment(text="The congregation laughed at the joke."):
@@ -77,6 +78,7 @@ def test_translate_segment_builds_single_request_and_preserves_provenance():
     assert result.language == "es-US"
     assert result.started_monotonic_ms == 2_000
     assert result.completed_monotonic_ms == 2_250
+    assert result.source_override_applied is False
 
 
 def test_blank_source_is_rejected_before_request_or_rpc():
@@ -119,8 +121,98 @@ def test_response_rejects_blank_translated_text(text):
         response=SimpleNamespace(translations=[translation(text=text)])
     )
 
-    with pytest.raises(DirectNMTResponseError, match="empty translation"):
+    with pytest.raises(
+        TargetTextValidationError, match="missing_letter_or_digit"
+    ):
         client.translate_segment(make_segment(), "es-US")
+
+
+def test_response_is_normalized_to_nfc_before_becoming_a_segment():
+    client, _, _ = configured_client(
+        response=SimpleNamespace(
+            translations=[translation(text="La congregacio\u0301n canto\u0301.")]
+        )
+    )
+
+    result = client.translate_segment(make_segment(), "es-US")
+
+    assert result.text == "La congregación cantó."
+
+
+@pytest.mark.parametrize(
+    "unsafe_text,expected_diagnostic",
+    [
+        ("好吧。", "Han"),
+        ("Привет.", "Cyrillic"),
+        ("Hola а todos.", "Cyrillic"),
+        ("Hola\u2060.", "U+2060"),
+        ("¿?!", "missing_letter_or_digit"),
+    ],
+)
+def test_response_rejects_unsafe_target_text_with_safe_diagnostics(
+    unsafe_text, expected_diagnostic
+):
+    client, _, _ = configured_client(
+        response=SimpleNamespace(translations=[translation(text=unsafe_text)])
+    )
+
+    with pytest.raises(TargetTextValidationError) as failure:
+        client.translate_segment(make_segment(), "es-US")
+
+    assert failure.value.sequence_id == 7
+    assert failure.value.language == "es-US"
+    assert expected_diagnostic in str(failure.value)
+    assert unsafe_text not in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    "source_text,expected_text",
+    [
+        ("Okay.", "De acuerdo."),
+        ("okay?", "¿De acuerdo?"),
+        ("OK!", "¡De acuerdo!"),
+        ("Amen.", "Amén."),
+        ("AMEN?", "¿Amén?"),
+        ("amen!", "¡Amén!"),
+        ('  "Amen."  ', '"Amén."'),
+        ("“Okay.”", "“De acuerdo.”"),
+        ("‘amen!’", "‘¡Amén!’"),
+    ],
+)
+def test_standalone_source_overrides_bypass_nmt_and_are_observable(
+    source_text, expected_text
+):
+    client, auth, rpc = configured_client()
+
+    result = client.translate_segment(make_segment(source_text), "es-US")
+
+    assert result.text == expected_text
+    assert result.language == "es-US"
+    assert result.source_override_applied is True
+    assert result.to_dict()["source_override_applied"] is True
+    rpc.assert_not_called()
+    auth.get_auth_metadata.assert_not_called()
+
+
+def test_source_override_is_narrow_and_sentence_context_still_calls_nmt():
+    client, _, rpc = configured_client()
+
+    result = client.translate_segment(
+        make_segment("Okay everyone, please sit down."), "es-US"
+    )
+
+    assert result.source_override_applied is False
+    rpc.assert_called_once()
+
+
+@pytest.mark.parametrize("source_text", ['“Amen."', '"Okay.”', '“Amen. now”'])
+def test_source_override_rejects_mismatched_or_non_standalone_quotes(source_text):
+    client, _, rpc = configured_client()
+
+    result = client.translate_segment(make_segment(source_text), "es-US")
+
+    assert result.source_override_applied is False
+    rpc.assert_called_once()
 
 
 @pytest.mark.parametrize("language", ["", "es-ES", "en-US"])
@@ -150,6 +242,13 @@ def test_disconnected_client_rejects_translation():
 
     with pytest.raises(RuntimeError, match="not connected"):
         client.translate_segment(make_segment(), "es-US")
+
+
+def test_disconnected_client_also_rejects_source_override():
+    client = DirectNMTClient()
+
+    with pytest.raises(RuntimeError, match="not connected"):
+        client.translate_segment(make_segment("Amen."), "es-US")
 
 
 def test_connect_is_idempotent_and_disconnect_closes_channel_once():

@@ -1,26 +1,33 @@
-# Planned staged ASR to NMT to TTS pipeline
+# Staged ASR to NMT to TTS pipeline
 
 ## Status
 
-The first foundation milestone is implemented and documented in
+The staged path is implemented and connected to `/ws/translate` behind
+`S2S_PIPELINE_MODE=staged`. Monolithic mode remains the default and rollback
+path. The first foundation milestone is documented in
 [Staged pipeline foundation](STAGED_PIPELINE_FOUNDATION.md). It adds direct
 Nemotron streaming ASR, typed final/segment records, deterministic punctuation
-segmentation, and an opt-in live smoke. The second milestone now also provides
+segmentation, and an opt-in live smoke. The second milestone provides
 direct NMT/TTS adapters, bounded overlapping workers, ordered drain, and a
 successful one-minute live preflight; see
-[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md). The active
-browser path remains monolithic, and no staged sermon run has been performed.
+[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md) and
+[feature-flagged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
 
-The current backend calls the monolithic streaming S2S operation on the NMT
-service. That endpoint connects to remote ASR and TTS services, but the
-application cannot observe or control punctuation segmentation, queue
-residence, or pipeline overlap between individual stages.
+The first full staged sermon canary is also complete. Beholding attempt 3
+processed all 1,888.1045 seconds, delivered 646 consecutive ordered sequence
+IDs, and reached natural completion with no pipeline, WebSocket, or cleanup
+errors. This passes the operational gate, but not the audience-experience
+gate: fixed 1.00x listener playback still ended 64.038 seconds after the
+source. Spirit, Blessed, the complete staged comparison matrix, browser Web
+Audio validation, and marked-phrase/punchline timing remain open.
 
-The staged design makes those boundaries explicit while keeping the pinned
-models unchanged initially.
+The monolithic endpoint still connects to remote ASR and TTS services without
+application-owned stage boundaries. Staged mode makes punctuation,
+queue-residence, overlap, ordering, and content-safety decisions observable
+and controllable while using the same pinned NMT and TTS models.
 
 This work remains necessary after the offline adaptive replay. Although the
-1.10x policy reduced aggregate simulated listener tail by 82.2%, queue p95 was
+1.10x policy reduced aggregate simulated listener tail by 82.3%, queue p95 was
 still 19-45 seconds and every trace exceeded the 10-second soft/SLA ceiling.
 Listener-side catch-up alone did not create a bounded queue on the saved
 arrival patterns.
@@ -51,13 +58,12 @@ the effect of orchestration is not confounded with a model change.
 The installed Riva Python client exposes the relevant operation families as
 `ASRService.streaming_response_generator`,
 `NeuralMachineTranslationClient.translate`, and
-`SpeechSynthesisService.synthesize_online`. Confirm exact signatures against
-the live services before coding the staged path. The repository pins the
-tested client to `nvidia-riva-client==2.24.0`; direct ASR, NMT, and TTS smoke
-tests must still verify that its request shapes and response streaming behavior
-match the three pinned NIM releases.
+`SpeechSynthesisService.synthesize_online`. The repository pins the tested
+client to `nvidia-riva-client==2.24.0`; direct ASR, NMT, and TTS smokes have
+validated its request shapes and response streaming behavior against the three
+pinned NIM releases.
 
-## Proposed data flow
+## Implemented data flow
 
 ```text
 English PCM stream
@@ -71,6 +77,8 @@ bounded ordered ASR event queue (implemented; interims are observability-only)
       |
       v
 punctuation-aware segmenter
+      |
+      +-- isolated hesitation filler --> telemetry-only discard before ID allocation
       |
       v
 bounded NMT input queue --> NMT worker --> bounded TTS input queue
@@ -125,7 +133,7 @@ smoke-test path, not the application integration API.
 ## Punctuation-aware segmentation
 
 The segmenter accumulates final ASR text and emits complete translation units
-at terminal punctuation. Its contract should:
+at terminal punctuation. Its contract:
 
 - emit complete clauses or sentences on `.`, `?`, and `!` boundaries;
 - retain any unpunctuated residual for the next final;
@@ -136,11 +144,40 @@ at terminal punctuation. Its contract should:
 - apply a configurable maximum text length or age so a missing punctuation
   mark cannot buffer indefinitely.
 
+Exact standalone hesitation fillers `uh`, `um`, `er`, `erm`, and `hmm` are
+suppressed case-insensitively, including terminal punctuation and quote
+wrappers. This happens before sequence-ID allocation, so subsequent meaningful
+segments remain consecutive. Each suppression emits a privacy-safe
+`segmenter/filler_discarded` record with contributing ASR-final IDs, source
+timing, character count, and no translated-segment ID. It also increments the
+session's `fillers_discarded` total. A filler embedded in meaningful text is
+preserved.
+
 The maximum-length/age fallback is a safety valve, not a substitute for the
 800 ms ASR endpoint. Record why each segment was emitted: punctuation,
 length, age, or final flush. Unit tests should cover punctuation across final
 boundaries, multiple sentences in one final, abbreviations, decimals, empty
 finals, Unicode punctuation, and end-of-input residuals.
+
+## NMT-to-TTS content safety
+
+The staged path applies narrow deterministic `es-US` source overrides only to
+standalone `OK`/`Okay` and `Amen` variants, preserving supported punctuation
+and matched quote wrappers. They become `De acuerdo.` or `Amén.` (with Spanish
+question/exclamation marks where applicable), bypass the NMT RPC, and remain
+observable through `source_override_applied`. Sentence context and all other
+short utterances still use NMT.
+
+Every translated result is NFC-normalized and validated immediately after NMT,
+then validated defensively again before TTS. The current `es-US` policy
+requires speakable letter/digit content and permits Latin letters, decimal
+digits, an explicit Spanish Magpie-safe punctuation allowlist, non-control
+whitespace, and Latin-attached combining marks. CJK punctuation such as
+`U+3002`, non-Latin or mixed-script letters, detached marks, symbols, and
+control/format characters fail closed with sequence-scoped, privacy-safe
+metadata. Invalid output is never sent to Magpie. The pipeline does not retry
+an unchanged NMT or TTS payload because that cannot make deterministic invalid
+text safe and can produce inconsistent or wrong-language audio.
 
 ## Bounded queues and backpressure
 
@@ -220,7 +257,10 @@ which sequence IDs did not complete.
 ## Failure handling
 
 - Give every session and segment a stable ID in logs.
-- Retry only failures known to be transient and cap retry counts.
+- Fail closed on invalid or wrong-script target text before TTS, with no
+  unchanged NMT/TTS retry.
+- Retry only failures proven to be transient, cap retry counts, and never treat
+  deterministic content validation as transient.
 - Make TTS retry output atomic so a partial first attempt is not followed by a
   duplicated full segment.
 - Surface stage failure to the WebSocket client with the affected sequence ID.
@@ -252,6 +292,7 @@ audio_bytes
 audio_duration_ms
 retry_count
 error_code
+source_override_applied
 ```
 
 Recommended events are:
@@ -259,6 +300,7 @@ Recommended events are:
 ```text
 asr_final
 segment_emitted
+filler_discarded
 nmt_enqueued
 nmt_started
 nmt_completed
@@ -273,6 +315,11 @@ browser_scheduled
 browser_audible_start
 browser_completed
 ```
+
+`filler_discarded` is intentionally a pre-sequence event: it carries final
+provenance and source timing but no segment ID. The session summary retains its
+aggregate count. Source-override use is attached to the translated segment so
+known short-form handling is auditable without logging source or target text.
 
 Emit compact per-session summaries in addition to event-level CSV. Do not mix
 backend epoch timestamps and browser `performance.now()` without an explicit
@@ -290,19 +337,22 @@ offset measurement.
 4. **Completed:** add ordered atomic audio and deterministic sentinel-based
    drain tests.
 5. **Completed:** retain stage telemetry and expose session summaries/reports.
-6. Integrate the existing WebSocket API behind a staged feature flag while
-   retaining `end_input` and
-   `stop_stream` semantics.
-7. **One-minute preflight completed:** run one staged sermon next, before the
-   full matrix.
-8. Compare monolithic and staged paths with identical models, input, EOU, and
-   browser playback policy.
-9. Increase workers only if stage telemetry justifies it.
+6. **Completed:** integrate the existing WebSocket API behind a staged feature
+   flag while retaining `end_input` and `stop_stream` semantics.
+7. **Completed:** pass the one-minute preflight and the first full staged
+   sermon operational canary. Beholding attempt 3 processed 1,888.1045 seconds
+   and delivered all 646 ordered IDs without errors.
+8. Run Spirit and Blessed, then complete the staged three-sermon comparison
+   matrix with identical models, input, EOU, and playback policy.
+9. Cross-check scheduling in browser Web Audio and measure marked-phrase or
+   punchline delay; the 64.038-second Beholding fixed listener tail leaves this
+   audience gate open.
+10. Increase workers only if stage telemetry justifies it.
 
 ## Validation gates
 
-- Every nonempty ASR final is represented in emitted-segment provenance or the
-  terminal residual.
+- Every nonempty ASR final is represented in emitted-segment provenance, a
+  pre-ID `filler_discarded` record, or the terminal residual.
 - Every emitted segment ID reaches ordered output or has an explicit error
   record.
 - End-of-input drains every stage and the browser without a fixed arbitrary
@@ -311,6 +361,8 @@ offset measurement.
 - The application exposes overload instead of dropping speech.
 - Stage timing explains the difference between semantic delay and browser
   queue depth.
+- The first full staged operational canary completes with consecutive output
+  IDs and one natural terminal. Beholding attempt 3 passed this gate.
 - Three sermon runs complete without gRPC, WebSocket, or container failure.
 - Audience queue and marked-joke delay improve without unacceptable Spanish
   quality.

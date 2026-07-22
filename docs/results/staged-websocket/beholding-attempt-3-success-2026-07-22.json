@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "capture_schema": {
+    "status": "historical_pre_strict_provenance",
+    "new_format_resumable": false,
+    "git_commit_at_capture": null,
+    "clean_worktree_at_capture": false,
+    "source_sha256_at_capture": null,
+    "reason": "The live capture predates /api/config.modelConfig and the new top-level terminal-arrival fields. Retained raw events remain auditable, but this summary is intentionally not accepted as a current resume checkpoint.",
+    "provenance_limit": "The capture used an uncommitted working branch. Image version tags were recorded, but a source SHA, immutable image digests, endpoints, profiles, NMT model, EOU/word-time settings, and voice were not embedded in the captured summary."
+  },
+  "result": "operational_pass_audience_latency_open",
+  "date_utc": "2026-07-22",
+  "source": {
+    "name": "Beholding the Love of God",
+    "duration_seconds": 1888.1045,
+    "chunks_sent": 6294
+  },
+  "pipeline": {
+    "mode": "staged",
+    "asr_image": "nvcr.io/nim/nvidia/nemotron-asr-streaming:1.2.0",
+    "nmt_image": "nvcr.io/nim/nvidia/riva-translate-1_6b:1.5.2",
+    "tts_image": "nvcr.io/nim/nvidia/magpie-tts-multilingual:1.7.0",
+    "target_language": "es-US",
+    "session_id": "043a46ea13c34190868c44c63fec9b4a"
+  },
+  "operational": {
+    "input_completed": true,
+    "translation_completed": true,
+    "staged_integrity_passed": true,
+    "segments_emitted": 646,
+    "audio_segments_produced": 646,
+    "first_sequence_id": 0,
+    "last_sequence_id": 645,
+    "incomplete_sequence_ids": [],
+    "fillers_discarded_before_sequence_allocation": 6,
+    "pipeline_failure": null,
+    "cleanup_errors": [],
+    "connection_lost": false,
+    "drain_timed_out": false,
+    "server_error": "",
+    "first_audio_seconds": 5.112942218780518,
+    "last_audio_arrival_tail_seconds": 0.8495775600022171,
+    "completed_terminal_arrival_lag_seconds": 1.7436084747314453,
+    "harness_drain_observation_seconds": 2.254557565000141,
+    "max_queue_depths": {
+      "nmt": 4,
+      "tts": 4,
+      "output": 1
+    },
+    "blocked_put_counts": {
+      "nmt": 15,
+      "tts": 0,
+      "output": 0
+    },
+        "terminal_protocol": {
+            "pcm_frames": 646,
+            "pcm_frames_received": 646,
+            "pcm_bytes_sent": 61402404,
+            "pcm_bytes_received": 61402404,
+            "send_receive_parity": true,
+            "parity_verification_source": "retained staged websocket_send_events and client receive trace",
+            "completed_status_count": 1,
+      "final_pcm_order": 836,
+      "completed_order": 837,
+      "pcm_after_completed": 0
+    }
+  },
+  "media": {
+    "input_duration_seconds": 1888.1045,
+    "translated_audio_duration_seconds": 1918.825125,
+    "output_to_input_ratio": 1.016270616907062,
+    "duration_excess_seconds": 30.720625000000155,
+    "fixed_1x_listener_tail_seconds": 64.03760539245695
+  },
+  "adaptive_playback_replay": {
+    "rates": [1.0, 1.05, 1.1],
+    "target_queue_seconds": 5.0,
+    "soft_limit_seconds": 10.0,
+    "listener_tail_seconds": 14.246126,
+    "listener_tail_reduction_percent": 77.753502,
+    "peak_queue_seconds": 28.0521,
+    "seconds_above_10": 633.58345,
+    "percent_playback_window_above_10": 33.392944,
+    "accelerated_source_percent": 92.286631,
+    "urgent_1_10x_source_percent": 73.011741,
+    "chunks_dropped": 0,
+    "meets_10_second_queue_objective": false
+  },
+  "runtime_snapshot_after_run": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_memory_total_mib": 97887,
+    "gpu_memory_used_mib": 32217,
+    "gpu_memory_free_mib": 65034,
+    "asr_health": "healthy",
+    "nmt_health": "healthy",
+    "tts_health": "healthy",
+    "container_restarts": {
+      "asr": 0,
+      "nmt": 0,
+      "tts": 0
+    }
+  },
+    "interpretation": {
+        "server_gate": "passed",
+        "live_audience_gate": "not_passed",
+        "caveat": "The fixed and adaptive listener tails are deterministic replays of client arrival timestamps, not measured browser WebAudio or semantic punchline delay."
+    },
+    "post_capture_hardening": {
+        "live_gpu_rerun_on_final_snapshot": false,
+        "implemented_after_capture": [
+            "reject completed before end_input",
+            "automatically require exact staged PCM send/receive frame and byte parity",
+            "freeze declared ASR/NMT/TTS modelConfig for new runs and resume",
+            "separate exact terminal-arrival lag from harness polling/settle observation",
+            "make staged lifecycle cleanup cancellation-safe and protocol terminals generation-aware",
+            "reject punctuation outside the explicit Spanish Magpie-safe target set"
+        ],
+        "validation": {
+            "python_tests_passed": 344,
+            "frontend_tests_passed": 88,
+            "frontend_lint": "passed",
+            "frontend_build": "passed_with_existing_bundle_size_warning"
+        }
+    }
+}

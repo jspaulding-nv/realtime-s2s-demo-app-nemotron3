@@ -1,0 +1,99 @@
+{
+    "capture_schema": {
+        "status": "historical_pre_strict_provenance",
+        "new_format_resumable": false,
+        "git_commit_at_capture": null,
+        "clean_worktree_at_capture": false,
+        "source_sha256_at_capture": null,
+        "reason": "The live preflight predates /api/config.modelConfig and the new top-level terminal-arrival fields."
+    },
+  "date_utc": "2026-07-22",
+  "test": "feature-flagged staged /ws/translate one-minute preflight",
+  "backend_url": "http://127.0.0.1:8001",
+  "pipeline_mode": "staged",
+  "pipeline_mode_source": "api_config",
+  "images": {
+    "asr": "nvcr.io/nim/nvidia/nemotron-asr-streaming:1.2.0",
+    "nmt": "nvcr.io/nim/nvidia/riva-translate-1_6b:1.5.2",
+    "tts": "nvcr.io/nim/nvidia/magpie-tts-multilingual:1.7.0"
+  },
+  "source": {
+    "path": "test_audio/test-1min.wav",
+    "duration_seconds": 60.0,
+    "chunks_sent": 200,
+    "input_completed": true
+  },
+  "result": {
+    "translation_completed": true,
+    "connection_lost": false,
+    "drain_timed_out": false,
+    "server_error": "",
+    "first_audio_latency_seconds": 5.087045907974243,
+    "translated_audio_bytes": 1609442,
+    "translated_audio_seconds": 50.2950625,
+    "output_to_input_duration_ratio": 0.8382510416666666,
+    "last_audio_tail_seconds": 1.315717051998945,
+    "completed_terminal_arrival_lag_seconds": 1.374077796936035,
+    "harness_drain_observation_seconds": 2.2537455270066857,
+    "fixed_rate_playback_tail_seconds": 6.996383354187003
+  },
+    "websocket_receive_order": {
+        "event_count": 33,
+        "pcm_frames": 23,
+        "server_pcm_frames_sent": 23,
+        "pcm_bytes_sent": 1609442,
+        "pcm_bytes_received": 1609442,
+        "send_receive_parity": true,
+        "completed_status_count": 1,
+    "completed_is_last_event": true,
+    "pcm_after_completed": 0
+  },
+  "staged_integrity": {
+    "passed": true,
+    "errors": [],
+    "outcome": "complete",
+    "segments_emitted": 23,
+    "audio_segments_produced": 23,
+    "completed_sequence_ids": [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+      12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    ],
+    "websocket_sent_sequence_ids": [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+      12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+    ],
+    "incomplete_sequence_ids": [],
+    "failure": null,
+    "cleanup_errors": [],
+    "max_queue_depths": {"nmt": 2, "tts": 2, "output": 1},
+    "blocked_put_counts": {"nmt": 0, "tts": 0, "output": 0},
+    "telemetry_event_count": 535,
+    "emission_reasons": {"punctuation": 13, "age": 10}
+  },
+  "stage_timing_ms": {
+    "nmt_processing": {"min": 134.75075101852417, "avg": 325.5178074810816, "max": 674.3415369987488},
+    "tts_first_audio": {"min": 130.1205029785633, "avg": 144.4094300425571, "max": 158.6385299861431},
+    "tts_completion": {"min": 203.00047099590302, "avg": 474.0449180888093, "max": 887.3541849851608},
+    "nmt_queue_residence": {"min": 0.13204199075698853, "avg": 13.833976868702019, "max": 176.3184989988804},
+    "tts_queue_residence": {"min": 0.1279270052909851, "avg": 2.870329043139582, "max": 62.27877199649811},
+    "output_queue_residence": {"min": 0.1309109926223755, "avg": 7.4932761788368225, "max": 10.675045996904373}
+  },
+  "hardware": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "memory_total_mib": 97887,
+    "memory_used_mib": 32217,
+    "memory_free_mib": 65034
+  },
+  "containers_after_run": {
+    "asr": {"healthy": true, "restart_count": 0},
+    "nmt": {"healthy": true, "restart_count": 0},
+    "tts": {"healthy": true, "restart_count": 0}
+  },
+    "limitations": [
+        "One-minute source prefix, not a full sermon.",
+        "Playback tail is an arrival-trace replay, not an executed browser Web Audio distribution.",
+        "No synchronized English-to-Spanish marked-phrase or joke-delay measurement.",
+        "Whole-prefix output/input ratio includes source silence and is not a speech-aligned TTS expansion measurement.",
+        "The final lifecycle/provenance harness hardening was unit-tested after this capture and has not been rerun against the GPU stack."
+    ]
+}

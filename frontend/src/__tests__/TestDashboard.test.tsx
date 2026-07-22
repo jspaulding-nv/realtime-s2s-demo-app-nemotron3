@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { TestDashboard } from '../components/TestDashboard';
 import type { PlaybackMetrics } from '../hooks/useAudioPlayback';
+import type { SessionStatus } from '../types/messages';
 
 // --- Mocks ---
 
@@ -104,8 +105,14 @@ vi.mock('../components/DriftChart', () => ({
   ),
 }));
 
-// Mock fetch
-const mockFetch = vi.fn(() =>
+// Mock fetch. Keep the response shape broad enough to cover both the normal
+// start acknowledgement and FastAPI error payloads.
+type MockFetchResponse = {
+  ok: boolean;
+  status?: number;
+  json: () => Promise<Record<string, string>>;
+};
+const mockFetch = vi.fn<() => Promise<MockFetchResponse>>(() =>
   Promise.resolve({
     ok: true,
     json: () => Promise.resolve({ status: 'started' }),
@@ -178,6 +185,38 @@ describe('TestDashboard', () => {
     render(<TestDashboard />);
     const startBtn = screen.getByText('Start Test');
     expect(startBtn).not.toBeDisabled();
+  });
+
+  it('does not start playback when the backend rejects a new evidence window', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: () => Promise.resolve({
+        detail: 'Cannot start a new test while a staged stream is active',
+      }),
+    });
+    render(<TestDashboard />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Could not start test: Cannot start a new test while a staged stream is active',
+    );
+    expect(screen.getByText('Start Test')).toBeInTheDocument();
+    expect(mockPlaybackStart).not.toHaveBeenCalled();
+    expect(mockTrackerStartTest).not.toHaveBeenCalled();
   });
 
   // --- Audio playback integration tests ---
@@ -388,12 +427,13 @@ describe('TestDashboard', () => {
     expect(screen.getByText(/File input ended/)).toBeInTheDocument();
   });
 
-  it('waits for the playback queue to empty before finishing a natural run', async () => {
+  it('requires server completion and an empty playback queue before finishing naturally', async () => {
     vi.useFakeTimers();
     try {
       const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
       const { useWebSocket } = await import('../hooks/useWebSocket');
       let completeSource: (() => void) | undefined;
+      let notifyStatus: ((status: SessionStatus, message: string) => void) | undefined;
       const sendMessage = vi.fn();
       const disconnect = vi.fn();
 
@@ -409,13 +449,16 @@ describe('TestDashboard', () => {
           stopStreaming: vi.fn(),
         };
       });
-      vi.mocked(useWebSocket).mockReturnValue({
-        isConnected: false,
-        status: 'disconnected',
-        sendMessage,
-        sendAudio: vi.fn(),
-        connect: vi.fn(),
-        disconnect,
+      vi.mocked(useWebSocket).mockImplementation((options) => {
+        notifyStatus = options.onStatus;
+        return {
+          isConnected: false,
+          status: 'disconnected',
+          sendMessage,
+          sendAudio: vi.fn(),
+          connect: vi.fn(),
+          disconnect,
+        };
       });
       mockGetPlaybackMetrics.mockReturnValue({
         queueDepthSeconds: 12,
@@ -455,6 +498,13 @@ describe('TestDashboard', () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1_000);
       });
+      expect(disconnect).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalledWith({ type: 'stop_stream' });
+
+      act(() => notifyStatus?.('completed', 'Riva output complete'));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
 
       expect(sendMessage).toHaveBeenCalledWith({ type: 'stop_stream' });
       expect(disconnect).toHaveBeenCalledTimes(1);
@@ -462,5 +512,127 @@ describe('TestDashboard', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('marks a server error as failed instead of completed', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    let notifyError: ((message: string) => void) | undefined;
+    const stopStreaming = vi.fn();
+    const disconnect = vi.fn();
+
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 10,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming,
+    });
+    vi.mocked(useWebSocket).mockImplementation((options) => {
+      notifyError = options.onError;
+      return {
+        isConnected: false,
+        status: 'disconnected',
+        sendMessage: vi.fn(),
+        sendAudio: vi.fn(),
+        connect: vi.fn(),
+        disconnect,
+      };
+    });
+
+    render(<TestDashboard />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    await act(async () => {
+      notifyError?.('Staged TTS failed');
+      await Promise.resolve();
+    });
+
+    expect(stopStreaming).toHaveBeenCalledTimes(1);
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Test failed: Staged TTS failed',
+    );
+    expect(screen.getByText('Export CSV')).toBeInTheDocument();
+    expect(screen.getByText('New Test')).toBeInTheDocument();
+  });
+
+  it('marks a missing server completion as failed at the drain timeout', async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+      let completeSource: (() => void) | undefined;
+
+      vi.mocked(useFileAudioSource).mockImplementation((options) => {
+        completeSource = options.onComplete;
+        return {
+          isLoaded: true,
+          isStreaming: false,
+          duration: 60,
+          position: 60,
+          loadFile: vi.fn(),
+          startStreaming: vi.fn(),
+          stopStreaming: vi.fn(),
+        };
+      });
+      mockGetPlaybackMetrics.mockReturnValue({
+        queueDepthSeconds: 0,
+        peakQueueDepthSeconds: 0,
+        playbackRate: 1,
+        playbackMode: 'normal',
+        totalSourceDurationSeconds: 60,
+        totalScheduledDurationSeconds: 60,
+        aboveTarget: false,
+        aboveLimit: false,
+        limitExceededCount: 0,
+      });
+
+      render(<TestDashboard />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Start Test'));
+      });
+      act(() => completeSource?.());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300_000);
+      });
+
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Test failed: Timed out waiting for Riva to confirm translation completion.',
+      );
+      expect(screen.getByText('Export CSV')).toBeInTheDocument();
+    } finally {
+      consoleLog.mockRestore();
+      consoleError.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps manual stop independent of the server completion signal', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 10,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Stop Test'));
+    });
+
+    expect(screen.getByText('Export CSV')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

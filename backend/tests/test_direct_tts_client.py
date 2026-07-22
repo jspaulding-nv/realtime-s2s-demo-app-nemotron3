@@ -16,6 +16,7 @@ from staged_models import (
     TextSegment,
     TranslatedSegment,
 )
+from target_text_validation import TargetTextValidationError
 
 
 def translated_segment(text="La congregación se rió.", language="es-US"):
@@ -132,6 +133,40 @@ def test_empty_responses_do_not_set_first_audio_time():
     result = client.synthesize(translated_segment())
 
     assert result.first_audio_monotonic_ms == 125
+
+
+def test_target_text_is_normalized_to_nfc_before_magpie_call():
+    service = RecordingService([Response(b"\x00\x00")])
+    client, _ = configured_client(service)
+
+    client.synthesize(translated_segment(text="La congregacio\u0301n canto\u0301."))
+
+    assert service.calls[0]["text"] == "La congregación cantó."
+
+
+@pytest.mark.parametrize(
+    "unsafe_text,expected_diagnostic",
+    [
+        ("好吧。", "Han"),
+        ("Привет.", "Cyrillic"),
+        ("Hola а todos.", "Cyrillic"),
+        ("Hola\u2060.", "U+2060"),
+        ("¿?!", "missing_letter_or_digit"),
+    ],
+)
+def test_unsafe_target_text_never_calls_magpie(
+    unsafe_text, expected_diagnostic
+):
+    service = RecordingService([Response(b"\x00\x00")])
+    client, _ = configured_client(service)
+
+    with pytest.raises(TargetTextValidationError) as failure:
+        client.synthesize(translated_segment(text=unsafe_text))
+
+    assert failure.value.sequence_id == 7
+    assert expected_diagnostic in str(failure.value)
+    assert unsafe_text not in str(failure.value)
+    assert service.calls == []
 
 
 def test_no_audio_is_an_explicit_failure_and_never_publishes_a_result():

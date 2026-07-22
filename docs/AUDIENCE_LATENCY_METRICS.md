@@ -82,6 +82,15 @@ response arrives. A short flush tail means the service is not still generating
 for minutes after input ends. It does **not** mean the listener has heard all
 audio; minutes of translated audio may still be scheduled in the browser.
 
+### Completed-terminal arrival lag
+
+Time from the explicit end-of-input signal until the client receives the
+single `completed` control message. This includes the final stage cleanup and
+integrity checks after the last PCM response. Report it from receive-event
+timestamps. Keep it separate from the harness's drain-observation duration,
+which can include a polling interval and a deliberate post-terminal settle
+window used to catch duplicate terminals or PCM-after-terminal violations.
+
 ### Listener playback tail
 
 Time from source input completion until the final translated audio would
@@ -115,14 +124,17 @@ duration drift**, not audience delay.
 
 ### Stage residence and processing time
 
-The planned staged backend should record, for each sequence ID:
+The staged backend now records, for each sequence ID:
 
 - ASR final timestamp;
 - punctuation segment emitted timestamp;
 - NMT enqueue, start, and finish timestamps;
 - TTS enqueue, first-audio, and finish timestamps;
-- WebSocket send timestamp; and
-- browser receive, schedule, and audible-start timestamps.
+- WebSocket send timestamp.
+
+The instrumented browser separately records receive and scheduling telemetry;
+an audible-start marker remains future work for synchronized semantic-delay
+testing.
 
 These measurements separate queue residence from inference time and make the
 dominant source of delay actionable.
@@ -134,20 +146,22 @@ playback tails:
 
 | Sermon | Output/input duration | Fixed 1.00x tail | Simulated adaptive tail | Simulated queue p95 | Simulated peak | Simulated time over 10 s |
 |---|---:|---:|---:|---:|---:|---:|
-| Spirit | 1.056x | 172.770 s | 27.183 s | 38.31 s | 46.54 s | 80.0% |
-| Blessed | 1.081x | 228.782 s | 40.206 s | 44.95 s | 53.11 s | 77.3% |
-| Beholding | 1.017x | 70.598 s | 16.613 s | 19.48 s | 23.81 s | 45.6% |
+| Spirit | 1.056x | 172.638 s | 27.051 s | 38.08 s | 46.54 s | 80.0% |
+| Blessed | 1.081x | 228.772 s | 40.195 s | 44.71 s | 53.11 s | 77.3% |
+| Beholding | 1.017x | 70.394 s | 16.408 s | 19.10 s | 23.81 s | 45.6% |
 
 Their service flush tails were 0.0, 0.4, and 0.8 seconds respectively. This
 contrast is important: the service stopped emitting quickly, but the listener
 could still have 1-4 minutes of media left to hear at 1.00x.
 
 The adaptive columns are a deterministic replay of the saved client arrival
-timestamps and PCM byte counts. They preserve every audio chunk and reproduce
-the recorded fixed-rate tails within 0.005 seconds. They are not a new live
+timestamps and PCM byte counts. They preserve every audio chunk. The July 8
+summaries measured input completion at the start of the final source chunk;
+the generated replay now uses that chunk's exact PCM end and records the old
+values only as annotated compatibility evidence. These are not a new live
 Riva run or a browser/audio-quality test.
 
-Across the three replays, tail fell from 472.151 to 84.001 seconds, an 82.2%
+Across the three replays, tail fell from 471.803 to 83.654 seconds, an 82.3%
 reduction. That encouraging tail result must not hide the queue result: p95
 remained 19-45 seconds, peaks remained 24-53 seconds, and the queue exceeded
 10 seconds for 46-80% of playback time. A 1.10x maximum rate did not meet the

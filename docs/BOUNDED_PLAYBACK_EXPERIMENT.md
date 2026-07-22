@@ -133,11 +133,11 @@ deterministic implementation of the browser policy:
 
 | Saved trace | Simulated adaptive tail | Arrival-sampled queue p95 | Peak queue | Playback time over 10 s |
 |---|---:|---:|---:|---:|
-| Spirit | 27.183 s | 38.31 s | 46.54 s | 80.0% |
-| Blessed | 40.206 s | 44.95 s | 53.11 s | 77.3% |
-| Beholding | 16.613 s | 19.48 s | 23.81 s | 45.6% |
+| Spirit | 27.051 s | 38.08 s | 46.54 s | 80.0% |
+| Blessed | 40.195 s | 44.71 s | 53.11 s | 77.3% |
+| Beholding | 16.408 s | 19.10 s | 23.81 s | 45.6% |
 
-Aggregate tail was 82.2% lower than fixed 1.00x replay, with no chunks
+Aggregate tail was 82.3% lower than fixed 1.00x replay, with no chunks
 dropped. This is not a new live Riva or browser run. It predicts two things the
 formal experiment must test: 1.10x can sharply reduce the final tail, but it is
 unlikely to hold the listener queue below the 10-second soft ceiling without

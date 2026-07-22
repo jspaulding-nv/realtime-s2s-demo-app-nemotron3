@@ -6,7 +6,7 @@ The pinned Nemotron 3 S2S stack completed one new live Riva capture for each
 of Jonathan Gough's three sermon files. Every final capture passed the
 harness's completion and artifact-integrity checks. The adaptive playback
 candidate retained every translated chunk and reduced aggregate listener tail
-by 78.1%, from 388.731 seconds at fixed 1.00x playback to 85.310 seconds.
+by 78.1%, from 388.383 seconds at fixed 1.00x playback to 84.962 seconds.
 
 The proposed 5-10 second live-audience queue objective was **not met**. The
 time-weighted adaptive queue p95 was 35.823 seconds for Spirit, 37.460 seconds
@@ -116,16 +116,18 @@ input, and its fixed-rate playback tail was 7.547 seconds.
 
 ## Capture results
 
-`Service drain` is the time from the explicit end-of-input signal to confirmed
-terminal completion. `Fixed listener tail` replays the received chunks at
-1.00x and measures when queued translated playback ends relative to source
-input. It is not the same as service drain.
+`Harness terminal observation` is the time from the explicit end-of-input
+signal until the legacy polling loop observed terminal completion. It can
+include up to a polling interval; these historical summaries do not retain the
+terminal's exact receive timestamp. `Fixed listener tail` replays the received
+chunks at 1.00x and measures when queued translated playback ends relative to
+source input. It is not the same as terminal-arrival lag.
 
-| Sermon | Input | Output | Output/input | Duration excess | First audio | Service drain | Fixed listener tail |
+| Sermon | Input | Output | Output/input | Duration excess | First audio | Harness terminal observation | Fixed listener tail |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Spirit | 1,908.432 s | 1,982.439 s | 1.039x | 74.007 s | 16.897 s | 1.002 s | 142.565 s |
-| Blessed | 2,427.011 s | 2,620.528 s | 1.080x | 193.517 s | 2.296 s | 1.002 s | 204.155 s |
-| Beholding | 1,888.105 s | 1,877.486 s | 0.994x | 0.000 s | 4.577 s | 2.004 s | 42.011 s |
+| Spirit | 1,908.432 s | 1,982.439 s | 1.039x | 74.007 s | 16.897 s | 1.002 s | 142.433 s |
+| Blessed | 2,427.011 s | 2,620.528 s | 1.080x | 193.517 s | 2.296 s | 1.002 s | 204.144 s |
+| Beholding | 1,888.105 s | 1,877.486 s | 0.994x | 0.000 s | 4.577 s | 2.004 s | 41.806 s |
 
 All three final summaries report:
 
@@ -151,9 +153,9 @@ rates. It never drops audio.
 
 | Sermon | Fixed tail | Adaptive tail | Tail reduction | Adaptive p95 | Adaptive peak | Playback time above 10 s |
 |---|---:|---:|---:|---:|---:|---:|
-| Spirit | 142.565 s | 36.788 s | 74.2% | 35.823 s | 41.683 s | 69.377% |
-| Blessed | 204.155 s | 30.520 s | 85.1% | 37.460 s | 44.638 s | 78.620% |
-| Beholding | 42.011 s | 18.001 s | 57.2% | 18.622 s | 26.930 s | 41.569% |
+| Spirit | 142.433 s | 36.656 s | 74.3% | 35.823 s | 41.683 s | 69.377% |
+| Blessed | 204.144 s | 30.509 s | 85.1% | 37.460 s | 44.638 s | 78.620% |
+| Beholding | 41.806 s | 17.797 s | 57.4% | 18.622 s | 26.930 s | 41.569% |
 
 | Sermon | Accelerated source audio | Source audio at 1.10x | Longest continuous 1.10x | Dropped chunks |
 |---|---:|---:|---:|---:|
@@ -161,8 +163,12 @@ rates. It never drops audio.
 | Blessed | 95.6% | 87.767% | 521.650 s | 0 |
 | Beholding | 79.2% | 60.876% | 115.763 s | 0 |
 
-Aggregate fixed tail was 388.731 seconds and aggregate adaptive tail was
-85.310 seconds, a reduction of 303.421 seconds or 78.054%.
+Aggregate fixed tail was 388.383 seconds and aggregate adaptive tail was
+84.962 seconds, a reduction of 303.421 seconds or 78.124%.
+
+These replay numbers were regenerated with the exact end of each final PCM
+source chunk. The original capture summaries used the final chunk's start;
+the analyzer recognizes those values only as annotated compatibility evidence.
 
 Candidate gates were evaluated per trace:
 
@@ -227,6 +233,59 @@ scratch, then completed Beholding and aggregate analysis. This validates the
 harness's staged promotion and strict resume behavior under a real long-form
 failure.
 
+## Post-acceptance retrospective: staged hardening and Beholding canary
+
+This section records evidence obtained later on 2026-07-22. The incident
+account above is intentionally unchanged because it accurately describes what
+was known during the original monolithic acceptance run.
+
+The staged WebSocket promotion work made the short-fragment failure class
+reproducible. Its first full Beholding attempt stopped at approximately 69.1
+seconds on `monotonic time cannot move backwards`: a producer capture timestamp
+was older than an asyncio age-poll observation. The fix supplies a
+nondecreasing consumer observation timeline to the punctuation segmenter while
+preserving raw capture times and Nemotron source offsets.
+
+A second attempt reached 807.9 seconds before an isolated ASR final, `uh.`,
+caused Riva Translate 1.5.2 to return Chinese `呃。` under the requested Spanish
+target. Direct probes reproduced the broader short-fragment class: `Okay.`
+became `好吧。`, and `Amen.` became `阿门。`. This provides a concrete NMT
+wrong-script explanation for the content reaching Magpie and connects it to
+the earlier Blessed observation. It does not indicate a GPU-capacity failure
+or a permanent inability of Magpie to synthesize ordinary Spanish.
+
+The staged path now applies three safety layers: exact standalone hesitation
+fillers are discarded before ID allocation with privacy-safe telemetry; NMT
+output is validated for Spanish-compatible content immediately after
+translation and defensively again before TTS; and narrowly scoped deterministic
+Spanish overrides handle standalone `OK`/`Okay` and `Amen`. Invalid content is
+not blindly retried through Magpie. A real-time smoke over the exact 790-815
+second source region then passed with 10 ordered segments, one filler discard,
+no incomplete IDs, and no pipeline error.
+
+The third attempt completed the full 1,888.1045-second Beholding source. It
+delivered all 646 ordered IDs, discarded six exact fillers, and passed staged
+and terminal integrity with no runtime, cleanup, disconnect, timeout, restart,
+or OOM error. Measured results were:
+
+| Measurement | Staged Beholding attempt 3 |
+|---|---:|
+| Output/input duration | 1.01627x |
+| First translated audio | 5.113 s |
+| Last-audio arrival tail | 0.850 s |
+| Completed-terminal arrival after input | 1.744 s |
+| Harness drain observation (poll/settle included) | 2.255 s |
+| Fixed 1.00x playback tail | 64.038 s |
+| Maximum NMT / TTS / output queue depth | 4 / 4 / 1 |
+| Blocked NMT / TTS / output puts | 15 / 0 / 0 |
+
+This closes the single-sermon staged operational canary, but it does not change
+the original audience-latency decision. The long fixed-rate playback tail
+still represents an awkward-delay risk for jokes and audience reactions. An
+actual browser/Web Audio run, synchronized semantic-marker timing, native
+Spanish quality review, and the full staged Spirit/Blessed/Beholding matrix
+remain pending.
+
 ## Nemotron 3 assessment
 
 Nemotron 3 remains the appropriate ASR choice for this experiment:
@@ -244,7 +303,13 @@ attribute its exact numbers to the ASR swap alone. Blessed continues to show
 that the ASR change does not solve sustained translated-audio expansion, NMT
 output validity, TTS behavior, or queue growth by itself.
 
-## Decision and next work
+## Original decision and next work (historical)
+
+The list below is retained as the decision made from the monolithic acceptance
+evidence. The retrospective above records that the staged WebSocket path,
+bounded queues, and target-content validation were subsequently implemented
+and that the first full Beholding operational canary passed. The current open
+work is the remaining staged sermon matrix and audience-facing validation.
 
 Running three more identical repetitions is not the highest-value next step:
 one repeat already misses both queue gates by wide margins. Keep the complete

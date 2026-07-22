@@ -78,6 +78,34 @@ def test_response_parser_prefers_word_timing_envelope():
     assert event.source_end_ms == 900
 
 
+def test_response_parser_preserves_hypothesis_local_source_timing():
+    responses = [
+        response(result("interim", audio_processed=68.9600601196289)),
+        response(
+            result(
+                "Final words.",
+                is_final=True,
+                audio_processed=69.0,
+                words=[
+                    SimpleNamespace(start_time=60_800, end_time=61_040),
+                    SimpleNamespace(start_time=67_760, end_time=68_080),
+                ],
+            )
+        ),
+    ]
+
+    interim, final_event = iter_transcript_results(
+        responses, clock_ms=iter([180_109_747.9, 180_110_061.943]).__next__
+    )
+
+    # A final word envelope can end before an earlier interim's processed-audio
+    # horizon. That is a normal hypothesis transition, not a stream reset.
+    assert interim.source_end_ms == pytest.approx(68_960.0601196289)
+    assert final_event.source_start_ms == 60_800
+    assert final_event.source_end_ms == 68_080
+    assert final_event.source_end_ms < interim.source_end_ms
+
+
 def test_shared_asr_config_uses_rnnt_800ms_and_punctuation_fields():
     with patch("asr_config.riva_asr_pb2.EndpointingConfig") as endpoint_cls, patch(
         "asr_config.riva_asr_pb2.RecognitionConfig"

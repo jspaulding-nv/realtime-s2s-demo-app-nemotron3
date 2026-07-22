@@ -67,6 +67,19 @@ export interface AudioConfig {
   sampleRate: number;
   chunkSize: number;
   channels: number;
+  pipelineMode?: 'monolithic' | 'staged';
+  stagedConfig?: {
+    segmentMaxChars: number;
+    segmentMaxAgeMs: number;
+    asrEventQueueMaxSize: number;
+    nmtQueueMaxSize: number;
+    ttsQueueMaxSize: number;
+    outputQueueMaxSize: number;
+    nmtRpcTimeoutSeconds: number;
+    ttsRpcTimeoutSeconds: number;
+    ttsMaxSegmentAudioSeconds: number;
+    closeTimeoutSeconds: number;
+  };
 }
 
 // Application state

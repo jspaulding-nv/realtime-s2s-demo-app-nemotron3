@@ -11,6 +11,7 @@ import riva.client
 
 from config import SUPPORTED_LANGUAGES, audio_config, riva_config
 from staged_models import SynthesizedSegment, TranslatedSegment
+from target_text_validation import validate_target_text
 
 
 class DirectTTSError(RuntimeError):
@@ -175,9 +176,11 @@ class DirectTTSClient:
         """Return one atomically collected PCM segment for ``translation``."""
         if not isinstance(translation, TranslatedSegment):
             raise TypeError("translation must be a TranslatedSegment")
-        text = translation.text.strip()
-        if not text:
-            raise ValueError("translated text must contain non-whitespace content")
+        text = validate_target_text(
+            translation.text,
+            language=translation.language,
+            sequence_id=translation.sequence_id,
+        )
         voice_name = self._voice_for_language(translation.language)
 
         with self._lifecycle_lock:

@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "source_format": "batch_latency_test client event CSV",
+  "audio_format": {
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "bytes_per_sample": 2
+  },
+  "policy": {
+    "target_queue_seconds": 5.0,
+    "urgent_queue_seconds": 8.0,
+    "limit_queue_seconds": 10.0,
+    "catch_up_release_seconds": 4.0,
+    "urgent_release_seconds": 7.0,
+    "normal_rate": 1.0,
+    "catch_up_rate": 1.05,
+    "urgent_rate": 1.1
+  },
+  "semantics": {
+    "preserve_every_chunk": true,
+    "limit_is_sla_alarm_not_drop_boundary": true,
+    "queue_time_above_threshold_is_exact_between_arrivals": true,
+    "arrival_queue_percentiles_use_nearest_rank": true,
+    "input_end_prefers_explicit_event": true,
+    "legacy_missing_end_event_uses_last_chunk_end": true,
+    "historical_last_chunk_start_validation_is_annotated_compatibility": true
+  },
+  "traces": [
+    {
+      "trace_csv": "gospel_in_life_tk_1-john-part-2-mp3_Beholding_the_Love_of_God_results.csv",
+      "trace_sha256": "2d7d6ac7529028b65eee6bfc61c0db62dec7cce44be3ca530ba5967f29c01142",
+      "input_end_seconds": 1888.22407,
+      "input_boundary_source": "explicit_input_ended",
+      "legacy_last_chunk_start_seconds": null,
+      "translated_audio_seconds": 1918.825125,
+      "recorded_fixed_listener_tail_seconds": 64.037605,
+      "reproduced_fixed_tail_delta_seconds": 7e-06,
+      "legacy_start_boundary_fixed_tail_seconds": null,
+      "legacy_start_boundary_recorded_delta_seconds": null,
+      "fixed_1x": {
+        "adaptive": false,
+        "chunks_received": 646,
+        "chunks_scheduled": 646,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 1918.825125,
+        "total_scheduled_duration_seconds": 1918.825125,
+        "first_arrival_seconds": 5.11294,
+        "input_end_seconds": 1888.22407,
+        "playback_end_seconds": 1952.261683,
+        "listener_tail_seconds": 64.037613,
+        "peak_queue_depth_seconds": 66.882727,
+        "arrival_queue_p50_seconds": 40.634218,
+        "arrival_queue_p95_seconds": 59.710635,
+        "time_weighted_queue_p50_seconds": 36.833588,
+        "time_weighted_queue_p95_seconds": 57.715315,
+        "seconds_above_target": 1806.68045,
+        "seconds_above_limit": 1715.26624,
+        "percent_playback_window_above_target": 92.78595,
+        "percent_playback_window_above_limit": 88.091177,
+        "limit_breach_entries": 0,
+        "accelerated_source_duration_seconds": 0.0,
+        "accelerated_source_percent": 0.0,
+        "urgent_source_duration_seconds": 0.0,
+        "urgent_source_percent": 0.0,
+        "max_continuous_urgent_playback_seconds": 0.0,
+        "rate_chunk_counts": {
+          "1.00x": 646,
+          "1.05x": 0,
+          "1.10x": 0
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 1918.825125,
+          "1.05x": 0.0,
+          "1.10x": 0.0
+        },
+        "mode_chunk_counts": {
+          "normal": 646,
+          "catch-up": 0,
+          "urgent": 0,
+          "over-limit": 0
+        }
+      },
+      "adaptive": {
+        "adaptive": true,
+        "chunks_received": 646,
+        "chunks_scheduled": 646,
+        "chunks_dropped": 0,
+        "total_source_duration_seconds": 1918.825125,
+        "total_scheduled_duration_seconds": 1773.852459,
+        "first_arrival_seconds": 5.11294,
+        "input_end_seconds": 1888.22407,
+        "playback_end_seconds": 1902.470196,
+        "listener_tail_seconds": 14.246126,
+        "peak_queue_depth_seconds": 28.0521,
+        "arrival_queue_p50_seconds": 9.822111,
+        "arrival_queue_p95_seconds": 18.839419,
+        "time_weighted_queue_p50_seconds": 7.437433,
+        "time_weighted_queue_p95_seconds": 17.12491,
+        "seconds_above_target": 1282.58164,
+        "seconds_above_limit": 633.58345,
+        "percent_playback_window_above_target": 67.598321,
+        "percent_playback_window_above_limit": 33.392944,
+        "limit_breach_entries": 46,
+        "accelerated_source_duration_seconds": 1770.819063,
+        "accelerated_source_percent": 92.286631,
+        "urgent_source_duration_seconds": 1400.967625,
+        "urgent_source_percent": 73.011741,
+        "max_continuous_urgent_playback_seconds": 260.361818,
+        "rate_chunk_counts": {
+          "1.00x": 69,
+          "1.05x": 125,
+          "1.10x": 452
+        },
+        "rate_source_duration_seconds": {
+          "1.00x": 148.006062,
+          "1.05x": 369.851437,
+          "1.10x": 1400.967625
+        },
+        "mode_chunk_counts": {
+          "normal": 69,
+          "catch-up": 125,
+          "urgent": 120,
+          "over-limit": 332
+        }
+      },
+      "comparison": {
+        "listener_tail_reduction_seconds": 49.791487,
+        "listener_tail_reduction_percent": 77.753502,
+        "peak_queue_reduction_seconds": 38.830628
+      },
+      "recorded_tail_validation": {
+        "performed": true,
+        "passed": true,
+        "boundary": "corrected_input_boundary",
+        "note": "recorded tail matches the corrected input boundary"
+      }
+    }
+  ],
+  "aggregate": {
+    "trace_count": 1,
+    "fixed_listener_tail_seconds": 64.037613,
+    "adaptive_listener_tail_seconds": 14.246126,
+    "listener_tail_reduction_seconds": 49.791487,
+    "listener_tail_reduction_percent": 77.753502
+  }
+}

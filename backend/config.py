@@ -23,8 +23,33 @@ class RivaConfig:
     tts_uri: str = os.getenv("RIVA_TTS_URI", "localhost:50053")
     model: str = os.getenv("RIVA_NMT_MODEL", "megatronnmt_any_any_1b")
     source_language: str = os.getenv("RIVA_SOURCE_LANGUAGE", "en-US")
+    target_language: str = os.getenv("RIVA_TARGET_LANGUAGE", "es-US")
     endpointing_history_ms: int = int(os.getenv("RIVA_EOU_MS", "800"))
     asr_word_time_offsets: bool = os.getenv("RIVA_ASR_WORD_TIMES", "0") == "1"
+    asr_image: str = os.getenv(
+        "ASR_IMAGE", "nvcr.io/nim/nvidia/nemotron-asr-streaming:1.2.0"
+    )
+    nmt_image: str = os.getenv(
+        "NMT_IMAGE", "nvcr.io/nim/nvidia/riva-translate-1_6b:1.5.2"
+    )
+    tts_image: str = os.getenv(
+        "TTS_IMAGE", "nvcr.io/nim/nvidia/magpie-tts-multilingual:1.7.0"
+    )
+    asr_image_digest: str = os.getenv("ASR_IMAGE_DIGEST", "")
+    nmt_image_digest: str = os.getenv("NMT_IMAGE_DIGEST", "")
+    tts_image_digest: str = os.getenv("TTS_IMAGE_DIGEST", "")
+    asr_profile: str = os.getenv(
+        "ASR_NIM_TAGS_SELECTOR",
+        "name=nemotron-asr-streaming,type=en-US,batch_size=32",
+    )
+    # The proven NMT Compose launch did not set NIM_TAGS_SELECTOR. This optional
+    # label is provenance-only for externally configured deployments; it is
+    # intentionally not presented as a Compose-applied selector.
+    nmt_profile: str = os.getenv("NMT_PROFILE", "")
+    tts_profile: str = os.getenv(
+        "TTS_NIM_TAGS_SELECTOR",
+        "name=magpie-tts-multilingual,batch_size=8",
+    )
 
 
 @dataclass

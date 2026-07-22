@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useReducer, useState } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useAudioCapture } from '../hooks/useAudioCapture';
-import { useAudioPlayback } from '../hooks/useAudioPlayback';
+import {
+  useAudioPlayback,
+  type PlaybackMetrics,
+} from '../hooks/useAudioPlayback';
 import { StatusIndicator } from './StatusIndicator';
 import { LanguageSelector } from './LanguageSelector';
 import { AudioVisualizer } from './AudioVisualizer';
 import { ControlButton } from './ControlButton';
 import type { AppState, AppAction, Language, SessionStatus } from '../types/messages';
+import {
+  DEFAULT_PLAYBACK_POLICY,
+  type PlaybackMode,
+} from '../utils/playbackPolicy';
 
 const AUDIO_CONFIG = {
   sampleRate: 16000,
@@ -16,6 +23,38 @@ const AUDIO_CONFIG = {
 const DEFAULT_LANGUAGES: Language[] = [
   { code: 'es-US', name: 'Spanish (US)', available: true },
 ];
+
+interface PlaybackStatus {
+  queueDepthSeconds: number;
+  peakQueueDepthSeconds: number;
+  playbackRate: number;
+  playbackMode: PlaybackMode;
+  aboveTarget: boolean;
+  aboveLimit: boolean;
+  limitExceededCount: number;
+}
+
+const INITIAL_PLAYBACK_STATUS: PlaybackStatus = {
+  queueDepthSeconds: 0,
+  peakQueueDepthSeconds: 0,
+  playbackRate: DEFAULT_PLAYBACK_POLICY.normalRate,
+  playbackMode: 'normal',
+  aboveTarget: false,
+  aboveLimit: false,
+  limitExceededCount: 0,
+};
+
+function playbackStatusFromMetrics(metrics: PlaybackMetrics): PlaybackStatus {
+  return {
+    queueDepthSeconds: metrics.queueDepthSeconds,
+    peakQueueDepthSeconds: metrics.peakQueueDepthSeconds,
+    playbackRate: metrics.playbackRate,
+    playbackMode: metrics.playbackMode,
+    aboveTarget: metrics.aboveTarget,
+    aboveLimit: metrics.aboveLimit,
+    limitExceededCount: metrics.limitExceededCount,
+  };
+}
 
 const initialState: AppState = {
   status: 'disconnected',
@@ -69,11 +108,10 @@ export function TranslationPanel() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [languages, setLanguages] = useState<Language[]>(DEFAULT_LANGUAGES);
   const [isTranslating, setIsTranslating] = useState(false);
-  const [playbackStatus, setPlaybackStatus] = useState({
-    queueDepthSeconds: 0,
-    playbackRate: 1,
-    aboveLimit: false,
-  });
+  const [hasPlaybackSession, setHasPlaybackSession] = useState(false);
+  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>(
+    INITIAL_PLAYBACK_STATUS,
+  );
   // Audio playback hook
   const {
     queueAudio,
@@ -153,12 +191,7 @@ export function TranslationPanel() {
     if (!isTranslating) return;
 
     const updatePlaybackStatus = () => {
-      const metrics = getPlaybackMetrics();
-      setPlaybackStatus({
-        queueDepthSeconds: metrics.queueDepthSeconds,
-        playbackRate: metrics.playbackRate,
-        aboveLimit: metrics.aboveLimit,
-      });
+      setPlaybackStatus(playbackStatusFromMetrics(getPlaybackMetrics()));
     };
     updatePlaybackStatus();
     const timer = setInterval(updatePlaybackStatus, 500);
@@ -169,17 +202,18 @@ export function TranslationPanel() {
   const handleToggle = useCallback(async () => {
     if (isTranslating) {
       // Stop translation
+      const metrics = getPlaybackMetrics();
+      // Preserve the final browser-side observation before stopPlayback closes
+      // the AudioContext and discards any remaining scheduled audio.
+      setPlaybackStatus(playbackStatusFromMetrics(metrics));
       stopCapture();
       stopPlayback();
       sendMessage({ type: 'stop_stream' });
       setIsTranslating(false);
     } else {
       // Start translation
-      setPlaybackStatus({
-        queueDepthSeconds: 0,
-        playbackRate: 1,
-        aboveLimit: false,
-      });
+      setPlaybackStatus(INITIAL_PLAYBACK_STATUS);
+      setHasPlaybackSession(true);
       startPlayback();
       sendMessage({ type: 'start_stream', targetLanguage: state.targetLanguage });
       await startCapture();
@@ -192,6 +226,7 @@ export function TranslationPanel() {
     startPlayback,
     stopPlayback,
     sendMessage,
+    getPlaybackMetrics,
     state.targetLanguage,
   ]);
 
@@ -256,27 +291,56 @@ export function TranslationPanel() {
           />
         </div>
 
-        {isTranslating && (
+        {hasPlaybackSession && (
           <div
-            aria-label="Spanish playback queue"
+            aria-label="Spanish playback telemetry"
+            data-session-active={isTranslating}
+            data-queue-current-seconds={playbackStatus.queueDepthSeconds}
+            data-queue-peak-seconds={playbackStatus.peakQueueDepthSeconds}
+            data-playback-rate={playbackStatus.playbackRate}
+            data-playback-mode={playbackStatus.playbackMode}
+            data-limit-breaches={playbackStatus.limitExceededCount}
             className={`rounded-lg border p-3 mb-6 text-sm ${
               playbackStatus.aboveLimit
                 ? 'bg-red-50 border-red-200 text-red-700'
-                : playbackStatus.queueDepthSeconds > 5
+                : playbackStatus.aboveTarget
                   ? 'bg-amber-50 border-amber-200 text-amber-700'
                   : 'bg-green-50 border-green-200 text-green-700'
             }`}
           >
-            <div className="flex justify-between gap-4">
-              <span>Spanish playback queue</span>
-              <span className="font-mono font-semibold">
-                {playbackStatus.queueDepthSeconds.toFixed(1)}s at{' '}
-                {playbackStatus.playbackRate.toFixed(2)}x
+            <div className="flex items-baseline justify-between gap-4">
+              <span className="font-medium">Spanish playback telemetry</span>
+              <span className="text-xs">
+                {isTranslating ? 'Live browser queue' : 'Final stop snapshot'}
               </span>
             </div>
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-1 mt-2 text-xs">
+              <dt>{isTranslating ? 'Current queue' : 'Queue at stop'}</dt>
+              <dd className="font-mono font-semibold text-right">
+                {playbackStatus.queueDepthSeconds.toFixed(2)}s
+              </dd>
+              <dt>Peak queue</dt>
+              <dd className="font-mono font-semibold text-right">
+                {playbackStatus.peakQueueDepthSeconds.toFixed(2)}s
+              </dd>
+              <dt>Scheduled rate</dt>
+              <dd className="font-mono font-semibold text-right">
+                {playbackStatus.playbackRate.toFixed(2)}x ({playbackStatus.playbackMode})
+              </dd>
+              <dt>&gt;{DEFAULT_PLAYBACK_POLICY.limitQueueSeconds}s breaches</dt>
+              <dd className="font-mono font-semibold text-right">
+                {playbackStatus.limitExceededCount}
+              </dd>
+            </dl>
+            <div className="text-xs mt-2">
+              Audience target ≤{DEFAULT_PLAYBACK_POLICY.targetQueueSeconds}s;
+              limit {DEFAULT_PLAYBACK_POLICY.limitQueueSeconds}s.
+            </div>
             {playbackStatus.aboveLimit && (
-              <p className="text-xs mt-1">
-                Queue exceeded the 10-second target; all speech is still preserved.
+              <p className="text-xs mt-1" role="alert">
+                {isTranslating
+                  ? 'The live queue is above the audience limit; all speech is still preserved.'
+                  : 'The queue was above the audience limit when playback stopped.'}
               </p>
             )}
           </div>

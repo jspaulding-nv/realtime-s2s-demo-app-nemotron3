@@ -34,9 +34,14 @@ Historical results:
 
 | Sermon | First audio | Service flush tail | Output/input | Fixed 1.00x playback tail |
 |---|---:|---:|---:|---:|
-| Spirit | 16.1 s | 0.0 s | 1.056x | 172.770 s |
-| Blessed | 2.3 s | 0.4 s | 1.081x | 228.782 s |
-| Beholding | 4.7 s | 0.8 s | 1.017x | 70.598 s |
+| Spirit | 16.1 s | 0.0 s | 1.056x | 172.638 s |
+| Blessed | 2.3 s | 0.4 s | 1.081x | 228.772 s |
+| Beholding | 4.7 s | 0.8 s | 1.017x | 70.394 s |
+
+The fixed tails shown here were later corrected to the exact end of the final
+PCM source chunk. The compact July 8 summaries retain their original
+last-chunk-start values as historical capture records; the generated playback
+report labels those values as compatibility evidence.
 
 The short service flush tail did not eliminate the listener tail. Spanish
 media was longer than the source, and response timing left substantial audio
@@ -103,11 +108,11 @@ Completed offline validation:
 
 | Saved trace | Simulated adaptive tail | Arrival-sampled queue p95 | Peak queue | Playback time over 10 s |
 |---|---:|---:|---:|---:|
-| Spirit | 27.183 s | 38.31 s | 46.54 s | 80.0% |
-| Blessed | 40.206 s | 44.95 s | 53.11 s | 77.3% |
-| Beholding | 16.613 s | 19.48 s | 23.81 s | 45.6% |
+| Spirit | 27.051 s | 38.08 s | 46.54 s | 80.0% |
+| Blessed | 40.195 s | 44.71 s | 53.11 s | 77.3% |
+| Beholding | 16.408 s | 19.10 s | 23.81 s | 45.6% |
 
-The simulated aggregate tail reduction was 82.2%. This is promising but does
+The simulated aggregate tail reduction was 82.3%. This is promising but does
 not meet the queue goal: 1.10x still left all three traces above the 10-second
 soft ceiling for substantial periods. The output also predicts that most
 translated media would be accelerated, so a live browser run and native
@@ -235,11 +240,11 @@ Measured fixed 1.00x versus adaptive playback:
 
 | Sermon | Fixed tail | Adaptive tail | Reduction | Adaptive p95 | Time above 10 s |
 |---|---:|---:|---:|---:|---:|
-| Spirit | 142.565 s | 36.788 s | 74.2% | 35.823 s | 69.377% |
-| Blessed | 204.155 s | 30.520 s | 85.1% | 37.460 s | 78.620% |
-| Beholding | 42.011 s | 18.001 s | 57.2% | 18.622 s | 41.569% |
+| Spirit | 142.433 s | 36.656 s | 74.3% | 35.823 s | 69.377% |
+| Blessed | 204.144 s | 30.509 s | 85.1% | 37.460 s | 78.620% |
+| Beholding | 41.806 s | 17.797 s | 57.4% | 18.622 s | 41.569% |
 
-Aggregate tail fell 78.1%, from 388.731 to 85.310 seconds, with no translated
+Aggregate tail fell 78.1%, from 388.383 to 84.962 seconds, with no translated
 chunks dropped. Every sermon trace nevertheless missed the overall candidate
 gate set. The data does not support treating the 10-second value as a bounded
 audience experience at the current 1.10x maximum rate.
@@ -332,11 +337,182 @@ Live 60-second staged preflight:
   TTS average full completion:     493.69 ms
 ```
 
-The active browser route remains monolithic. The next staged milestone is an
-explicit default-off WebSocket integration with an ordered sender, followed
-by new Spirit, Blessed, and Beholding runs. Detailed contracts, commands,
-limitations, and the interpretation of the one-minute result are in
-[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md).
+That milestone left the active browser route monolithic. The subsequent
+default-off WebSocket integration is documented in
+[Feature-flagged staged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+The one-minute WebSocket gate later passed. The Beholding canary also passed
+after the content-safety hardening documented below; new staged Spirit,
+Blessed, and Beholding matrix runs remain pending.
+
+## 2026-07-22: feature-flagged staged WebSocket path
+
+Completed on top of `agent/staged-nmt-tts-pipeline`:
+
+- wired the bounded direct pipeline into `/ws/translate` only when
+  `S2S_PIPELINE_MODE=staged`; the default remains `monolithic`;
+- created fresh session-owned ASR, NMT, and TTS clients for every staged
+  stream so cancellation cannot poison a later stream;
+- preserved the existing control/status/error/binary PCM protocol;
+- emitted `listening` only after all staged clients and workers started;
+- serialized PCM, status, level, and pong WebSocket writes;
+- retained FIFO sequence IDs and successful WebSocket send timestamps;
+- validated cleanup, outcome, incomplete sequences, and sent/dequeued parity
+  before emitting `completed`;
+- made duplicate `end_input` idempotent and session replacement await cleanup;
+- exported full staged events and summaries from `/api/test/export`;
+- exposed active mode and all staged limits through `/api/config`;
+- taught the batch and resumable sermon harnesses to save and enforce staged
+  integrity evidence while keeping audience SLA misses as measurements;
+- made the browser dashboard require server completion, network quiet, and an
+  empty Web Audio queue for natural success; and
+- exposed current/peak browser queue, playback rate/mode, and limit breaches
+  in the live translation panel.
+
+Regression validation after integration:
+
+```text
+Python:          275 passed
+Frontend:         88 passed
+Frontend lint:    passed
+Frontend build:   passed (existing bundle-size warning only)
+Python compile:   passed
+git diff check:   passed
+```
+
+Live terminal-aware `/ws/translate` preflight with `test_audio/test-1min.wav`:
+
+```text
+mode:                            staged (reported by /api/config)
+input:                           60.000 s / 200 chunks, complete
+first translated client audio:    5.087 s
+translated output:               50.295 s / 1,609,442 bytes
+output/input whole-prefix ratio:   0.838x
+last-audio tail after input:       1.316 s
+completed-terminal arrival:       1.374 s
+harness drain observation:         2.254 s (poll/settle included)
+fixed-rate playback tail:          6.996 s
+segments emitted/sent:            23 / 23 (IDs 0-22)
+max NMT/TTS/output depths:         2 / 2 / 1
+blocked queue puts:                0 / 0 / 0
+integrity result:                  passed
+```
+
+The run had no failure, cleanup error, incomplete sequence, disconnect,
+timeout, container restart, or GPU OOM. All three NIMs remained healthy with
+zero restarts. Detailed timings, limitations, reproduction commands, and the
+compact evidence record are in
+[Feature-flagged staged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+
+This one-minute pass does not establish the live-audience SLA. A complete
+Beholding operational canary subsequently passed after the hardening described
+below. New staged runs of all three sermons remain pending. Browser queue
+p95/peak/time-over-10-seconds and a synchronized joke/marked-phrase delay also
+remain separate audience evidence.
+
+## 2026-07-22: staged content hardening and full Beholding canary
+
+The full-sermon promotion gate exposed two defects that the one-minute
+preflight did not reach:
+
+- Attempt 1 stopped approximately 69.1 seconds into Beholding when a producer
+  capture timestamp arrived behind a newer asyncio age-poll observation and
+  triggered `monotonic time cannot move backwards`. The staged consumer now
+  supplies a nondecreasing observation timeline to the segmenter while retaining
+  the original capture times and Nemotron source-word offsets as evidence.
+- Attempt 2 reached 807.9 seconds before Magpie failed on an isolated English
+  hesitation final, `uh.`. A targeted ASR replay reproduced that exact fragment;
+  Riva Translate 1.5.2 translated it to Chinese `呃。` while reporting the
+  requested Spanish target. Direct probes found the same wrong-script class for
+  standalone `Okay.` (`好吧。`) and `Amen.` (`阿门。`). This tied the earlier
+  Blessed `阿门。` observation to a reproducible short-fragment NMT content
+  class rather than a permanent TTS or GPU failure.
+
+The mitigation is deliberately layered:
+
+- suppress only exact standalone hesitation fillers (`uh`, `um`, `er`, `erm`,
+  and `hmm`, ignoring case and surrounding punctuation) before assigning a
+  segment ID, with privacy-safe `filler_discarded` telemetry;
+- validate every Spanish-target NMT result immediately after NMT and again at
+  the TTS boundary, rejecting empty, wrong-script, mixed-script, control,
+  format, symbol, or detached-mark content before it can reach Magpie; and
+- use narrow deterministic Spanish overrides for standalone `OK`/`Okay` and
+  `Amen` fragments. Meaningful short utterances remain eligible for normal
+  translation, and unsafe content is not blindly retried through TTS.
+
+An exact 790-815 second Beholding-region smoke then completed successfully. It
+emitted and synthesized 10 ordered segments, discarded the isolated filler,
+passed staged integrity, and reported no pipeline error or incomplete ID.
+
+Attempt 3 completed the entire 1,888.1045-second Beholding source through the
+feature-flagged staged WebSocket path:
+
+| Measurement | Result |
+|---|---:|
+| Ordered segment IDs | 646 |
+| Exact fillers discarded | 6 |
+| Translated output/input duration | 1.01627x |
+| First translated audio | 5.113 s |
+| Last-audio arrival tail | 0.850 s |
+| Completed-terminal arrival after input | 1.744 s |
+| Harness drain observation (poll/settle included) | 2.255 s |
+| Fixed 1.00x playback tail | 64.038 s |
+| Maximum NMT / TTS / output queue depth | 4 / 4 / 1 |
+| Blocked NMT / TTS / output puts | 15 / 0 / 0 |
+
+All 646 IDs were emitted, dequeued, and sent in order. The run passed the
+terminal and staged-integrity checks with no server error, cleanup error,
+incomplete sequence, disconnect, timeout, container restart, or GPU OOM. The
+15 blocked NMT puts demonstrate that bounded backpressure was exercised rather
+than bypassed.
+
+The post-run playback analyzer also exposed and fixed a 300 ms boundary error:
+new CSVs contain an explicit `client/input_ended` event, but the loader still
+used the start timestamp of the last input chunk. It now prefers the explicit
+boundary; older traces use the exact end of their final PCM chunk, while old
+start-boundary summaries are accepted only as annotated compatibility
+evidence. Regression tests cover both rules. The Beholding replay matches its
+explicit-boundary 64.038-second fixed tail within 7 microseconds. The adaptive
+replay reaches a 14.246-second tail (77.75% lower) but still peaks at 28.052
+seconds of queued media.
+
+The final release audit then hardened cases not exercised by the live canary:
+
+- reject a `completed` control before client `end_input`;
+- require exact successful-server-send/client-receive PCM frame and byte
+  parity for staged captures;
+- freeze full declared ASR/NMT/TTS model configuration for new runs and
+  reject incompatible resume checkpoints;
+- record exact completed-terminal arrival separately from harness
+  polling/settle duration;
+- make staged cleanup singleton and cancellation-safe, prevent a displaced
+  session from restarting, and avoid lifecycle locks across socket writes;
+- route unknown controls through the staged terminal latch; and
+- reject non-Magpie-safe target punctuation, including CJK full stop, without
+  logging translated text.
+
+The retained attempt-3 trace satisfies the new terminal order and byte-parity
+checks, but its old summary lacks `modelConfig` and the new top-level timing
+fields. It is therefore historical/non-resumable evidence. The final edge
+hardening is unit/integration-tested and still needs a fresh GPU preflight
+before the remaining long-form matrix.
+
+Post-hardening validation snapshot:
+
+```text
+Focused backend hardening:                125 passed
+Focused harness hardening:                 59 passed
+Full backend suite:                       264 passed
+Full Python backend + analysis + harness: 344 passed
+Frontend tests:                            88 passed (Node.js 22)
+Frontend lint:                             passed
+Frontend build:                            passed (existing bundle-size warning only)
+```
+
+This is an operational canary pass, not an audience-latency acceptance. Its
+64.038-second fixed-rate listener tail still illustrates the delayed-joke risk.
+An actual browser/Web Audio run, synchronized English-to-Spanish phrase timing,
+native Spanish quality review, and a new full staged Spirit/Blessed/Beholding
+matrix remain required.
 
 ## Reproducible validation commands
 
@@ -455,6 +631,10 @@ Artifact locations:
 - [ ] Capture synchronized phrase/punchline delay, not only queue depth
 - [ ] Review 1.05x and 1.10x quality with native Spanish listeners
 - [x] Implement and unit-test punctuation splitting before staged live tests
-- [ ] Add bounded NMT/TTS queues and ordered drain behavior
-- [ ] Keep the private `nvidian/tegra-audio` image reference out of external
-  documentation unless NVIDIA explicitly grants Pellera access
+- [x] Add bounded NMT/TTS queues and ordered drain behavior
+- [x] Integrate the staged pipeline into `/ws/translate` behind a default-off flag
+- [x] Pass the terminal-aware one-minute staged WebSocket preflight
+- [x] Pass one complete staged Beholding operational canary
+- [ ] Run the full staged Spirit, Blessed, and Beholding matrix
+- [x] Keep unapproved private/internal container references out of external
+  documentation
