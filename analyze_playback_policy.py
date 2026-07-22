@@ -36,6 +36,8 @@ REQUIRED_COLUMNS = {
 class PlaybackTrace:
     path: Path
     input_end_seconds: float
+    input_boundary_source: str
+    legacy_last_chunk_start_seconds: float | None
     chunks: tuple[AudioChunk, ...]
     sha256: str
 
@@ -57,7 +59,9 @@ def load_event_trace(
             hasher.update(block)
     digest = hasher.hexdigest()
     received: list[tuple[float, int, AudioChunk]] = []
-    input_end_seconds: float | None = None
+    last_chunk_sent_seconds: float | None = None
+    last_chunk_end_seconds: float | None = None
+    explicit_input_end_seconds: float | None = None
 
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -85,8 +89,22 @@ def load_event_trace(
                 )
 
             if row["stage"] == "chunk_sent":
-                input_end_seconds = max(
-                    input_end_seconds or 0.0, timestamp_seconds
+                if audio_bytes <= 0:
+                    raise ValueError(
+                        f"{path}:{row_number}: chunk_sent bytes must be positive"
+                    )
+                last_chunk_sent_seconds = max(
+                    last_chunk_sent_seconds or 0.0, timestamp_seconds
+                )
+                chunk_end_seconds = timestamp_seconds + (
+                    audio_bytes / (sample_rate * bytes_per_sample)
+                )
+                last_chunk_end_seconds = max(
+                    last_chunk_end_seconds or 0.0, chunk_end_seconds
+                )
+            elif row["stage"] == "input_ended":
+                explicit_input_end_seconds = max(
+                    explicit_input_end_seconds or 0.0, timestamp_seconds
                 )
             elif row["stage"] == "audio_received":
                 if audio_bytes <= 0:
@@ -108,8 +126,16 @@ def load_event_trace(
                     )
                 )
 
+    if explicit_input_end_seconds is not None:
+        input_end_seconds = explicit_input_end_seconds
+        input_boundary_source = "explicit_input_ended"
+        legacy_last_chunk_start_seconds = None
+    else:
+        input_end_seconds = last_chunk_end_seconds
+        input_boundary_source = "estimated_last_chunk_end"
+        legacy_last_chunk_start_seconds = last_chunk_sent_seconds
     if input_end_seconds is None:
-        raise ValueError(f"{path}: no client chunk_sent events found")
+        raise ValueError(f"{path}: no client input boundary events found")
     if not received:
         raise ValueError(f"{path}: no client audio_received events found")
 
@@ -117,6 +143,8 @@ def load_event_trace(
     return PlaybackTrace(
         path=path,
         input_end_seconds=input_end_seconds,
+        input_boundary_source=input_boundary_source,
+        legacy_last_chunk_start_seconds=legacy_last_chunk_start_seconds,
         chunks=tuple(item[2] for item in received),
         sha256=digest,
     )
@@ -177,15 +205,35 @@ def analyze_trace(
         if recorded_fixed_tail_seconds is not None
         else None
     )
+    legacy_fixed_tail = None
+    legacy_fixed_delta = None
+    if trace.legacy_last_chunk_start_seconds is not None:
+        legacy_fixed_tail = simulate_playback(
+            trace.chunks,
+            input_end_seconds=trace.legacy_last_chunk_start_seconds,
+            adaptive=False,
+            policy=policy,
+        ).summary.listener_tail_seconds
+        legacy_fixed_delta = (
+            legacy_fixed_tail - recorded_fixed_tail_seconds
+            if recorded_fixed_tail_seconds is not None
+            else None
+        )
 
     return _round_floats(
         {
             "trace_csv": trace.path.name,
             "trace_sha256": trace.sha256,
             "input_end_seconds": trace.input_end_seconds,
+            "input_boundary_source": trace.input_boundary_source,
+            "legacy_last_chunk_start_seconds": (
+                trace.legacy_last_chunk_start_seconds
+            ),
             "translated_audio_seconds": fixed.total_source_duration_seconds,
             "recorded_fixed_listener_tail_seconds": recorded_fixed_tail_seconds,
             "reproduced_fixed_tail_delta_seconds": fixed_delta,
+            "legacy_start_boundary_fixed_tail_seconds": legacy_fixed_tail,
+            "legacy_start_boundary_recorded_delta_seconds": legacy_fixed_delta,
             "fixed_1x": _compact_summary(fixed),
             "adaptive": _compact_summary(adaptive),
             "comparison": {
@@ -217,15 +265,51 @@ def build_analysis(
             recorded_fixed_tail_seconds=recorded_tail,
         )
         delta = result["reproduced_fixed_tail_delta_seconds"]
-        if (
-            validate_recorded
-            and delta is not None
-            and abs(delta) > validation_tolerance_seconds
+        legacy_delta = result[
+            "legacy_start_boundary_recorded_delta_seconds"
+        ]
+        if not validate_recorded:
+            validation = {
+                "performed": False,
+                "passed": None,
+                "boundary": None,
+                "note": "recorded-tail validation was disabled",
+            }
+        elif delta is None:
+            validation = {
+                "performed": False,
+                "passed": None,
+                "boundary": None,
+                "note": "no adjacent recorded tail was available",
+            }
+        elif abs(delta) <= validation_tolerance_seconds:
+            validation = {
+                "performed": True,
+                "passed": True,
+                "boundary": "corrected_input_boundary",
+                "note": "recorded tail matches the corrected input boundary",
+            }
+        elif (
+            result["input_boundary_source"] == "estimated_last_chunk_end"
+            and legacy_delta is not None
+            and abs(legacy_delta) <= validation_tolerance_seconds
         ):
+            validation = {
+                "performed": True,
+                "passed": True,
+                "boundary": "legacy_last_chunk_start_compatibility",
+                "note": (
+                    "recorded tail used the historical last-chunk-start "
+                    "boundary; reported fixed/adaptive metrics use the "
+                    "corrected last-chunk-end boundary"
+                ),
+            }
+        else:
             raise ValueError(
                 f"{path}: reproduced fixed tail differs from recorded result "
                 f"by {delta:.6f}s"
             )
+        result["recorded_tail_validation"] = validation
         traces.append(result)
 
     if not traces:
@@ -249,6 +333,9 @@ def build_analysis(
             "limit_is_sla_alarm_not_drop_boundary": True,
             "queue_time_above_threshold_is_exact_between_arrivals": True,
             "arrival_queue_percentiles_use_nearest_rank": True,
+            "input_end_prefers_explicit_event": True,
+            "legacy_missing_end_event_uses_last_chunk_end": True,
+            "historical_last_chunk_start_validation_is_annotated_compatibility": True,
         },
         "traces": traces,
         "aggregate": _round_floats(
@@ -344,8 +431,10 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             ),
             "",
             (
-                "`Fixed tail` is reproduced from the event trace and matches the "
-                "previously recorded browser queue calculation. It is distinct "
+                "`Fixed tail` uses the explicit input-ended event when present, "
+                "otherwise the exact end of the final source chunk. Historical "
+                "summaries that used the final chunk's start are accepted only "
+                "as annotated compatibility evidence. This metric is distinct "
                 "from whole-file output/input duration drift."
             ),
             "",

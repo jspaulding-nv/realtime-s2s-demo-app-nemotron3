@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -44,6 +46,7 @@ CHUNK_SAMPLES = 4800
 CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE  # 9600
 CHUNK_DURATION = CHUNK_SAMPLES / SAMPLE_RATE      # 0.3 s
 DRAIN_MAX_SECONDS = 300
+TERMINAL_SETTLE_SECONDS = 0.25
 TARGET_LANGUAGE = "es-US"
 
 AUDIO_DIR = Path(os.environ.get("S2S_TEST_AUDIO_DIR", "test_audio")).expanduser()
@@ -78,6 +81,15 @@ class DriftSample:
 class TestResult:
     audio_path: str
     duration_sec: float
+    backend_url: str = ""
+    backend_config_url: str = ""
+    backend_config: dict = field(default_factory=dict)
+    target_language: str = TARGET_LANGUAGE
+    pipeline_mode: str = "monolithic"
+    pipeline_mode_source: str = "legacy_default"
+    staged_pipeline: Any = None
+    staged_integrity_errors: list[str] = field(default_factory=list)
+    websocket_receive_events: list[dict[str, Any]] = field(default_factory=list)
     chunks_sent: int = 0
     audio_responses: int = 0
     total_received_bytes: int = 0
@@ -98,8 +110,475 @@ class TestResult:
     connection_lost: bool = False
     drain_timed_out: bool = False
     drain_duration_sec: float = 0.0
+    input_end_timestamp_ms: float = 0.0
+    terminal_arrival_timestamp_ms: float = 0.0
+    terminal_arrival_lag_sec: float = 0.0
     translation_completed: bool = False
     server_error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Evidence provenance and staged-pipeline integrity
+# ---------------------------------------------------------------------------
+def resolve_pipeline_mode(backend_config: dict) -> tuple[str, str]:
+    """Resolve the server-selected path from an ``/api/config`` snapshot.
+
+    Older backends did not expose ``pipelineMode`` and only supported the
+    monolithic route. Treating a missing value as that legacy default keeps
+    historical runs compatible while recording that the mode was inferred.
+    """
+    if "pipelineMode" not in backend_config:
+        return "monolithic", "legacy_default"
+
+    mode = backend_config["pipelineMode"]
+    if not isinstance(mode, str) or mode not in {"monolithic", "staged"}:
+        raise ValueError(
+            "/api/config.pipelineMode must be 'monolithic' or 'staged'"
+        )
+    return mode, "api_config"
+
+
+def fetch_backend_config(backend_url: str) -> tuple[dict, str, str, str]:
+    """Capture the active backend configuration used as test provenance."""
+    config_url = f"{backend_url.rstrip('/')}/api/config"
+    response = requests.get(config_url, timeout=10)
+    response.raise_for_status()
+    config = response.json()
+    if not isinstance(config, dict):
+        raise ValueError("/api/config must return a JSON object")
+    mode, mode_source = resolve_pipeline_mode(config)
+    return config, mode, mode_source, config_url
+
+
+def _sequence_ids(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> list[int] | None:
+    if not isinstance(value, list):
+        errors.append(f"{field_name} must be a list")
+        return None
+    if any(
+        not isinstance(sequence_id, int)
+        or isinstance(sequence_id, bool)
+        or sequence_id < 0
+        for sequence_id in value
+    ):
+        errors.append(f"{field_name} must contain non-negative integer IDs")
+        return None
+    return value
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate_staged_pipeline_integrity(
+    staged_pipeline: Any,
+    backend_config: dict,
+    websocket_receive_events: Any,
+    input_end_timestamp_ms: Any,
+) -> list[str]:
+    """Return hard integrity failures for a staged pipeline export.
+
+    The raw export is retained even when this validation fails. That lets a
+    failed batch run preserve enough evidence to diagnose the exact lifecycle,
+    ordering, or backpressure violation instead of discarding the trace.
+    """
+    errors: list[str] = []
+    if not isinstance(staged_pipeline, dict):
+        return ["/api/test/export.stagedPipeline must be a JSON object"]
+
+    if not isinstance(websocket_receive_events, list):
+        errors.append("websocket_receive_events must be a list")
+    else:
+        completed_orders: list[int] = []
+        completed_timestamps: list[float] = []
+        received_pcm_bytes: list[int] = []
+        valid_orders = True
+        observed_orders: list[int] = []
+        for index, event in enumerate(websocket_receive_events):
+            if not isinstance(event, dict):
+                errors.append(f"websocket_receive_events[{index}] must be an object")
+                valid_orders = False
+                continue
+            order = event.get("order")
+            if (
+                not isinstance(order, int)
+                or isinstance(order, bool)
+                or order < 0
+            ):
+                errors.append(
+                    f"websocket_receive_events[{index}].order is invalid"
+                )
+                valid_orders = False
+                continue
+            observed_orders.append(order)
+            if event.get("frame_type") == "pcm":
+                audio_bytes = event.get("audio_bytes")
+                if (
+                    not isinstance(audio_bytes, int)
+                    or isinstance(audio_bytes, bool)
+                    or audio_bytes <= 0
+                ):
+                    errors.append(
+                        f"websocket_receive_events[{index}].audio_bytes is invalid"
+                    )
+                else:
+                    received_pcm_bytes.append(audio_bytes)
+            if (
+                event.get("frame_type") == "control"
+                and event.get("message_type") == "status"
+                and event.get("status") == "completed"
+            ):
+                completed_orders.append(order)
+                timestamp_ms = event.get("timestamp_ms")
+                if (
+                    not isinstance(timestamp_ms, (int, float))
+                    or isinstance(timestamp_ms, bool)
+                    or not math.isfinite(timestamp_ms)
+                    or timestamp_ms < 0
+                ):
+                    errors.append(
+                        f"websocket_receive_events[{index}].timestamp_ms is invalid"
+                    )
+                else:
+                    completed_timestamps.append(float(timestamp_ms))
+
+        if valid_orders and observed_orders != list(range(len(observed_orders))):
+            errors.append(
+                "websocket_receive_events order must be contiguous from zero"
+            )
+        if len(completed_orders) != 1:
+            errors.append(
+                "exactly one completed WebSocket terminal is required "
+                f"(got {len(completed_orders)})"
+            )
+        elif any(
+            isinstance(event, dict)
+            and event.get("frame_type") == "pcm"
+            and isinstance(event.get("order"), int)
+            and event["order"] > completed_orders[0]
+            for event in websocket_receive_events
+        ):
+            errors.append("PCM was received after the completed WebSocket terminal")
+        if (
+            not isinstance(input_end_timestamp_ms, (int, float))
+            or isinstance(input_end_timestamp_ms, bool)
+            or not math.isfinite(input_end_timestamp_ms)
+            or input_end_timestamp_ms <= 0
+        ):
+            errors.append("input_end_timestamp_ms must be positive and finite")
+        elif len(completed_timestamps) == 1 and (
+            completed_timestamps[0] < float(input_end_timestamp_ms)
+        ):
+            errors.append("completed WebSocket terminal arrived before end_input")
+
+    if staged_pipeline.get("outcome") != "complete":
+        errors.append(
+            "staged outcome must be 'complete' "
+            f"(got {staged_pipeline.get('outcome')!r})"
+        )
+    if staged_pipeline.get("failure") is not None:
+        errors.append("staged failure must be null")
+
+    cleanup_errors = staged_pipeline.get("cleanup_errors")
+    if not isinstance(cleanup_errors, list):
+        errors.append("cleanup_errors must be a list")
+    elif cleanup_errors:
+        errors.append("cleanup_errors must be empty")
+
+    incomplete = _sequence_ids(
+        staged_pipeline.get("incomplete_sequence_ids"),
+        field_name="incomplete_sequence_ids",
+        errors=errors,
+    )
+    if incomplete:
+        errors.append(f"incomplete sequence IDs remain: {incomplete}")
+
+    completed = _sequence_ids(
+        staged_pipeline.get("completed_sequence_ids"),
+        field_name="completed_sequence_ids",
+        errors=errors,
+    )
+    websocket_sent = _sequence_ids(
+        staged_pipeline.get("websocket_sent_sequence_ids"),
+        field_name="websocket_sent_sequence_ids",
+        errors=errors,
+    )
+    if completed is not None:
+        expected = list(range(len(completed)))
+        if completed != expected:
+            errors.append(
+                "completed_sequence_ids must be contiguous and ordered from zero "
+                f"(got {completed})"
+            )
+    if completed is not None and websocket_sent is not None:
+        if websocket_sent != completed:
+            errors.append(
+                "websocket_sent_sequence_ids must exactly match completed_sequence_ids"
+            )
+
+    for count_name in ("segments_emitted", "audio_segments_produced"):
+        count = staged_pipeline.get(count_name)
+        if (
+            completed is not None
+            and (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count != len(completed)
+            )
+        ):
+            errors.append(
+                f"{count_name} must equal the completed sequence count "
+                f"({len(completed)})"
+            )
+
+    websocket_events = staged_pipeline.get("websocket_send_events")
+    if not isinstance(websocket_events, list):
+        errors.append("websocket_send_events must be a list")
+    else:
+        websocket_event_ids = []
+        websocket_event_audio_bytes: list[int] = []
+        valid_websocket_events = True
+        for index, event in enumerate(websocket_events):
+            if not isinstance(event, dict):
+                errors.append(f"websocket_send_events[{index}] must be an object")
+                valid_websocket_events = False
+                continue
+            sequence_id = event.get("sequence_id")
+            if (
+                not isinstance(sequence_id, int)
+                or isinstance(sequence_id, bool)
+                or sequence_id < 0
+            ):
+                errors.append(
+                    f"websocket_send_events[{index}].sequence_id is invalid"
+                )
+                valid_websocket_events = False
+                continue
+            websocket_event_ids.append(sequence_id)
+            audio_bytes = event.get("audio_bytes")
+            if (
+                not isinstance(audio_bytes, int)
+                or isinstance(audio_bytes, bool)
+                or audio_bytes <= 0
+            ):
+                errors.append(
+                    f"websocket_send_events[{index}].audio_bytes is invalid"
+                )
+                valid_websocket_events = False
+            else:
+                websocket_event_audio_bytes.append(audio_bytes)
+        if (
+            valid_websocket_events
+            and completed is not None
+            and websocket_event_ids != completed
+        ):
+            errors.append(
+                "websocket_send_events sequence order must exactly match "
+                "completed_sequence_ids"
+            )
+        if valid_websocket_events and isinstance(websocket_receive_events, list):
+            if len(received_pcm_bytes) != len(websocket_event_audio_bytes):
+                errors.append(
+                    "WebSocket PCM receive count must exactly match successful "
+                    "send count "
+                    f"({len(received_pcm_bytes)} != "
+                    f"{len(websocket_event_audio_bytes)})"
+                )
+            elif sum(received_pcm_bytes) != sum(websocket_event_audio_bytes):
+                errors.append(
+                    "WebSocket PCM received bytes must exactly match successful "
+                    "send bytes "
+                    f"({sum(received_pcm_bytes)} != "
+                    f"{sum(websocket_event_audio_bytes)})"
+                )
+
+    events = staged_pipeline.get("events")
+    if not isinstance(events, list):
+        errors.append("staged events must be a list")
+        events = []
+
+    event_sequences: dict[tuple[str, str], list[int]] = {
+        ("segmenter", "emitted"): [],
+        ("nmt", "completed"): [],
+        ("tts", "completed"): [],
+        ("output", "dequeued"): [],
+    }
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            errors.append(f"events[{index}] must be an object")
+            continue
+
+        key = (event.get("stage"), event.get("event"))
+        sequence_id = event.get("sequence_id")
+        if key in event_sequences and sequence_id is not None:
+            if (
+                not isinstance(sequence_id, int)
+                or isinstance(sequence_id, bool)
+                or sequence_id < 0
+            ):
+                errors.append(f"events[{index}].sequence_id is invalid")
+            else:
+                event_sequences[key].append(sequence_id)
+
+        queue_depth = event.get("queue_depth")
+        queue_capacity = event.get("queue_capacity")
+        if queue_depth is None and queue_capacity is None:
+            continue
+        if (
+            not isinstance(queue_depth, int)
+            or isinstance(queue_depth, bool)
+            or queue_depth < 0
+        ):
+            errors.append(f"events[{index}].queue_depth is invalid")
+            continue
+        if not _positive_int(queue_capacity):
+            errors.append(f"events[{index}].queue_capacity is invalid")
+            continue
+        if queue_depth > queue_capacity:
+            errors.append(
+                f"events[{index}] queue depth {queue_depth} exceeds "
+                f"capacity {queue_capacity}"
+            )
+
+    if completed is not None:
+        for (stage, event_name), observed in event_sequences.items():
+            if observed != completed:
+                errors.append(
+                    f"{stage}/{event_name} sequence order must exactly match "
+                    "completed_sequence_ids"
+                )
+
+    staged_config = backend_config.get("stagedConfig")
+    if staged_config is not None and not isinstance(staged_config, dict):
+        errors.append("/api/config.stagedConfig must be an object")
+        staged_config = None
+
+    max_depths = staged_pipeline.get("max_queue_depths")
+    if not isinstance(max_depths, dict):
+        errors.append("max_queue_depths must be an object")
+    elif staged_config is not None:
+        queue_config_keys = {
+            "nmt": "nmtQueueMaxSize",
+            "tts": "ttsQueueMaxSize",
+            "output": "outputQueueMaxSize",
+        }
+        for queue_name, config_key in queue_config_keys.items():
+            capacity = staged_config.get(config_key)
+            depth = max_depths.get(queue_name)
+            if not _positive_int(capacity):
+                errors.append(
+                    f"/api/config.stagedConfig.{config_key} must be a positive integer"
+                )
+                continue
+            if (
+                not isinstance(depth, int)
+                or isinstance(depth, bool)
+                or depth < 0
+            ):
+                errors.append(f"max_queue_depths.{queue_name} is invalid")
+                continue
+            if depth > capacity:
+                errors.append(
+                    f"max_queue_depths.{queue_name}={depth} exceeds configured "
+                    f"capacity {capacity}"
+                )
+
+    return errors
+
+
+def validate_capture_result(result: TestResult) -> list[str]:
+    """Return operational failures that make a batch capture incomplete."""
+    errors: list[str] = []
+    if result.pipeline_mode not in {"monolithic", "staged"}:
+        errors.append(f"invalid pipeline mode: {result.pipeline_mode!r}")
+    if result.duration_sec <= 0:
+        errors.append("source audio duration is empty")
+    if result.chunks_sent <= 0:
+        errors.append("no source chunks were sent")
+    if not result.input_completed:
+        errors.append("input did not complete")
+    if result.connection_lost:
+        errors.append("WebSocket connection was lost")
+    if result.drain_timed_out:
+        errors.append("translated tail drain timed out")
+    if not result.translation_completed:
+        errors.append("backend did not confirm translated-stream completion")
+    if result.server_error:
+        errors.append(f"backend error: {result.server_error}")
+    if result.audio_responses <= 0:
+        errors.append("no translated audio responses were received")
+    if result.total_received_bytes <= 0:
+        errors.append("translated audio was empty")
+    if result.translation_completed:
+        if result.input_end_timestamp_ms <= 0:
+            errors.append("input end timestamp is missing")
+        if result.terminal_arrival_timestamp_ms <= 0:
+            errors.append("terminal arrival timestamp is missing")
+        elif result.terminal_arrival_timestamp_ms < result.input_end_timestamp_ms:
+            errors.append("completed terminal arrived before end_input")
+        expected_lag = max(
+            0.0,
+            (
+                result.terminal_arrival_timestamp_ms
+                - result.input_end_timestamp_ms
+            )
+            / 1000,
+        )
+        if not math.isclose(
+            result.terminal_arrival_lag_sec,
+            expected_lag,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            errors.append("terminal arrival lag is inconsistent with timestamps")
+    errors.extend(result.staged_integrity_errors)
+    return errors
+
+
+def compute_playback_metrics(result: TestResult) -> None:
+    """Compute arrival-replay first-audio latency and listener-visible tail.
+
+    ``chunk_sent`` timestamps identify the start of each source chunk, not the
+    end of input. Prefer the observed ``end_input`` send timestamp; for older
+    or partial traces, add each chunk's exact PCM duration to its send time.
+    """
+    playback_end_sec = 0.0
+    estimated_input_end_sec = 0.0
+    explicit_input_end_sec = (
+        result.input_end_timestamp_ms / 1000
+        if result.input_end_timestamp_ms > 0
+        else None
+    )
+    result.first_audio_latency_sec = 0.0
+
+    for event in sorted(result.client_events, key=lambda event: event.timestamp_ms):
+        event_time_sec = event.timestamp_ms / 1000
+        if event.stage == "chunk_sent":
+            estimated_input_end_sec = max(
+                estimated_input_end_sec,
+                event_time_sec
+                + event.audio_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE),
+            )
+        elif event.stage == "input_ended":
+            explicit_input_end_sec = event_time_sec
+        elif event.stage == "audio_received":
+            if result.first_audio_latency_sec == 0.0:
+                result.first_audio_latency_sec = event_time_sec
+            playback_end_sec = max(playback_end_sec, event_time_sec)
+            playback_end_sec += event.audio_bytes / (
+                SAMPLE_RATE * BYTES_PER_SAMPLE
+            )
+
+    input_end_sec = (
+        explicit_input_end_sec
+        if explicit_input_end_sec is not None
+        else estimated_input_end_sec
+    )
+    result.playback_tail_sec = max(0.0, playback_end_sec - input_end_sec)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +638,36 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     duration_sec = len(pcm) / SAMPLE_RATE
     print(f"{len(pcm)} samples ({duration_sec:.1f}s)")
 
-    result = TestResult(audio_path=audio_path, duration_sec=duration_sec)
+    result = TestResult(
+        audio_path=audio_path,
+        duration_sec=duration_sec,
+        backend_url=backend_url.rstrip("/"),
+        target_language=TARGET_LANGUAGE,
+    )
+    (
+        result.backend_config,
+        result.pipeline_mode,
+        result.pipeline_mode_source,
+        result.backend_config_url,
+    ) = fetch_backend_config(backend_url)
+    model_config = result.backend_config.get("modelConfig")
+    if isinstance(model_config, dict):
+        nmt_config = model_config.get("nmt")
+        configured_target = (
+            nmt_config.get("targetLanguage")
+            if isinstance(nmt_config, dict)
+            else None
+        )
+        if configured_target != result.target_language:
+            raise RuntimeError(
+                "backend target-language provenance does not match the batch "
+                f"request: configured={configured_target!r}, "
+                f"requested={result.target_language!r}"
+            )
+    print(
+        f"Backend pipeline: {result.pipeline_mode} "
+        f"(source: {result.pipeline_mode_source})"
+    )
     pcm_bytes = pcm.tobytes()
     total_chunks = (len(pcm_bytes) + CHUNK_BYTES - 1) // CHUNK_BYTES
 
@@ -172,6 +680,30 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     print(f"Connecting to {ws_url}...", flush=True)
     test_start_time = time.monotonic()
     client_start_epoch = time.time()
+    receive_order = 0
+
+    def record_receive(
+        *,
+        frame_type: str,
+        received_at: float,
+        control: dict[str, Any] | None = None,
+        audio_bytes: int = 0,
+    ) -> dict[str, Any]:
+        nonlocal receive_order
+        event: dict[str, Any] = {
+            "order": receive_order,
+            "timestamp_ms": (received_at - client_start_epoch) * 1000,
+            "frame_type": frame_type,
+            "audio_bytes": audio_bytes,
+        }
+        if control is not None:
+            event["message_type"] = control.get("type")
+            event["status"] = control.get("status")
+            if control.get("type") == "error":
+                event["message"] = control.get("message")
+        result.websocket_receive_events.append(event)
+        receive_order += 1
+        return event
 
     # Disable websockets library auto-ping (uvicorn/starlette doesn't
     # respond to protocol-level pings). We send app-level pings instead.
@@ -186,6 +718,11 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         # Wait for "connected" status
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
         msg = json.loads(raw)
+        record_receive(
+            frame_type="control",
+            received_at=time.time(),
+            control=msg,
+        )
         if msg.get("status") != "connected":
             raise RuntimeError(f"Unexpected initial message: {msg}")
 
@@ -198,6 +735,11 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         # Wait for "listening"
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
         msg = json.loads(raw)
+        record_receive(
+            frame_type="control",
+            received_at=time.time(),
+            control=msg,
+        )
         if msg.get("status") != "listening":
             raise RuntimeError(f"Expected 'listening', got: {msg}")
 
@@ -206,8 +748,10 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         audio_responses = 0
         total_recv_bytes = 0
         last_audio_time = time.monotonic()
-        send_done = asyncio.Event()
+        stream_abort = asyncio.Event()
+        terminal_received = asyncio.Event()
         translation_complete = asyncio.Event()
+        input_end_sent = asyncio.Event()
         connection_lost = False
         server_error = ""
         last_print_time = 0.0
@@ -235,6 +779,9 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             loop_start = time.monotonic()
 
             while offset < len(pcm_bytes):
+                if stream_abort.is_set():
+                    break
+
                 chunk = pcm_bytes[offset : offset + CHUNK_BYTES]
                 send_ts = time.time()
 
@@ -242,6 +789,8 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                     await ws.send(chunk)
                 except websockets.exceptions.ConnectionClosed:
                     connection_lost = True
+                    stream_abort.set()
+                    terminal_received.set()
                     print(f"\nConnection lost at chunk {idx} "
                           f"({idx * CHUNK_DURATION:.1f}s)")
                     break
@@ -284,9 +833,13 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                 expected = loop_start + idx * CHUNK_DURATION
                 sleep_for = expected - time.monotonic()
                 if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-
-            send_done.set()
+                    try:
+                        await asyncio.wait_for(
+                            stream_abort.wait(),
+                            timeout=sleep_for,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
 
         # -- Receive task ---------------------------------------------------
         async def receive_audio():
@@ -297,6 +850,11 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                     raw = await ws.recv()
                     if isinstance(raw, bytes):
                         recv_ts = time.time()
+                        record_receive(
+                            frame_type="pcm",
+                            received_at=recv_ts,
+                            audio_bytes=len(raw),
+                        )
                         audio_responses += 1
                         total_recv_bytes += len(raw)
                         last_audio_time = time.monotonic()
@@ -313,17 +871,39 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                         try:
                             control = json.loads(raw)
                         except json.JSONDecodeError:
+                            record_receive(
+                                frame_type="text",
+                                received_at=time.time(),
+                            )
                             continue
+                        receive_event = record_receive(
+                            frame_type="control",
+                            received_at=time.time(),
+                            control=control,
+                        )
                         if (
                             control.get("type") == "status"
                             and control.get("status") == "completed"
                         ):
-                            translation_complete.set()
+                            result.terminal_arrival_timestamp_ms = float(
+                                receive_event["timestamp_ms"]
+                            )
+                            if not input_end_sent.is_set():
+                                server_error = (
+                                    "backend completed before client end_input"
+                                )
+                                stream_abort.set()
+                            else:
+                                translation_complete.set()
+                            terminal_received.set()
                         elif control.get("type") == "error":
                             server_error = control.get("message", "backend error")
-                            translation_complete.set()
+                            stream_abort.set()
+                            terminal_received.set()
             except websockets.exceptions.ConnectionClosed:
                 connection_lost = True
+                stream_abort.set()
+                terminal_received.set()
             except asyncio.CancelledError:
                 pass
 
@@ -341,14 +921,40 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             f" | Drift: {current_drift():.1f}s   ",
         )
 
-        if connection_lost:
-            print("(connection lost — saving partial results)")
+        if connection_lost or server_error or stream_abort.is_set():
+            if server_error:
+                print(
+                    "(backend error — stopped input early and saving "
+                    f"partial results: {server_error})"
+                )
+            elif connection_lost:
+                print("(connection lost — saving partial results)")
         else:
             # Close only the input side so Riva can flush final ASR/NMT/TTS
             # responses while this client keeps receiving translated audio.
-            responses_at_input_end = audio_responses
             input_end_time = time.monotonic()
-            await ws.send(json.dumps({"type": "end_input"}))
+            input_end_epoch = time.time()
+            result.input_end_timestamp_ms = (
+                input_end_epoch - client_start_epoch
+            ) * 1000
+            result.client_events.append(TimingEvent(
+                source="client",
+                stage="input_ended",
+                timestamp_ms=result.input_end_timestamp_ms,
+                chunk_index=chunks_sent,
+                source_position_sec=duration_sec,
+                audio_bytes=0,
+            ))
+            responses_at_input_end = audio_responses
+            # Mark the causal boundary before yielding in ws.send(). A valid
+            # completion cannot precede the invocation that sends end_input.
+            input_end_sent.set()
+            try:
+                await ws.send(json.dumps({"type": "end_input"}))
+            except websockets.exceptions.ConnectionClosed:
+                connection_lost = True
+                stream_abort.set()
+                terminal_received.set()
 
             print(
                 "Draining translated tail until Riva confirms completion "
@@ -359,6 +965,9 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             while time.monotonic() - drain_start < DRAIN_MAX_SECONDS:
                 if connection_lost:
                     print("\n(connection lost during drain)")
+                    break
+                if server_error:
+                    print(f"\n(backend error during drain: {server_error})")
                     break
                 elapsed = time.monotonic() - drain_start
                 idle = time.monotonic() - last_audio_time
@@ -373,7 +982,11 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                     elapsed_sec=time.monotonic() - test_start_time,
                     drift_sec=drift,
                 ))
-                if translation_complete.is_set():
+                if terminal_received.is_set():
+                    # Keep the receiver alive briefly so a duplicate terminal or
+                    # protocol-invalid PCM queued behind the terminal is captured.
+                    if translation_complete.is_set():
+                        await asyncio.sleep(TERMINAL_SETTLE_SECONDS)
                     break
                 await asyncio.sleep(1.0)
             print()
@@ -382,17 +995,30 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             result.translation_completed = (
                 translation_complete.is_set() and not server_error
             )
-            result.server_error = server_error
-            result.drain_timed_out = not translation_complete.is_set()
+            result.drain_timed_out = not terminal_received.is_set()
             result.tail_lag_sec = max(0.0, last_audio_time - input_end_time)
             result.post_input_responses = audio_responses - responses_at_input_end
+            if result.terminal_arrival_timestamp_ms > 0:
+                result.terminal_arrival_lag_sec = max(
+                    0.0,
+                    (
+                        result.terminal_arrival_timestamp_ms
+                        - result.input_end_timestamp_ms
+                    )
+                    / 1000,
+                )
 
-            # Stop stream
+        result.server_error = server_error
+
+        # Stop any still-open stream. On an error this performs best-effort
+        # backend cleanup without falsely signaling normal end-of-input.
+        if not connection_lost:
             try:
                 await ws.send(json.dumps({"type": "stop_stream"}))
             except websockets.exceptions.ConnectionClosed:
                 pass
 
+        stream_abort.set()
         ping_task.cancel()
         recv_task.cancel()
         try:
@@ -411,6 +1037,9 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         export_resp = requests.get(f"{backend_url}/api/test/export", timeout=30)
         export_resp.raise_for_status()
         export_data = export_resp.json()
+        if not isinstance(export_data, dict):
+            raise ValueError("/api/test/export must return a JSON object")
+        result.staged_pipeline = export_data.get("stagedPipeline")
         for ev in export_data.get("events", []):
             result.backend_events.append(TimingEvent(
                 source="backend",
@@ -422,6 +1051,14 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             ))
     except Exception as e:
         print(f"Warning: could not export backend timing: {e}")
+
+    if result.pipeline_mode == "staged":
+        result.staged_integrity_errors = validate_staged_pipeline_integrity(
+            result.staged_pipeline,
+            result.backend_config,
+            result.websocket_receive_events,
+            result.input_end_timestamp_ms,
+        )
 
     # -- Compute summary stats ----------------------------------------------
     result.chunks_sent = chunks_sent
@@ -447,20 +1084,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     # Simulate the browser's gapless playback queue using actual arrival
     # timestamps. This captures initial latency and delivery gaps as well as
     # output-duration expansion, yielding the listener-visible tail.
-    playback_end_sec = 0.0
-    input_end_sec = 0.0
-    for event in sorted(result.client_events, key=lambda e: e.timestamp_ms):
-        event_time_sec = event.timestamp_ms / 1000
-        if event.stage == "chunk_sent":
-            input_end_sec = max(input_end_sec, event_time_sec)
-        elif event.stage == "audio_received":
-            if result.first_audio_latency_sec == 0.0:
-                result.first_audio_latency_sec = event_time_sec
-            playback_end_sec = max(playback_end_sec, event_time_sec)
-            playback_end_sec += event.audio_bytes / (
-                SAMPLE_RATE * BYTES_PER_SAMPLE
-            )
-    result.playback_tail_sec = max(0.0, playback_end_sec - input_end_sec)
+    compute_playback_metrics(result)
 
     return result
 
@@ -513,9 +1137,30 @@ def generate_csv(result: TestResult, output_path: str):
 
 
 def generate_summary(result: TestResult, output_path: str):
-    """Write compact metrics separately from the event-level CSV."""
+    """Write metrics, provenance, and staged evidence for one audio file."""
     summary = {
         "audio_path": result.audio_path,
+        "backend_url": result.backend_url,
+        "backend_config_url": result.backend_config_url,
+        "backend_config": result.backend_config,
+        "target_language": result.target_language,
+        "pipeline_mode": result.pipeline_mode,
+        "pipeline_mode_source": result.pipeline_mode_source,
+        # Preserve the complete direct-stage summary and event trace returned
+        # by /api/test/export. This remains null for monolithic runs.
+        "staged_pipeline": result.staged_pipeline,
+        "staged_integrity": {
+            "applicable": result.pipeline_mode == "staged",
+            "passed": (
+                not result.staged_integrity_errors
+                if result.pipeline_mode == "staged"
+                else None
+            ),
+            "errors": result.staged_integrity_errors,
+        },
+        # Ordered receive-side protocol evidence. This proves where the sole
+        # completed terminal occurred relative to every translated PCM frame.
+        "websocket_receive_events": result.websocket_receive_events,
         "input_duration_sec": result.duration_sec,
         "chunks_sent": result.chunks_sent,
         "audio_responses": result.audio_responses,
@@ -536,6 +1181,9 @@ def generate_summary(result: TestResult, output_path: str):
         "connection_lost": result.connection_lost,
         "drain_timed_out": result.drain_timed_out,
         "drain_duration_sec": result.drain_duration_sec,
+        "input_end_timestamp_ms": result.input_end_timestamp_ms,
+        "terminal_arrival_timestamp_ms": result.terminal_arrival_timestamp_ms,
+        "terminal_arrival_lag_sec": result.terminal_arrival_lag_sec,
         "translation_completed": result.translation_completed,
         "server_error": result.server_error,
     }
@@ -582,20 +1230,18 @@ async def run_preflight(backend_url: str) -> bool:
         )
         return False
 
-    if (
-        not result.input_completed
-        or result.connection_lost
-        or result.drain_timed_out
-        or not result.translation_completed
-        or result.server_error
-    ):
+    capture_errors = validate_capture_result(result)
+    if capture_errors:
         print(
             "\nPre-flight FAILED: capture did not complete cleanly: "
             f"input_completed={result.input_completed}, "
             f"connection_lost={result.connection_lost}, "
             f"drain_timed_out={result.drain_timed_out}, "
             f"translation_completed={result.translation_completed}, "
-            f"server_error={result.server_error or 'none'}"
+            f"server_error={result.server_error or 'none'}, "
+            "staged_integrity_errors="
+            f"{result.staged_integrity_errors or 'none'}, "
+            f"validation_errors={capture_errors}"
         )
         return False
 
@@ -609,20 +1255,24 @@ async def run_preflight(backend_url: str) -> bool:
     return True
 
 
-async def run_batch(files: list[str], backend_url: str, output_dir: str):
+async def run_batch(files: list[str], backend_url: str, output_dir: str) -> bool:
     """Run tests on a list of audio files sequentially."""
     total = len(files)
+    all_captures_passed = total > 0
+    captures_written = 0
     for i, fpath in enumerate(files, 1):
         print(f"\n=== Test {i}/{total}: {Path(fpath).name} ===")
 
         if not Path(fpath).exists():
-            print(f"SKIPPED: File not found: {fpath}")
+            print(f"FAILED: File not found: {fpath}")
+            all_captures_passed = False
             continue
 
         try:
             result = await run_test(fpath, backend_url)
         except Exception as e:
             print(f"\nERROR: {e}")
+            all_captures_passed = False
             continue
 
         # Generate outputs
@@ -633,9 +1283,22 @@ async def run_batch(files: list[str], backend_url: str, output_dir: str):
         csv_path = str(parent / f"{stem}_results.csv")
         summary_path = str(parent / f"{stem}_summary.json")
 
-        generate_plot(result, plot_path)
-        generate_csv(result, csv_path)
-        generate_summary(result, summary_path)
+        try:
+            generate_plot(result, plot_path)
+            generate_csv(result, csv_path)
+            generate_summary(result, summary_path)
+            captures_written += 1
+        except Exception as exc:
+            print(f"Artifact generation FAILED: {exc}")
+            all_captures_passed = False
+            continue
+
+        capture_errors = validate_capture_result(result)
+        if capture_errors:
+            all_captures_passed = False
+            print("Capture validation FAILED:")
+            for error in capture_errors:
+                print(f"  - {error}")
 
         print(
             f"Summary: avg_drift={result.avg_drift:.1f}s, "
@@ -649,6 +1312,7 @@ async def run_batch(files: list[str], backend_url: str, output_dir: str):
             f"playback_tail={result.playback_tail_sec:.1f}s, "
             f"post_input_responses={result.post_input_responses}"
         )
+    return all_captures_passed and captures_written == total
 
 
 def main():
@@ -681,9 +1345,10 @@ def main():
         sys.exit(0 if ok else 1)
 
     if args.file:
-        asyncio.run(run_batch([args.file], args.backend, args.output_dir))
+        ok = asyncio.run(run_batch([args.file], args.backend, args.output_dir))
     else:
-        asyncio.run(run_batch(LONG_FORM_FILES, args.backend, args.output_dir))
+        ok = asyncio.run(run_batch(LONG_FORM_FILES, args.backend, args.output_dir))
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 """Unit tests for test control and metrics API endpoints."""
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
-from main import app
+from config import riva_config, staged_pipeline_config
+from main import app, handle_control_message, lifespan
 from timing_logger import timing_logger
 
 
@@ -29,10 +30,30 @@ async def client():
 
 @pytest.mark.asyncio
 async def test_start_test_endpoint(client: AsyncClient):
-    resp = await client.post("/api/test/start")
+    with patch(
+        "main.session_manager.clear_staged_telemetry",
+        return_value=True,
+    ) as clear_telemetry:
+        resp = await client.post("/api/test/start")
     assert resp.status_code == 200
     assert resp.json() == {"status": "started"}
     assert timing_logger.is_test_active
+    clear_telemetry.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_start_test_rejects_active_staged_stream(client: AsyncClient):
+    with patch(
+        "main.session_manager.clear_staged_telemetry",
+        return_value=False,
+    ):
+        response = await client.post("/api/test/start")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Cannot start a new test while a staged stream is active"
+    }
+    assert not timing_logger.is_test_active
 
 
 @pytest.mark.asyncio
@@ -60,3 +81,128 @@ async def test_export_empty_when_no_test(client: AsyncClient):
     resp = await client.get("/api/test/export")
     assert resp.status_code == 200
     assert resp.json()["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_export_includes_retained_staged_pipeline_telemetry(
+    client: AsyncClient,
+):
+    telemetry = {
+        "outcome": "complete",
+        "events": [{"stage": "nmt", "event": "completed"}],
+        "websocket_sent_sequence_ids": [0],
+        "websocket_send_events": [
+            {"sequence_id": 0, "sent_monotonic_ms": 123.0, "audio_bytes": 3200}
+        ],
+    }
+    with patch(
+        "main.session_manager.get_staged_telemetry",
+        return_value=telemetry,
+    ):
+        response = await client.get("/api/test/export")
+
+    assert response.status_code == 200
+    assert response.json()["stagedPipeline"] == telemetry
+
+
+@pytest.mark.asyncio
+async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
+    with patch("main.staged_pipeline_config.pipeline_mode", "staged"):
+        config_response = await client.get("/api/config")
+        root_response = await client.get("/")
+
+    assert config_response.json()["pipelineMode"] == "staged"
+    assert root_response.json()["pipeline_mode"] == "staged"
+    assert config_response.json()["modelConfig"] == {
+        "asr": {
+            "endpoint": riva_config.asr_uri,
+            "image": riva_config.asr_image,
+            "imageDigest": riva_config.asr_image_digest or None,
+            "profile": riva_config.asr_profile or None,
+            "eouMs": riva_config.endpointing_history_ms,
+            "wordTimeOffsets": riva_config.asr_word_time_offsets,
+            "sourceLanguage": riva_config.source_language,
+        },
+        "nmt": {
+            "endpoint": riva_config.uri,
+            "image": riva_config.nmt_image,
+            "imageDigest": riva_config.nmt_image_digest or None,
+            "profile": riva_config.nmt_profile or None,
+            "model": riva_config.model,
+            "sourceLanguage": riva_config.source_language,
+            "targetLanguage": riva_config.target_language,
+        },
+        "tts": {
+            "endpoint": riva_config.tts_uri,
+            "image": riva_config.tts_image,
+            "imageDigest": riva_config.tts_image_digest or None,
+            "profile": riva_config.tts_profile or None,
+            "targetLanguage": riva_config.target_language,
+            "voice": "Magpie-Multilingual.ES-US.Isabela",
+        },
+    }
+    assert config_response.json()["stagedConfig"] == {
+        "segmentMaxChars": staged_pipeline_config.segment_max_chars,
+        "segmentMaxAgeMs": staged_pipeline_config.segment_max_age_ms,
+        "asrEventQueueMaxSize": staged_pipeline_config.asr_event_queue_maxsize,
+        "nmtQueueMaxSize": staged_pipeline_config.nmt_queue_maxsize,
+        "ttsQueueMaxSize": staged_pipeline_config.tts_queue_maxsize,
+        "outputQueueMaxSize": staged_pipeline_config.output_queue_maxsize,
+        "nmtRpcTimeoutSeconds": staged_pipeline_config.nmt_rpc_timeout_s,
+        "ttsRpcTimeoutSeconds": staged_pipeline_config.tts_rpc_timeout_s,
+        "ttsMaxSegmentAudioSeconds": (
+            staged_pipeline_config.tts_max_segment_audio_s
+        ),
+        "closeTimeoutSeconds": staged_pipeline_config.close_timeout_s,
+    }
+
+
+@pytest.mark.asyncio
+async def test_staged_lifespan_does_not_open_monolithic_connection():
+    with (
+        patch("main.staged_pipeline_config.pipeline_mode", "staged"),
+        patch("main.riva_client") as monolithic_client,
+    ):
+        monolithic_client.is_connected.return_value = False
+        async with lifespan(app):
+            pass
+
+    monolithic_client.connect.assert_not_called()
+    monolithic_client.disconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_monolithic_lifespan_keeps_eager_connection():
+    with (
+        patch("main.staged_pipeline_config.pipeline_mode", "monolithic"),
+        patch("main.riva_client") as monolithic_client,
+    ):
+        monolithic_client.connect.return_value = True
+        monolithic_client.is_connected.return_value = True
+        async with lifespan(app):
+            pass
+
+    monolithic_client.connect.assert_called_once_with()
+    monolithic_client.disconnect.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_ping_control_uses_session_serialized_pong_sender():
+    session = MagicMock()
+    session.send_pong = AsyncMock()
+
+    await handle_control_message(session, {"type": "ping"})
+
+    session.send_pong.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_unknown_control_uses_generation_aware_protocol_failure():
+    session = MagicMock()
+    session.send_protocol_error = AsyncMock()
+
+    await handle_control_message(session, {"type": "unexpected"})
+
+    session.send_protocol_error.assert_awaited_once_with(
+        "Unknown message type: unexpected"
+    )

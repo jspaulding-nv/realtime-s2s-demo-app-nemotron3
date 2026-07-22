@@ -1,8 +1,9 @@
 """Bounded, ordered ASR -> NMT -> TTS orchestration.
 
-This module is the experimental application boundary for the direct NIM
-adapters.  It intentionally does not replace the existing monolithic browser
-WebSocket route yet.  One worker per model preserves source order while still
+This module is the application boundary for the direct NIM adapters.  The
+pipeline is available to the browser WebSocket route only when the explicit
+``S2S_PIPELINE_MODE=staged`` feature flag is selected; the monolithic route
+remains the default.  One worker per model preserves source order while still
 allowing NMT for segment ``n + 1`` to overlap TTS for segment ``n``.
 """
 
@@ -17,7 +18,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from config import SUPPORTED_LANGUAGES, StagedPipelineConfig, staged_pipeline_config
-from punctuation_segmenter import PunctuationSegmenter
+from punctuation_segmenter import FillerDiscard, PunctuationSegmenter
 from staged_models import (
     ASRStreamEventKind,
     PipelineEvent,
@@ -132,11 +133,13 @@ class StagedPipelineSession:
             "output": 0,
         }
         self._audio_segments_produced = 0
+        self._fillers_discarded = 0
         self._emitted_sequence_ids: list[int] = []
         self._synthesized_sequence_ids: list[int] = []
         self._consumed_sequence_ids: list[int] = []
         self._expected_nmt_sequence = 0
         self._expected_tts_sequence = 0
+        self._last_asr_observation_ms: Optional[float] = None
 
     @property
     def state(self) -> StagedPipelineState:
@@ -268,6 +271,7 @@ class StagedPipelineSession:
             "outcome": self._outcome,
             "target_language": self.target_language,
             "audio_segments_produced": self._audio_segments_produced,
+            "fillers_discarded": self._fillers_discarded,
             "segments_emitted": len(self._emitted_sequence_ids),
             "completed_sequence_ids": list(self._consumed_sequence_ids),
             "incomplete_sequence_ids": sorted(
@@ -372,17 +376,19 @@ class StagedPipelineSession:
             await self._fail(stage, exc)
 
     async def _consume_asr(self) -> None:
+        segmenter_outcomes = []
         segmenter = PunctuationSegmenter(
             max_chars=self.config.segment_max_chars,
             max_age_ms=self.config.segment_max_age_ms,
+            outcome_sink=segmenter_outcomes.append,
         )
         poll_s = min(0.1, self.config.segment_max_age_ms / 1_000)
         while True:
             try:
                 event = await self._asr_stream.next_event(timeout_s=poll_s)
             except asyncio.TimeoutError:
-                for segment in segmenter.emit_due(self._clock_ms()):
-                    await self._emit_text_segment(segment)
+                segmenter.emit_due(self._normalized_asr_observation_ms())
+                await self._handle_segmenter_outcomes(segmenter_outcomes)
                 continue
 
             if event.kind is ASRStreamEventKind.INTERIM:
@@ -396,8 +402,12 @@ class StagedPipelineSession:
                 )
                 # Interims can arrive continuously, so check buffered-final age
                 # after each one instead of relying only on a quiet timeout.
-                for segment in segmenter.emit_due(self._clock_ms()):
-                    await self._emit_text_segment(segment)
+                segmenter.emit_due(
+                    self._normalized_asr_observation_ms(
+                        transcript.received_monotonic_ms
+                    )
+                )
+                await self._handle_segmenter_outcomes(segmenter_outcomes)
             elif event.kind is ASRStreamEventKind.FINAL:
                 final = event.final
                 self._record(
@@ -408,16 +418,61 @@ class StagedPipelineSession:
                     source_start_ms=final.source_start_ms,
                     source_end_ms=final.source_end_ms,
                 )
-                for segment in segmenter.push_final(final):
-                    await self._emit_text_segment(segment)
+                segmenter.push_final(
+                    final,
+                    observed_monotonic_ms=self._normalized_asr_observation_ms(
+                        final.received_monotonic_ms
+                    ),
+                )
+                await self._handle_segmenter_outcomes(segmenter_outcomes)
             elif event.kind is ASRStreamEventKind.COMPLETE:
-                for segment in segmenter.flush(self._clock_ms()):
-                    await self._emit_text_segment(segment)
+                segmenter.flush(self._normalized_asr_observation_ms())
+                await self._handle_segmenter_outcomes(segmenter_outcomes)
                 await self._enqueue(self._nmt_queue, _DRAIN, "nmt", "drain_enqueued")
                 self._record(stage="asr", event="complete")
                 return
             else:
                 raise StagedPipelineError(event.error or "direct ASR failed")
+
+    def _normalized_asr_observation_ms(
+        self, captured_monotonic_ms: Optional[float] = None
+    ) -> float:
+        """Return a nondecreasing consumer time without rewriting ASR timing.
+
+        Direct-ASR events are timestamped in their blocking producer thread.
+        Once they cross the bounded event queue, the asyncio consumer clock can
+        already be slightly ahead of the next event's capture time.  Segment
+        age is evaluated on this normalized consumer timeline; source word
+        offsets and the event's original capture time remain unchanged.
+        """
+        observed_ms = self._clock_ms()
+        if captured_monotonic_ms is not None:
+            observed_ms = max(observed_ms, captured_monotonic_ms)
+        if self._last_asr_observation_ms is not None:
+            observed_ms = max(observed_ms, self._last_asr_observation_ms)
+        self._last_asr_observation_ms = observed_ms
+        return observed_ms
+
+    async def _handle_segmenter_outcomes(self, outcomes: list[Any]) -> None:
+        pending = tuple(outcomes)
+        outcomes.clear()
+        for outcome in pending:
+            if isinstance(outcome, TextSegment):
+                await self._emit_text_segment(outcome)
+                continue
+            if not isinstance(outcome, FillerDiscard):
+                raise StagedPipelineError("segmenter returned an invalid outcome")
+            self._fillers_discarded += 1
+            self._record(
+                stage="segmenter",
+                event="filler_discarded",
+                asr_final_id=outcome.contributing_final_ids[-1],
+                contributing_final_ids=outcome.contributing_final_ids,
+                source_start_ms=outcome.source_start_ms,
+                source_end_ms=outcome.source_end_ms,
+                text_chars=outcome.text_chars,
+                monotonic_ms=outcome.discarded_monotonic_ms,
+            )
 
     async def _emit_text_segment(self, segment: TextSegment) -> None:
         self._emitted_sequence_ids.append(segment.sequence_id)
@@ -739,6 +794,7 @@ class StagedPipelineSession:
         event: str,
         segment: Any = None,
         asr_final_id: Optional[int] = None,
+        contributing_final_ids: Tuple[int, ...] = (),
         source_start_ms: Optional[float] = None,
         source_end_ms: Optional[float] = None,
         queue_depth: Optional[int] = None,
@@ -761,7 +817,9 @@ class StagedPipelineSession:
             sequence_id=source.sequence_id if source is not None else None,
             asr_final_id=asr_final_id,
             contributing_final_ids=(
-                source.contributing_final_ids if source is not None else ()
+                source.contributing_final_ids
+                if source is not None
+                else contributing_final_ids
             ),
             emission_reason=source.reason if source is not None else None,
             source_start_ms=(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -12,6 +13,7 @@ import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
 from config import riva_config
 from staged_models import TextSegment, TranslatedSegment
+from target_text_validation import validate_target_text
 
 
 class DirectNMTResponseError(RuntimeError):
@@ -116,6 +118,24 @@ class DirectNMTClient:
             auth = self._auth
             client = self._client
 
+        override = _standalone_es_us_override(segment.text, resolved_target)
+        if override is not None:
+            started_ms = self._clock_ms()
+            translated_text = validate_target_text(
+                override,
+                language=resolved_target,
+                sequence_id=segment.sequence_id,
+            )
+            completed_ms = self._clock_ms()
+            return TranslatedSegment(
+                segment=segment,
+                text=translated_text,
+                language=resolved_target,
+                started_monotonic_ms=started_ms,
+                completed_monotonic_ms=completed_ms,
+                source_override_applied=True,
+            )
+
         started_ms = self._clock_ms()
         request = riva_nmt_pb2.TranslateTextRequest(
             texts=[segment.text],
@@ -137,15 +157,18 @@ class DirectNMTClient:
                 f"received {len(translations)}"
             )
         translation = translations[0]
-        translated_text = str(getattr(translation, "text", "")).strip()
-        if not translated_text:
-            raise DirectNMTResponseError("NMT returned an empty translation")
+        translated_text = str(getattr(translation, "text", ""))
         response_language = str(getattr(translation, "language", "")).strip()
         if response_language != resolved_target:
             raise DirectNMTResponseError(
                 "NMT response language mismatch: "
                 f"expected {resolved_target!r}, received {response_language!r}"
             )
+        translated_text = validate_target_text(
+            translated_text,
+            language=response_language,
+            sequence_id=segment.sequence_id,
+        )
 
         return TranslatedSegment(
             segment=segment,
@@ -154,6 +177,46 @@ class DirectNMTClient:
             started_monotonic_ms=started_ms,
             completed_monotonic_ms=completed_ms,
         )
+
+
+_STANDALONE_ES_US_OVERRIDE = re.compile(
+    r"^(?P<term>ok(?:ay)?|amen)(?P<terminal>[.!?]?)$",
+    re.IGNORECASE,
+)
+
+
+def _standalone_es_us_override(text: str, target_language: str) -> Optional[str]:
+    """Translate only known standalone short utterances without an NMT RPC."""
+    if target_language != "es-US":
+        return None
+    candidate = text.strip()
+    opening_quote = ""
+    closing_quote = ""
+    quote_pairs = {'"': '"', "'": "'", "“": "”", "‘": "’", "«": "»"}
+    if candidate[:1] in quote_pairs:
+        opening_quote = candidate[0]
+        closing_quote = quote_pairs[opening_quote]
+        if not candidate.endswith(closing_quote):
+            return None
+        candidate = candidate[1:-1]
+
+    match = _STANDALONE_ES_US_OVERRIDE.fullmatch(candidate)
+    if match is None:
+        return None
+
+    translated = (
+        "De acuerdo"
+        if match.group("term").casefold() in {"ok", "okay"}
+        else "Amén"
+    )
+    terminal = match.group("terminal") or "."
+    if terminal == "?":
+        result = f"¿{translated}?"
+    elif terminal == "!":
+        result = f"¡{translated}!"
+    else:
+        result = f"{translated}."
+    return f"{opening_quote}{result}{closing_quote}"
 
 
 def _required_text(name: str, value: object) -> str:

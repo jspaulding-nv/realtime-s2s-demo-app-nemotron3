@@ -2,11 +2,12 @@
 
 ## Status
 
-The first staged-pipeline milestone is implemented on
-`agent/staged-s2s-pipeline` without changing the active browser translation
-path. The existing `/ws/translate` endpoint still uses the monolithic Riva S2S
-operation, so the July 22 acceptance baseline remains directly comparable and
-rollback remains trivial.
+This is the historical record of the first staged-pipeline milestone on
+`agent/staged-s2s-pipeline`. That milestone stopped at the direct-ASR and
+segmenter boundary. The current implementation is connected to `/ws/translate`
+behind `S2S_PIPELINE_MODE=staged`, while monolithic mode remains the default and
+rollback path; see the later
+[feature-flagged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
 
 Implemented and validated:
 
@@ -20,14 +21,15 @@ Implemented and validated:
 - a standalone live direct-ASR smoke command; and
 - focused and full-suite regression tests.
 
-Not implemented in this milestone:
-
-- direct NMT and TTS adapters in the application;
-- bounded NMT/TTS queues and pipeline overlap;
-- the staged WebSocket session and sentinel drain;
-- target-language validation before TTS;
-- per-stage event persistence and session summaries; or
-- a staged sample-length latency comparison.
+The once-deferred direct NMT/TTS adapters, bounded queues, ordered sentinel
+drain, persisted stage telemetry, target-language validation, and staged
+WebSocket session are now implemented. The one-minute WebSocket preflight and
+the first full sample operational canary have passed. Sample 03 attempt 3
+processed all 1,888.1045 seconds, delivered 646 consecutive ordered IDs, and
+reached natural completion with no errors. Its fixed 1.00x listener tail was
+still 64.038 seconds, so this operational success does not close the
+audience-experience gate. Sample 01, Sample 02, the complete staged matrix, browser
+Web Audio validation, and marked-phrase/punchline timing remain open.
 
 ## Files and responsibilities
 
@@ -82,9 +84,10 @@ Cancellation unblocks both the audio iterator and a worker waiting on a full
 event queue. Opening a second stream or racing a new stream with client shutdown
 fails explicitly.
 
-The event-count bound protects ordering and memory at the ASR handoff. It is
-not the audience's 5-10 second playback objective and does not yet bound NMT,
-TTS, outbound audio, or end-to-end semantic delay.
+The event-count bound protects ordering and memory at the ASR handoff. Later
+stages now have their own bounded NMT, TTS, and outbound queues, but none of
+those item-count bounds is the audience's 5-10 second playback objective or a
+guarantee on end-to-end semantic delay.
 
 ## Segmenter contract
 
@@ -122,12 +125,44 @@ Every emitted segment records:
 - the contributing ASR-final IDs; and
 - the coarse source timing envelope when ASR supplies one.
 
+Before sequence-ID allocation, the current segmenter suppresses only exact
+standalone hesitation fillers `uh`, `um`, `er`, `erm`, and `hmm`, matched
+case-insensitively with terminal punctuation and quote wrappers. A suppression
+does not consume a translated-segment ID and never calls NMT or TTS. It emits a
+privacy-safe `segmenter/filler_discarded` record containing contributing
+ASR-final IDs, source timing, and character count, and increments the session's
+`fillers_discarded` total. Fillers embedded in meaningful speech are preserved.
+
 If any contributing final lacks a source start or end, that aggregate endpoint
 remains unknown instead of fabricating a complete timing range from another
 final.
 
 `flush()` emits the residual at most once. Repeated flush calls return no
 segments, and pushing more text after flush fails explicitly.
+
+## Current NMT-to-TTS safety contract
+
+The current staged adapter has narrow deterministic Spanish source overrides
+for standalone `OK`/`Okay` and `Amen` variants only. It preserves supported
+punctuation and matched quote wrappers, produces `De acuerdo.` or `Amén.` (with
+Spanish question/exclamation marks when applicable), bypasses the NMT RPC, and
+sets `source_override_applied`. Sentence context and other short utterances
+continue through NMT.
+
+All translated `es-US` text is NFC-normalized and validated immediately after
+NMT and defensively again before TTS. It must contain speakable letter/digit
+content and use Latin letters, decimal digits, punctuation, non-control
+whitespace, and Latin-attached combining marks only. Here, `punctuation` means
+the explicit Spanish Magpie-safe allowlist; CJK punctuation such as `U+3002`
+fails closed. Non-Latin or mixed-script letters, detached marks, symbols, and
+control/format characters also fail with sequence-scoped metadata; raw text is
+not included in the diagnostic and invalid text never reaches Magpie. The
+pipeline does not retry an unchanged NMT or TTS payload, because deterministic
+invalid content cannot become safe by repetition.
+
+The wider Unicode punctuation list used by the source-side segmenter above is
+only for finding ASR boundaries. It does not define what target text may cross
+the Spanish TTS boundary.
 
 ## Live smoke
 
@@ -183,9 +218,10 @@ The observed 20-second real-time run with
 sentinel, segmentation, and async client-close path.
 
 Separate operator probes also confirmed that the pinned direct NMT call and
-streaming TTS call accept Riva client `2.24.0`. Those probes are compatibility
-evidence only; application adapters and lifecycle tests are still required in
-the next milestone.
+streaming TTS call accept Riva client `2.24.0`. Those probes were compatibility
+evidence for the next milestone; the application adapters, lifecycle tests,
+WebSocket integration, and first full staged sample canary have since been
+completed.
 
 ## Validation
 
@@ -217,13 +253,17 @@ Adapter tests use fake Riva services, and the smoke CLI tests are local. They
 therefore cannot prove NIM compatibility; both checked-in opt-in live commands
 are separate required gates.
 
-## Next milestone
+## Subsequent milestones and remaining gates
 
-This historical next-milestone list is now implemented and validated in
-[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md). The next
-remaining integration is the default-off staged WebSocket route.
+This historical next-milestone list is implemented and validated in
+[Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md) and
+[Feature-flagged staged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+The WebSocket preflight and first full staged sample operational run have
+passed. Sample 03 attempt 3 consumed 1,888.1045 seconds, delivered all 646
+ordered sequence IDs, and completed without errors. Its 64.038-second fixed
+listener tail remains an audience concern rather than an operational failure.
 
-Implement the staged text/audio worker path behind an explicit feature flag:
+Completed implementation sequence:
 
 1. Add direct NMT and streaming TTS adapters with target-language/non-empty
    validation between them.
@@ -237,3 +277,14 @@ Implement the staged text/audio worker path behind an explicit feature flag:
    control.
 6. Pass the one-minute preflight and short excerpts before running a complete
    sample.
+7. Pass the first full staged sample operational canary with ordered output and
+   one natural terminal.
+
+Remaining promotion gates:
+
+1. Run Sample 01 and Sample 02 and complete the staged three-sample comparison
+   matrix.
+2. Cross-check queue scheduling and final drain in browser Web Audio.
+3. Capture marked-phrase or punchline delay for the live-audience experience.
+4. Evaluate bounded-queue and playback-speed policy without dropping speech or
+   accepting unacceptable Spanish quality.

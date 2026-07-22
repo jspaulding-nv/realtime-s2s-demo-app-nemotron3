@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from punctuation_segmenter import PunctuationSegmenter
+from punctuation_segmenter import FillerDiscard, PunctuationSegmenter
 from staged_models import AsrFinal, EmissionReason, PipelineEvent
 
 
@@ -34,6 +34,80 @@ def test_multiple_sentences_get_independent_ordered_segment_ids():
     assert [item.sequence_id for item in emitted] == [0, 1, 2]
     assert [item.text for item in emitted] == ["One.", "Two?", "Three!"]
     assert all(item.contributing_final_ids == (7,) for item in emitted)
+
+
+def test_same_final_discards_isolated_filler_before_allocating_sequence_id():
+    outcomes = []
+    segmenter = PunctuationSegmenter(outcome_sink=outcomes.append)
+
+    emitted = segmenter.push_final(
+        final(7, "It moves from. uh. from something...", at=100)
+    )
+
+    assert [item.text for item in emitted] == [
+        "It moves from.",
+        "from something...",
+    ]
+    assert [item.sequence_id for item in emitted] == [0, 1]
+    assert [type(outcome) for outcome in outcomes] == [
+        type(emitted[0]),
+        FillerDiscard,
+        type(emitted[1]),
+    ]
+    discard = outcomes[1]
+    assert discard.text_chars == len("uh.")
+    assert discard.contributing_final_ids == (7,)
+
+
+def test_split_final_filler_is_discarded_with_all_final_provenance():
+    outcomes = []
+    segmenter = PunctuationSegmenter(outcome_sink=outcomes.append)
+
+    emitted = segmenter.push_final(
+        final(0, "It moves from. ERM", at=100, start=0, end=1_000)
+    )
+    emitted.extend(
+        segmenter.push_final(
+            final(1, ". From something.", at=200, start=1_000, end=2_000)
+        )
+    )
+
+    assert [item.text for item in emitted] == ["It moves from.", "From something."]
+    assert [item.sequence_id for item in emitted] == [0, 1]
+    discard = next(
+        outcome for outcome in outcomes if isinstance(outcome, FillerDiscard)
+    )
+    assert discard.contributing_final_ids == (0, 1)
+    assert discard.source_start_ms == 0
+    assert discard.source_end_ms == 2_000
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["uh", "UM.", "Er?", "erm!", "hMm...", '“Uh!”', "'um?'"],
+)
+def test_filler_only_input_is_suppressed_on_punctuation_or_flush(text):
+    outcomes = []
+    segmenter = PunctuationSegmenter(outcome_sink=outcomes.append)
+
+    emitted = segmenter.push_final(final(0, text, at=100))
+    emitted.extend(segmenter.flush(200))
+
+    assert emitted == []
+    assert segmenter.next_sequence_id == 0
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], FillerDiscard)
+    assert outcomes[0].text_chars == len(text)
+
+
+@pytest.mark.parametrize("text", ["No.", "Why?", "Okay.", "ah.", "uh, well."])
+def test_meaningful_or_unknown_short_utterances_are_preserved(text):
+    segmenter = PunctuationSegmenter()
+
+    emitted = segmenter.push_final(final(0, text))
+
+    assert [item.text for item in emitted] == [text]
+    assert [item.sequence_id for item in emitted] == [0]
 
 
 def test_sentence_can_span_multiple_asr_finals():
@@ -277,6 +351,31 @@ def test_ids_time_and_source_ranges_are_validated():
         final(3, "Bad", at=102, start=10, end=5)
 
 
+def test_queued_final_uses_consumer_observation_without_rewriting_capture_time():
+    segmenter = PunctuationSegmenter()
+    # Sample 03's final 17 was captured just before the asyncio consumer's
+    # preceding age observation. Its Nemotron word offsets were still valid.
+    segmenter.emit_due(180_110_062.0)
+    captured_ms = 180_110_061.943155
+
+    emitted = segmenter.push_final(
+        final(
+            17,
+            "A queued final.",
+            at=captured_ms,
+            start=60_800,
+            end=68_080,
+        ),
+        observed_monotonic_ms=180_110_062.075487,
+    )
+
+    assert len(emitted) == 1
+    assert emitted[0].buffered_since_monotonic_ms == captured_ms
+    assert emitted[0].emitted_monotonic_ms == 180_110_062.075487
+    assert emitted[0].source_start_ms == 60_800
+    assert emitted[0].source_end_ms == 68_080
+
+
 def test_inconsistent_partial_source_ranges_degrade_to_unknown():
     segmenter = PunctuationSegmenter()
     segmenter.push_final(final(0, "Earlier", at=0, end=100))
@@ -332,6 +431,7 @@ def test_nonfinite_times_are_rejected(value):
         {"max_chars": True},
         {"max_age_ms": 0},
         {"abbreviations": [" "]},
+        {"outcome_sink": "not-callable"},
     ],
 )
 def test_invalid_configuration_is_rejected(kwargs):

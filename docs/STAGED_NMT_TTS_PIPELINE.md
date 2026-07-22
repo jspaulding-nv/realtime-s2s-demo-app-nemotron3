@@ -6,19 +6,23 @@ The second staged-pipeline milestone is implemented on
 `agent/staged-nmt-tts-pipeline`. It joins direct Nemotron ASR, punctuation
 segmentation, direct Riva NMT, and direct Magpie TTS through bounded FIFO
 queues. A real-time one-minute English-to-Spanish preflight completed on July
-22, 2026.
+22, 2026. The first full-length operational canary also passed: all 1,888.1045
+seconds of *Long-form sample 03* completed through the staged WebSocket
+path with 646 contiguous translated-audio sequence IDs and no pipeline,
+cleanup, WebSocket, container, or integrity error.
 
-The browser `/ws/translate` route is deliberately unchanged and still uses
-Riva's monolithic S2S operation. The staged path is currently exercised by the
-standalone smoke tool and unit-test fakes. This keeps the earlier three-sample
-baseline comparable while the new lifecycle and telemetry are validated.
+This document records the direct orchestrator milestone and its standalone
+smoke. The later feature-flagged browser integration is documented in
+[Feature-flagged staged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+The default remains monolithic; `S2S_PIPELINE_MODE=staged` now selects the
+direct path through the existing `/ws/translate` protocol.
 
 ## What is implemented
 
 | Component | Contract |
 |---|---|
-| `backend/direct_nmt_client.py` | One source segment per RPC, explicit deadline, exact-one/nonempty output, exact target-language validation, no retries |
-| `backend/direct_tts_client.py` | Spanish voice lookup, 16 kHz mono Int16 PCM, full-segment atomic buffering, first-audio/completion timing, active-call cancellation, no retries |
+| `backend/direct_nmt_client.py` | One source segment per RPC, explicit deadline, exact-one/nonempty output, narrow `OK`/`Okay`/`Amen` source overrides, Spanish target-text validation, no retries |
+| `backend/direct_tts_client.py` | Spanish voice lookup, defensive pre-TTS target-text validation, 16 kHz mono Int16 PCM, full-segment atomic buffering, first-audio/completion timing, active-call cancellation, no retries |
 | `backend/staged_pipeline.py` | One ASR consumer, one NMT worker, one TTS worker, bounded queues, ordered drain, first-failure ownership, per-stage telemetry |
 | `staged_pipeline_smoke.py` | Real-time WAV feed, direct three-service run, raw PCM output, JSON report, and an overall terminal deadline |
 
@@ -49,6 +53,17 @@ return fluent-looking output for an empty or whitespace-only request. Blank
 segments are rejected before the RPC, and NMT output must contain exactly one
 nonempty `es-US` translation before it can reach TTS.
 
+The full-sample canary exposed a second content boundary. Isolated hesitation
+fillers such as `uh.` are suppressed by the segmenter before a sequence ID is
+allocated, and the discard is recorded in privacy-safe telemetry. Narrow,
+deterministic Spanish overrides cover standalone `OK`/`Okay` and `Amen`, whose
+pinned-model outputs were observed to use the wrong script. All other NMT
+output is normalized and validated immediately after NMT and again before TTS:
+Spanish must contain at least one letter or digit, every letter must be Latin
+script, and control/format characters, symbols, and detached marks are
+rejected. Invalid output fails closed. An unchanged NMT or TTS request is
+never blindly retried.
+
 ## Data flow and bounds
 
 ```text
@@ -56,23 +71,29 @@ English PCM
     -> Nemotron streaming ASR
     -> bounded ASR event bridge (32 events)
     -> punctuation/age/length segmenter
+       -> suppress configured standalone hesitation fillers before ID allocation
     -> bounded NMT queue (4 segments)
     -> one NMT worker
     -> bounded TTS queue (4 translations)
     -> one TTS worker
     -> bounded output queue (4 atomic audio segments)
-    -> smoke consumer now; WebSocket sender in the next milestone
+    -> smoke consumer or feature-flagged ordered WebSocket relay
 ```
 
-All puts await capacity. No text or audio is discarded. The queue bounds are
-memory and overload controls, not proof that a live speaker can be paused or
-that audience delay will remain below a fixed number of seconds.
+All puts await capacity. Once a sequence ID is allocated, no translated text
+or audio is discarded: every sequence must complete or make the session fail.
+The only intentional content suppression is the configured standalone
+hesitation-filler policy before ID allocation, and each suppression is counted
+in telemetry. The queue bounds are memory and overload controls, not proof
+that a live speaker can be paused or that audience delay will remain below a
+fixed number of seconds.
 
 The output queue reserves one additional control slot so `COMPLETE` or `ERROR`
 cannot deadlock behind its configured audio-segment capacity. Each TTS response
 chunk is capped at 256 KiB and one synthesized segment is capped at 60 seconds
 of configured PCM by default. The queue still counts atomic segments rather
-than playback seconds; browser audio-time bounds belong to the next milestone.
+than playback seconds; browser/Web Audio instrumentation measures playback
+backlog separately.
 
 Natural completion is an exact ordered drain:
 
@@ -108,9 +129,9 @@ STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
 STAGED_CLOSE_TIMEOUT_SECONDS=10
 ```
 
-`S2S_PIPELINE_MODE` is configuration groundwork only in this milestone. The
-browser route does not consume it yet, and remains monolithic regardless of
-that value. `staged_pipeline_smoke.py` explicitly constructs the staged path.
+`S2S_PIPELINE_MODE` now controls the browser backend path. It defaults to
+`monolithic`; `staged_pipeline_smoke.py` still constructs the staged path
+explicitly regardless of that value.
 
 ## Reproduce the live preflight
 
@@ -151,7 +172,7 @@ ffplay -f s16le -ar 16000 -ac 1 \
 Use `--fast` only for throughput testing. Audience-latency observations need
 real-time source pacing.
 
-## July 22, 2026 live result
+## July 22, 2026 one-minute standalone result
 
 The pinned containers were healthy on the 96 GB RTX PRO 6000 Blackwell Server
 Edition. The preflight used 60 seconds from `test_audio/test-1min.wav`, real-
@@ -179,17 +200,56 @@ EOU.
 This sample stayed caught up: it finished only 1.307 seconds after the input
 window, no bounded queue saturated, and NMT/TTS work overlapped without
 reordering. It establishes that the direct APIs and drain protocol work on the
-deployed profiles. It does not yet establish sample-length stability.
+deployed profiles. The later full-sample WebSocket canary established the
+first sample-length operational pass described below.
 
 The 0.840 duration ratio includes silence in the whole source WAV prefix. It is
 not an aligned utterance-only TTS expansion measurement and should not be
 compared directly with the Riva team's 6–10% Spanish expansion finding.
 
+## Full Sample 03 staged WebSocket canary
+
+The first full-length canary completed all 1,888.1045 seconds of *Long-form sample 03* at real-time input pace. It emitted, synthesized, dequeued, and
+successfully WebSocket-sent the same contiguous 646 sequence IDs, `0` through
+`645`. Six standalone fillers were intentionally suppressed before ID
+allocation. The staged integrity validator passed with one ordered natural
+completion, no PCM after completion, and no failure, cleanup error, incomplete
+ID, container restart, or GPU OOM.
+
+| Metric | Observed |
+|---|---:|
+| Source input | 1,888.1045 s |
+| First translated audio at client | 5.112942 s |
+| Output/source duration ratio | 1.016270617x |
+| Last-audio arrival after input ended | 0.849578 s |
+| Completed-terminal arrival after input | 1.743608 s |
+| Harness drain observation (poll/settle included) | 2.254558 s |
+| Fixed-rate arrival-replay playback tail | 64.037605 s |
+| Translated-audio sequences | 646, IDs 0–645 |
+| Standalone fillers suppressed before ID allocation | 6 |
+| Maximum NMT / TTS / output queue depth | 4 / 4 / 1 |
+| Blocked NMT / TTS / output puts | 15 / 0 / 0 |
+| Integrity, cleanup, WebSocket, container errors | none |
+
+The bounded queues behaved correctly, including NMT backpressure rather than
+drops when its four-item queue filled. Operational completion is separate from
+audience latency: the fixed-rate replay accumulated a 64.037605-second tail,
+so the long canary confirms the risk that Spanish playback can fall behind
+even while last-audio and completed-terminal arrival tails stay short.
+
+See [Sample 03 staged full-sample canary](LONG_FORM_03_STAGED_CANARY.md) for the
+failure investigations, corrective policies, and promotion record. The
+compressed [successful summary](results/staged-websocket/sample_03-attempt-3-success-summary-2026-07-22.json.gz),
+[client events](results/staged-websocket/sample_03-attempt-3-client-events-2026-07-22.csv.gz),
+[client log](results/staged-websocket/sample_03-attempt-3-client-log-2026-07-22.txt.gz),
+and [latency plot](results/staged-websocket/sample_03-attempt-3-latency-2026-07-22.png)
+are archived with the [SHA-256 manifest](results/staged-websocket/SHA256SUMS).
+
 ## Audience-delay interpretation
 
-First output in this sample arrived 5.109 seconds after the file began, but
-that is not the same as punchline delay. A listener hears a particular joke
-only after:
+First output arrived in roughly 5.1 seconds in both the short sample and full
+canary, but that is not the same as punchline delay. A listener hears a
+particular joke only after:
 
 ```text
 source phrase timing
@@ -198,27 +258,24 @@ source phrase timing
 + already queued Spanish playback
 ```
 
-The staged report measures the server-side components and atomic-audio queue.
-It does not yet measure browser playback backlog or align an English punchline
-with its Spanish rendition. The audience objective therefore remains a
-bounded playback queue of roughly 5–10 seconds, with 10 seconds treated as a
-soft ceiling rather than a guaranteed cap. A growing Spanish playback queue
-could still make laughter feel late as a sample continues even when the
-server's end-of-input tail is small.
+The staged report measures server-side components and an arrival-based
+fixed-rate replay, but not executed browser Web Audio playback or alignment of
+an English punchline with its Spanish rendition. The 64.038-second Sample 03
+replay tail demonstrates why the audience objective remains a bounded playback
+queue of roughly 5–10 seconds, with 10 seconds treated as a soft ceiling rather
+than a guaranteed cap. A growing Spanish playback queue could make laughter
+feel late as a sample continues even when the server's end-of-input arrival
+tail is under one second.
 
 ## Remaining work
 
-1. Add a staged WebSocket session and one ordered sender behind an explicit,
-   default-off feature flag.
-2. Preserve the existing `start_stream`, `end_input`, `stop_stream`, binary
-   PCM, status, and terminal semantics.
-3. Feed staged PCM into the browser's existing 1.00x/1.05x/1.10x controller
-   and record actual Web Audio queue seconds.
-4. Extend the batch runner to select the staged route and rerun Sample 01,
-   Sample 02, and Sample 03 end to end.
-5. Add synchronized marked-phrase/joke measurements; service tail alone does
+1. Run Sample 01 and Sample 02 through the same resumable staged batch harness;
+   Sample 03's operational gate is passed.
+2. Use the browser's existing 1.00x/1.05x/1.10x controller to record actual
+   Web Audio queue seconds.
+3. Add synchronized marked-phrase/joke measurements; service tail alone does
    not answer the audience-experience question.
-6. If the browser queue still grows, evaluate 1.05–1.10x playback/prosody with
+4. If the browser queue still grows, evaluate 1.05–1.10x playback/prosody with
    native Spanish listeners and document quality tradeoffs.
 
 The direct ASR input iterator itself is still unbounded. Bounds begin at the

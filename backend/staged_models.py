@@ -136,6 +136,7 @@ class TranslatedSegment:
     language: str
     started_monotonic_ms: float
     completed_monotonic_ms: float
+    source_override_applied: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.segment, TextSegment):
@@ -144,6 +145,8 @@ class TranslatedSegment:
             raise ValueError("translated text must contain non-whitespace content")
         if not self.language.strip():
             raise ValueError("translated language is required")
+        if not isinstance(self.source_override_applied, bool):
+            raise ValueError("source_override_applied must be a boolean")
         _validate_nonnegative_finite(
             "started_monotonic_ms", self.started_monotonic_ms
         )
@@ -169,6 +172,7 @@ class TranslatedSegment:
             "started_monotonic_ms": self.started_monotonic_ms,
             "completed_monotonic_ms": self.completed_monotonic_ms,
             "processing_duration_ms": self.processing_duration_ms,
+            "source_override_applied": self.source_override_applied,
         }
 
 

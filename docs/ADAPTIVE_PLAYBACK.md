@@ -22,11 +22,11 @@ The replay produced:
 
 | Saved trace | Fixed tail | Simulated adaptive tail | Adaptive queue p95 | Adaptive peak | Playback time over 10 s |
 |---|---:|---:|---:|---:|---:|
-| Sample 01 | 172.770 s | 27.183 s | 38.31 s | 46.54 s | 80.0% |
-| Sample 02 | 228.782 s | 40.206 s | 44.95 s | 53.11 s | 77.3% |
-| Sample 03 | 70.598 s | 16.613 s | 19.48 s | 23.81 s | 45.6% |
+| Sample 01 | 172.638 s | 27.051 s | 38.08 s | 46.54 s | 80.0% |
+| Sample 02 | 228.772 s | 40.195 s | 44.71 s | 53.11 s | 77.3% |
+| Sample 03 | 70.394 s | 16.408 s | 19.10 s | 23.81 s | 45.6% |
 
-Aggregate listener tail fell 82.2% in the replay. However, every trace still
+Aggregate listener tail fell 82.3% in the replay. However, every trace still
 missed the 10-second queue SLA by a wide margin and spent 83-93% of translated
 media at an accelerated rate. The replay therefore supports testing adaptive
 playback, but it does not support calling the queue bounded at 10 seconds. It
@@ -36,6 +36,11 @@ evaluation.
 Sanitized aggregate findings are retained in
 [`NEMOTRON_TEST_RESULTS.md`](../NEMOTRON_TEST_RESULTS.md). Generated reports and
 machine-readable details remain under ignored local result directories.
+
+The regenerated report uses the exact end of the final PCM source chunk when
+an older trace lacks an explicit `input_ended` event. The original July 8
+compact summaries used the start of that chunk; the analyzer retains those
+numbers only as explicitly labeled compatibility evidence.
 
 ## Policy
 

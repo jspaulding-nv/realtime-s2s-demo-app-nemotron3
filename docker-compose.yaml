@@ -13,7 +13,7 @@ services:
       NIM_GRPC_API_PORT: "50052"
       # English-only, low-memory streaming profile. Punctuation must also be
       # enabled by the ASR client request (enable_automatic_punctuation=true).
-      NIM_TAGS_SELECTOR: name=nemotron-asr-streaming,type=en-US,batch_size=32
+      NIM_TAGS_SELECTOR: ${ASR_NIM_TAGS_SELECTOR:-name=nemotron-asr-streaming,type=en-US,batch_size=32}
     ports:
       - "${ASR_HTTP_PORT:-9002}:9000"
       - "${ASR_GRPC_PORT:-50052}:50052"
@@ -40,7 +40,7 @@ services:
       NIM_HTTP_API_PORT: "9000"
       NIM_GRPC_API_PORT: "50053"
       # Smallest Magpie profile; supports streaming and Spanish (es-US).
-      NIM_TAGS_SELECTOR: name=magpie-tts-multilingual,batch_size=8
+      NIM_TAGS_SELECTOR: ${TTS_NIM_TAGS_SELECTOR:-name=magpie-tts-multilingual,batch_size=8}
     ports:
       - "${TTS_HTTP_PORT:-9003}:9000"
       - "${TTS_GRPC_PORT:-50053}:50053"

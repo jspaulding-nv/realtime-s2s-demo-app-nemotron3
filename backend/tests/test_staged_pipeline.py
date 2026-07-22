@@ -8,6 +8,7 @@ from config import StagedPipelineConfig
 from staged_models import (
     ASRStreamEvent,
     ASRStreamEventKind,
+    ASRTranscript,
     AsrFinal,
     EmissionReason,
     StagedOutputEvent,
@@ -273,6 +274,79 @@ async def test_ordered_natural_drain_flushes_residual_and_overlaps_nmt_tts():
 
 
 @pytest.mark.asyncio
+async def test_filler_discard_preserves_pipeline_order_and_summary_evidence():
+    nmt = FakeNMTClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [final(0, "It moves from. uh. from something..."), COMPLETE]
+        ),
+        nmt_client=nmt,
+        tts_client=FakeTTSClient(),
+        config=config(),
+        session_id="filler-order",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    audio = [event.segment for event in outputs[:-1]]
+    assert [segment.sequence_id for segment in audio] == [0, 1]
+    assert [segment.translation.segment.text for segment in audio] == [
+        "It moves from.",
+        "from something...",
+    ]
+    assert nmt.sequences == [0, 1]
+    segmenter_events = [
+        event for event in session.telemetry if event.stage == "segmenter"
+    ]
+    assert [(event.event, event.sequence_id) for event in segmenter_events] == [
+        ("emitted", 0),
+        ("filler_discarded", None),
+        ("emitted", 1),
+    ]
+    discard = segmenter_events[1]
+    assert discard.text_chars == len("uh.")
+    assert discard.asr_final_id == 0
+    assert discard.contributing_final_ids == (0,)
+    assert "text" not in discard.to_dict()
+    summary = session.summary()
+    assert summary["fillers_discarded"] == 1
+    assert summary["segments_emitted"] == 2
+    assert summary["completed_sequence_ids"] == [0, 1]
+    assert summary["incomplete_sequence_ids"] == []
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_filler_only_session_completes_without_calling_nmt_or_tts():
+    nmt = FakeNMTClient()
+    tts = FakeTTSClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, '“Hmm.”'), COMPLETE]),
+        nmt_client=nmt,
+        tts_client=tts,
+        config=config(),
+        session_id="filler-only",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [event.kind for event in outputs] == [StagedOutputEventKind.COMPLETE]
+    assert nmt.sequences == []
+    assert tts.sequences == []
+    summary = session.summary()
+    assert summary["fillers_discarded"] == 1
+    assert summary["segments_emitted"] == 0
+    assert summary["audio_segments_produced"] == 0
+    assert summary["completed_sequence_ids"] == []
+    assert summary["incomplete_sequence_ids"] == []
+    await session.aclose()
+
+
+@pytest.mark.asyncio
 async def test_bounded_output_backpressure_preserves_every_segment():
     events = [final(index, f"Sentence {index}.") for index in range(8)] + [COMPLETE]
     session = StagedPipelineSession(
@@ -364,6 +438,55 @@ async def test_unpunctuated_final_emits_on_age_without_another_asr_event():
     assert outputs[0].segment.translation.segment.text == "Aged residual"
     assert outputs[0].segment.translation.segment.reason.value == "age"
     assert outputs[-1].kind is StagedOutputEventKind.COMPLETE
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_asr_consumer_normalizes_queued_final_capture_time():
+    captured_ms = 180_110_061.943155
+    observed_ms = 180_110_062.075487
+    events = [
+        ASRStreamEvent(
+            kind=ASRStreamEventKind.INTERIM,
+            transcript=ASRTranscript(
+                text="long interim hypothesis",
+                is_final=False,
+                received_monotonic_ms=180_109_747.916788,
+                source_end_ms=68_960.0601196289,
+            ),
+        ),
+        ASRStreamEvent(
+            kind=ASRStreamEventKind.FINAL,
+            final=AsrFinal(
+                final_id=17,
+                text="A queued final.",
+                received_monotonic_ms=captured_ms,
+                source_start_ms=60_800,
+                source_end_ms=68_080,
+            ),
+        ),
+        COMPLETE,
+    ]
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(events),
+        nmt_client=FakeNMTClient(),
+        tts_client=FakeTTSClient(),
+        config=config(),
+        session_id="queued-final-clock-normalization",
+        clock_ms=lambda: observed_ms,
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert outputs[-1].kind is StagedOutputEventKind.COMPLETE
+    source = outputs[0].segment.translation.segment
+    assert source.buffered_since_monotonic_ms == captured_ms
+    assert source.emitted_monotonic_ms == observed_ms
+    assert source.source_start_ms == 60_800
+    assert source.source_end_ms == 68_080
+    assert session.summary()["failure"] is None
     await session.aclose()
 
 

@@ -4,7 +4,17 @@ import math
 import re
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Callable,
+    Deque,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from staged_models import AsrFinal, EmissionReason, TextSegment
 
@@ -34,6 +44,14 @@ NO_SPACE_BEFORE = TERMINAL_PUNCTUATION.union(CLOSING_PUNCTUATION).union(
     frozenset(",;:%")
 )
 NO_SPACE_AFTER = frozenset("“‘«([{/-")
+HESITATION_FILLERS = frozenset({"uh", "um", "er", "erm", "hmm"})
+FILLER_QUOTES = '"\'\u201c\u201d\u2018\u2019«»'
+_ISOLATED_FILLER = re.compile(
+    rf"^[{re.escape(FILLER_QUOTES)}]*"
+    rf"(?:{'|'.join(sorted(HESITATION_FILLERS, key=len, reverse=True))})"
+    rf"(?:[{re.escape(''.join(TERMINAL_PUNCTUATION))}{re.escape(FILLER_QUOTES)}])*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -43,6 +61,20 @@ class _BufferedPiece:
     received_monotonic_ms: float
     source_start_ms: Optional[float]
     source_end_ms: Optional[float]
+
+
+@dataclass(frozen=True)
+class FillerDiscard:
+    """Non-text telemetry for one suppressed standalone hesitation filler."""
+
+    text_chars: int
+    discarded_monotonic_ms: float
+    source_start_ms: Optional[float]
+    source_end_ms: Optional[float]
+    contributing_final_ids: Tuple[int, ...]
+
+
+SegmenterOutcome = Union[TextSegment, FillerDiscard]
 
 
 class PunctuationSegmenter:
@@ -58,6 +90,7 @@ class PunctuationSegmenter:
         max_chars: int = 240,
         max_age_ms: float = 2_000,
         abbreviations: Optional[Iterable[str]] = None,
+        outcome_sink: Optional[Callable[[SegmenterOutcome], None]] = None,
     ) -> None:
         if (
             not isinstance(max_chars, int)
@@ -69,6 +102,8 @@ class PunctuationSegmenter:
             raise ValueError("max_age_ms must be finite")
         if max_age_ms <= 0:
             raise ValueError("max_age_ms must be positive")
+        if outcome_sink is not None and not callable(outcome_sink):
+            raise ValueError("outcome_sink must be callable")
 
         configured = set(DEFAULT_ABBREVIATIONS)
         if abbreviations is not None:
@@ -77,6 +112,7 @@ class PunctuationSegmenter:
         self.max_chars = max_chars
         self.max_age_ms = float(max_age_ms)
         self.abbreviations: Set[str] = configured
+        self._outcome_sink = outcome_sink
         self._pieces: Deque[_BufferedPiece] = deque()
         self._next_sequence_id = 0
         self._last_final_id: Optional[int] = None
@@ -95,18 +131,36 @@ class PunctuationSegmenter:
     def closed(self) -> bool:
         return self._closed
 
-    def push_final(self, final: AsrFinal) -> List[TextSegment]:
-        """Append one finalized ASR fragment and emit every due segment."""
+    def push_final(
+        self,
+        final: AsrFinal,
+        *,
+        observed_monotonic_ms: Optional[float] = None,
+    ) -> List[TextSegment]:
+        """Append one finalized ASR fragment and emit every due segment.
+
+        ``final.received_monotonic_ms`` is the capture time in the blocking ASR
+        worker.  A queued final can reach the asyncio consumer just after that
+        consumer has performed an age check with its newer clock.  Callers that
+        cross that boundary should pass the consumer observation time here.
+        The original capture time remains attached to the buffered text, while
+        ordering and emission use the normalized consumer observation.
+        """
         if self._closed:
             raise RuntimeError("cannot push an ASR final after segmenter flush")
         if self._last_final_id is not None and final.final_id <= self._last_final_id:
             raise ValueError("ASR final IDs must be strictly increasing")
-        self._observe_time(final.received_monotonic_ms)
+        observed_ms = (
+            final.received_monotonic_ms
+            if observed_monotonic_ms is None
+            else observed_monotonic_ms
+        )
+        self._observe_time(observed_ms)
         self._last_final_id = final.final_id
 
         text = final.text.strip()
         if not text:
-            return self._drain(final.received_monotonic_ms, include_age=True)
+            return self._drain(observed_ms, include_age=True)
 
         separator = self._separator_before(text)
         self._pieces.append(
@@ -118,7 +172,7 @@ class PunctuationSegmenter:
                 source_end_ms=final.source_end_ms,
             )
         )
-        return self._drain(final.received_monotonic_ms, include_age=True)
+        return self._drain(observed_ms, include_age=True)
 
     def emit_due(self, now_monotonic_ms: float) -> List[TextSegment]:
         """Emit an aged residual even when ASR has produced no new final."""
@@ -134,7 +188,11 @@ class PunctuationSegmenter:
         self._observe_time(now_monotonic_ms)
         emitted = self._drain(now_monotonic_ms, include_age=False)
         if self.residual_text:
-            emitted.append(self._emit(len(self._buffer()), EmissionReason.FINAL_FLUSH, now_monotonic_ms))
+            segment = self._emit(
+                len(self._buffer()), EmissionReason.FINAL_FLUSH, now_monotonic_ms
+            )
+            if segment is not None:
+                emitted.append(segment)
         self._closed = True
         return emitted
 
@@ -208,21 +266,35 @@ class PunctuationSegmenter:
             buffer = self._buffer()
             boundary = self._first_terminal_boundary(buffer)
             if boundary is not None and boundary <= self.max_chars:
-                emitted.append(self._emit(boundary, EmissionReason.PUNCTUATION, now_ms))
+                segment = self._emit(
+                    boundary, EmissionReason.PUNCTUATION, now_ms
+                )
+                if segment is not None:
+                    emitted.append(segment)
                 continue
             if len(buffer) >= self.max_chars:
                 cut = self._length_cut(buffer)
-                emitted.append(self._emit(cut, EmissionReason.LENGTH, now_ms))
+                segment = self._emit(cut, EmissionReason.LENGTH, now_ms)
+                if segment is not None:
+                    emitted.append(segment)
                 continue
             if boundary is not None:
-                emitted.append(self._emit(boundary, EmissionReason.PUNCTUATION, now_ms))
+                segment = self._emit(
+                    boundary, EmissionReason.PUNCTUATION, now_ms
+                )
+                if segment is not None:
+                    emitted.append(segment)
                 continue
             break
 
         if include_age and self.residual_text:
             oldest = self._oldest_buffered_ms()
             if oldest is not None and now_ms - oldest >= self.max_age_ms:
-                emitted.append(self._emit(len(self._buffer()), EmissionReason.AGE, now_ms))
+                segment = self._emit(
+                    len(self._buffer()), EmissionReason.AGE, now_ms
+                )
+                if segment is not None:
+                    emitted.append(segment)
         return emitted
 
     def _first_terminal_boundary(self, text: str) -> Optional[int]:
@@ -282,12 +354,43 @@ class PunctuationSegmenter:
         cut: int,
         reason: EmissionReason,
         now_ms: float,
-    ) -> TextSegment:
+    ) -> Optional[TextSegment]:
         raw, contributing = self._consume_prefix(cut)
         text = raw.strip()
         if not text:
             raise RuntimeError("segmenter attempted to emit an empty segment")
 
+        source_start_ms, source_end_ms, final_ids = self._provenance(contributing)
+        if _is_isolated_hesitation_filler(text):
+            discard = FillerDiscard(
+                text_chars=len(text),
+                discarded_monotonic_ms=now_ms,
+                source_start_ms=source_start_ms,
+                source_end_ms=source_end_ms,
+                contributing_final_ids=final_ids,
+            )
+            self._publish_outcome(discard)
+            return None
+
+        buffered_since = min(piece.received_monotonic_ms for piece in contributing)
+        segment = TextSegment(
+            sequence_id=self._next_sequence_id,
+            text=text,
+            reason=reason,
+            emitted_monotonic_ms=now_ms,
+            buffered_since_monotonic_ms=buffered_since,
+            source_start_ms=source_start_ms,
+            source_end_ms=source_end_ms,
+            contributing_final_ids=final_ids,
+        )
+        self._next_sequence_id += 1
+        self._publish_outcome(segment)
+        return segment
+
+    @staticmethod
+    def _provenance(
+        contributing: Sequence[_BufferedPiece],
+    ) -> Tuple[Optional[float], Optional[float], Tuple[int, ...]]:
         starts = [
             piece.source_start_ms
             for piece in contributing
@@ -298,7 +401,6 @@ class PunctuationSegmenter:
             for piece in contributing
             if piece.source_end_ms is not None
         ]
-        buffered_since = min(piece.received_monotonic_ms for piece in contributing)
         final_ids = tuple(dict.fromkeys(piece.final_id for piece in contributing))
         # A combined envelope is complete at an endpoint only when every
         # contributing piece supplied that endpoint. Never make partial timing
@@ -316,19 +418,11 @@ class PunctuationSegmenter:
             # text/provenance and report the aggregate source range as unknown.
             source_start_ms = None
             source_end_ms = None
+        return source_start_ms, source_end_ms, final_ids
 
-        segment = TextSegment(
-            sequence_id=self._next_sequence_id,
-            text=text,
-            reason=reason,
-            emitted_monotonic_ms=now_ms,
-            buffered_since_monotonic_ms=buffered_since,
-            source_start_ms=source_start_ms,
-            source_end_ms=source_end_ms,
-            contributing_final_ids=final_ids,
-        )
-        self._next_sequence_id += 1
-        return segment
+    def _publish_outcome(self, outcome: SegmenterOutcome) -> None:
+        if self._outcome_sink is not None:
+            self._outcome_sink(outcome)
 
     def _consume_prefix(self, count: int) -> Tuple[str, Sequence[_BufferedPiece]]:
         if count <= 0 or count > len(self._buffer()):
@@ -383,3 +477,8 @@ def _normalize_abbreviation(value: str) -> str:
     if not normalized.endswith("."):
         normalized += "."
     return normalized
+
+
+def _is_isolated_hesitation_filler(text: str) -> bool:
+    """Match only an exact known filler plus terminal punctuation/quotes."""
+    return _ISOLATED_FILLER.fullmatch(text.strip()) is not None

@@ -12,8 +12,11 @@ import {
   summarizePlaybackQueue,
   type PlaybackQueueSample,
 } from '../utils/playbackPolicy';
+import type { SessionStatus } from '../types/messages';
 
-type TestPhase = 'idle' | 'running' | 'draining' | 'completed';
+type TestPhase = 'idle' | 'running' | 'draining' | 'completed' | 'failed';
+type FinishedPhase = Extract<TestPhase, 'completed' | 'failed'>;
+type ServerTerminalState = 'pending' | 'completed' | 'error';
 
 const DRAIN_MIN_SEC = 10;
 const DRAIN_IDLE_SEC = 5;
@@ -22,6 +25,7 @@ const PLAYBACK_DRAIN_EPSILON_SEC = 0.1;
 
 export function TestDashboard() {
   const [phase, setPhase] = useState<TestPhase>('idle');
+  const [failureMessage, setFailureMessage] = useState('');
   const [adaptivePlaybackEnabled, setAdaptivePlaybackEnabled] = useState(true);
   const [driftData, setDriftData] = useState<DriftDataPoint[]>([]);
   const [drainCountdown, setDrainCountdown] = useState(DRAIN_IDLE_SEC);
@@ -46,6 +50,8 @@ export function TestDashboard() {
   const lastReceiveChangeRef = useRef(0);
   const drainStartTimeRef = useRef(0);
   const phaseRef = useRef<TestPhase>('idle');
+  const serverTerminalStateRef = useRef<ServerTerminalState>('pending');
+  const finishStartedRef = useRef(false);
   const driftDataRef = useRef<DriftDataPoint[]>([]);
   const queueSamplesRef = useRef<PlaybackQueueSample[]>([]);
 
@@ -86,6 +92,10 @@ export function TestDashboard() {
   // Store stable function refs to avoid closure issues
   const wsRef = useRef<ReturnType<typeof useWebSocket>>(null!);
   const fileSourceRef = useRef<ReturnType<typeof useFileAudioSource>>(null!);
+  const finishTestRef = useRef<(
+    finishedPhase?: FinishedPhase,
+    message?: string,
+  ) => Promise<void>>(null!);
 
   // Chunk counter for logging (doesn't need to trigger re-renders)
   const chunkLogCountRef = useRef(0);
@@ -94,6 +104,34 @@ export function TestDashboard() {
   // WebSocket for audio transport
   const ws = useWebSocket({
     url: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/translate`,
+    onStatus: (status: SessionStatus, message: string) => {
+      if (
+        status === 'completed'
+        && serverTerminalStateRef.current === 'pending'
+      ) {
+        serverTerminalStateRef.current = 'completed';
+      } else if (
+        status === 'error'
+        && serverTerminalStateRef.current === 'pending'
+      ) {
+        serverTerminalStateRef.current = 'error';
+        if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
+          fileSourceRef.current?.stopStreaming();
+          void finishTestRef.current?.(
+            'failed',
+            message || 'Riva reported a translation error.',
+          );
+        }
+      }
+    },
+    onError: (message: string) => {
+      if (serverTerminalStateRef.current !== 'pending') return;
+      serverTerminalStateRef.current = 'error';
+      if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
+        fileSourceRef.current?.stopStreaming();
+        void finishTestRef.current?.('failed', message);
+      }
+    },
     onAudio: (audio: ArrayBuffer) => {
       audioLogCountRef.current += 1;
       if (audioLogCountRef.current <= 5 || audioLogCountRef.current % 50 === 0) {
@@ -213,10 +251,31 @@ export function TestDashboard() {
     lastReceiveChangeRef.current = performance.now();
     chunkLogCountRef.current = 0;
     audioLogCountRef.current = 0;
+    serverTerminalStateRef.current = 'pending';
+    finishStartedRef.current = false;
+    setFailureMessage('');
     setDrainCountdown(DRAIN_IDLE_SEC);
 
     console.log('[TestDashboard] Calling /api/test/start...');
-    await fetch('/api/test/start', { method: 'POST' });
+    try {
+      const response = await fetch('/api/test/start', { method: 'POST' });
+      if (!response.ok) {
+        let detail = `Backend returned HTTP ${response.status}.`;
+        try {
+          const payload = await response.json() as { detail?: string };
+          if (payload.detail) detail = payload.detail;
+        } catch {
+          // Preserve the HTTP fallback when the response is not JSON.
+        }
+        setFailureMessage(detail);
+        return;
+      }
+    } catch (error) {
+      setFailureMessage(
+        error instanceof Error ? error.message : 'Backend test setup failed.',
+      );
+      return;
+    }
     console.log('[TestDashboard] /api/test/start returned');
 
     metrics.connect();
@@ -262,9 +321,13 @@ export function TestDashboard() {
     }
   }, [phase, updateDriftData]);
 
-  // -- Finish: disconnect everything, move to completed --
-  const finishTestRef = useRef<(() => Promise<void>) | null>(null);
-  const finishTest = useCallback(async () => {
+  // -- Finish: disconnect everything and preserve either terminal outcome --
+  const finishTest = useCallback(async (
+    finishedPhase: FinishedPhase = 'completed',
+    message = '',
+  ) => {
+    if (finishStartedRef.current) return;
+    finishStartedRef.current = true;
     console.log('[TestDashboard] finishTest called');
     wsRef.current.sendMessage({ type: 'stop_stream' });
     wsRef.current.disconnect();
@@ -274,24 +337,30 @@ export function TestDashboard() {
     inputPlaybackRef.current.stop();
     outputPlaybackRef.current.stop();
 
-    await fetch('/api/test/stop', { method: 'POST' });
-    if (driftUpdateTimerRef.current) {
-      clearInterval(driftUpdateTimerRef.current);
-      driftUpdateTimerRef.current = null;
+    try {
+      await fetch('/api/test/stop', { method: 'POST' });
+    } catch (error) {
+      console.error('[TestDashboard] Failed to stop timing capture:', error);
+    } finally {
+      if (driftUpdateTimerRef.current) {
+        clearInterval(driftUpdateTimerRef.current);
+        driftUpdateTimerRef.current = null;
+      }
+      setFailureMessage(finishedPhase === 'failed' ? message : '');
+      setPhase(finishedPhase);
     }
-    setPhase('completed');
   }, [metrics]);
 
   useEffect(() => {
     finishTestRef.current = finishTest;
   }, [finishTest]);
 
-  // -- Draining: require both network quiet and an empty playback queue --
+  // -- Draining: require the server terminal event, network quiet, and an empty queue --
   useEffect(() => {
     if (phase !== 'draining') return;
 
     console.log(
-      '[TestDashboard] Draining phase started; waiting for network and playback queue',
+      '[TestDashboard] Draining phase started; waiting for server completion, network, and playback queue',
     );
     const checkInterval = setInterval(() => {
       const drainElapsedSec = (
@@ -308,19 +377,23 @@ export function TestDashboard() {
       setDrainCountdown(remaining);
 
       const fullyDrained =
-        drainElapsedSec >= DRAIN_MIN_SEC
+        serverTerminalStateRef.current === 'completed'
+        && drainElapsedSec >= DRAIN_MIN_SEC
         && silenceSec >= DRAIN_IDLE_SEC
         && queueDepthSec <= PLAYBACK_DRAIN_EPSILON_SEC;
       const timedOut = drainElapsedSec >= DRAIN_MAX_SEC;
 
-      if (fullyDrained || timedOut) {
-        console.log(
-          fullyDrained
-            ? '[TestDashboard] Network and playback queue drained'
-            : '[TestDashboard] Maximum drain time reached',
-        );
+      if (fullyDrained) {
+        console.log('[TestDashboard] Server completed and playback queue drained');
         clearInterval(checkInterval);
         finishTestRef.current?.();
+      } else if (timedOut) {
+        const message = serverTerminalStateRef.current === 'completed'
+          ? 'Timed out waiting for the translated playback queue to drain.'
+          : 'Timed out waiting for Riva to confirm translation completion.';
+        console.error(`[TestDashboard] ${message}`);
+        clearInterval(checkInterval);
+        finishTestRef.current?.('failed', message);
       }
     }, 1000);
 
@@ -417,7 +490,7 @@ export function TestDashboard() {
               </button>
             )}
 
-            {phase === 'completed' && (
+            {(phase === 'completed' || phase === 'failed') && (
               <div className="flex gap-2">
                 <button
                   onClick={handleExport}
@@ -434,6 +507,16 @@ export function TestDashboard() {
               </div>
             )}
           </div>
+
+          {failureMessage && (phase === 'failed' || phase === 'idle') && (
+            <div
+              role="alert"
+              className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm"
+            >
+              {phase === 'failed' ? 'Test failed' : 'Could not start test'}:{' '}
+              {failureMessage}
+            </div>
+          )}
 
           <label className="mt-4 flex items-start gap-2 text-sm text-gray-700">
             <input
@@ -504,8 +587,8 @@ export function TestDashboard() {
           {phase === 'draining' && (
             <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
               <p className="text-amber-700 text-sm">
-                File input ended. Waiting for Riva output and the listener queue
-                to drain. Network-idle countdown:{' '}
+                File input ended. Waiting for Riva to confirm completion and for
+                the listener queue to drain. Network-idle countdown:{' '}
                 <span className="font-mono font-bold">{drainCountdown}s</span>;
                 playback queue:{' '}
                 <span className="font-mono font-bold">
@@ -517,7 +600,7 @@ export function TestDashboard() {
         </div>
 
         {/* Drift Chart */}
-        {(phase === 'running' || phase === 'draining' || phase === 'completed') && (
+        {(phase === 'running' || phase === 'draining' || phase === 'completed' || phase === 'failed') && (
           <div className="bg-white rounded-2xl shadow-xl p-6">
             <h2 className="text-lg font-semibold text-gray-800 mb-4">
               Legacy Duration Drift Over Time
@@ -527,7 +610,7 @@ export function TestDashboard() {
         )}
 
         {/* Stats Panel */}
-        {(phase === 'running' || phase === 'draining' || phase === 'completed') && (
+        {(phase === 'running' || phase === 'draining' || phase === 'completed' || phase === 'failed') && (
           <div className="bg-white rounded-2xl shadow-xl p-6">
             <h2 className="text-lg font-semibold text-gray-800 mb-1">
               Audience Playback Statistics
