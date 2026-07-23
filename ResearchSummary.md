@@ -141,7 +141,8 @@ The Test Dashboard (`frontend/src/components/TestDashboard.tsx`) provides:
 - CSV export of all timing events (client + backend)
 - Automatic drain detection (stops after 30s of silence)
 
-Consent-cleared audio stays local and ignored. The default neutral fixtures are
-`test_audio/preflight.wav`, `test_audio/long-form-01.mp3` through
-`long-form-03.mp3`, and `test_audio/long-form-03-30min.wav`. See
-`test_audio/README.md`; `S2S_TEST_AUDIO_DIR` can select an external directory.
+The upstream-published evaluation audio is bundled byte-for-byte under the
+neutral filenames `test_audio/preflight.wav`, `test_audio/long-form-01.mp3`
+through `long-form-03.mp3`, and `test_audio/long-form-03-30min.wav`. See
+`test_audio/README.md`; `S2S_TEST_AUDIO_DIR` can select a private directory of
+alternate consent-cleared inputs.

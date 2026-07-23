@@ -6,9 +6,11 @@ This repository preserves [@jgough-essextec's original demo](https://github.com/
 
 GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains the sanitized upstream history as a standalone repository and records that project as the upstream source.
 
-Recorded inputs and raw runtime captures are intentionally excluded from Git.
+The five upstream-published source recordings are bundled byte-for-byte under
+neutral filenames so a fresh clone can reproduce the evaluation. Generated
+audio and raw runtime captures remain excluded from Git.
 See the [sanitization policy](docs/SANITIZATION.md) and
-[local-audio instructions](test_audio/README.md) before running evaluations.
+[audio-fixture instructions](test_audio/README.md) before running evaluations.
 
 ## What Changed
 
@@ -49,7 +51,7 @@ realtime-s2s-demo-app/
 ├── docker-compose.yaml     # Pinned Nemotron ASR, NMT, and TTS services
 ├── .env.example            # Compose and application configuration template
 ├── NEMOTRON_TEST_RESULTS.md
-├── test_audio/README.md     # Local-only, ignored evaluation fixtures
+├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/SANITIZATION.md     # Public-data and evidence policy
 ├── backend/
 │   ├── main.py              # FastAPI app + WebSocket endpoint
@@ -115,10 +117,17 @@ printf '%s' "$NGC_API_KEY" | \
 
 Never commit `.env`. If login returns `unauthorized`, confirm the key is active, unexpired, and includes the NGC Catalog service.
 
-Place consent-cleared evaluation fixtures under `test_audio/` using the neutral
-names documented in `test_audio/README.md`, or set `S2S_TEST_AUDIO_DIR` to a
-private directory outside the repository. Audio and raw result directories are
-ignored and must not be force-added.
+The repository includes the five evaluation fixtures documented in
+`test_audio/README.md`. Verify their exact bytes before a comparison run:
+
+```bash
+(cd test_audio && sha256sum --check SHA256SUMS)
+```
+
+To use different consent-cleared inputs, set `S2S_TEST_AUDIO_DIR` to a private
+directory containing the same neutral filenames. Additional recordings,
+generated audio, and raw result directories remain ignored and must not be
+force-added.
 
 ### 2. Start the pinned Riva services
 
@@ -302,10 +311,11 @@ python batch_latency_test.py \
   --output-dir test_results_nemotron
 ```
 
-Generated event CSVs, plots, logs, and audio stay ignored because they can
-contain identifying metadata in addition to being large. Sanitized aggregate
-interpretation and comparison with @jgough-essextec's earlier runs are in
-`NEMOTRON_TEST_RESULTS.md`.
+Generated event CSVs, plots, logs, and derived audio stay ignored because they
+can contain identifying metadata in addition to being large. The five bundled
+source fixtures are the explicit exception described in
+`test_audio/README.md`. Sanitized aggregate interpretation and comparison with
+@jgough-essextec's earlier runs are in `NEMOTRON_TEST_RESULTS.md`.
 
 For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so the next architecture should cap the playback queue at roughly 5-10 seconds and evaluate adaptive playback/prosody speeds around 1.05x-1.10x.
 

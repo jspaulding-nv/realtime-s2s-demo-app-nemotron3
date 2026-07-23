@@ -51,6 +51,12 @@ htmlcov/
 .pytest_cache/
 test_audio/*
 !test_audio/README.md
+!test_audio/SHA256SUMS
+!test_audio/preflight.wav
+!test_audio/long-form-01.mp3
+!test_audio/long-form-02.mp3
+!test_audio/long-form-03.mp3
+!test_audio/long-form-03-30min.wav
 test_results/
 test_results_2/
 test_results_3/

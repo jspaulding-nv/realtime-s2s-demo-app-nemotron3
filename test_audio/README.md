@@ -1,11 +1,21 @@
-# Local evaluation audio
+# Bundled evaluation audio
 
-Audio fixtures are intentionally excluded from Git because recordings and
-embedded media metadata can identify speakers, organizations, or source
-material. Use only consent-cleared inputs and keep them outside public history.
+The five source fixtures in this directory are byte-for-byte copies of the
+recordings published by the upstream project. They are tracked intentionally so
+a fresh clone can reproduce the same evaluation inputs.
 
-The evaluation tools look in this directory by default, or in the directory
-selected by `S2S_TEST_AUDIO_DIR`. The neutral local filenames are:
+The filenames are neutral, but the recordings and their embedded metadata are
+unchanged. Do not treat the media payloads as anonymized.
+
+Verify the fixtures before a comparison run:
+
+```bash
+sha256sum --check SHA256SUMS
+```
+
+The evaluation tools look in this directory by default. To use alternate
+consent-cleared inputs without changing the repository, set
+`S2S_TEST_AUDIO_DIR` to a private directory containing:
 
 - `preflight.wav`
 - `long-form-01.mp3`
@@ -13,4 +23,5 @@ selected by `S2S_TEST_AUDIO_DIR`. The neutral local filenames are:
 - `long-form-03.mp3`
 - `long-form-03-30min.wav`
 
-Every file except this README is ignored. Do not force-add audio files.
+Additional recordings and all generated audio remain ignored. Do not force-add
+them.
