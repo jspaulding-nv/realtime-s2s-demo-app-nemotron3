@@ -21,7 +21,7 @@ direct path through the existing `/ws/translate` protocol.
 
 | Component | Contract |
 |---|---|
-| `backend/direct_nmt_client.py` | One source segment per RPC, explicit deadline, exact-one/nonempty output, narrow `OK`/`Okay`/`Amen` source overrides, Spanish target-text validation, no retries |
+| `backend/direct_nmt_client.py` | One source segment per RPC, explicit deadline, exact-one/nonempty output, narrow known-short-utterance overrides, Spanish target-text validation, and one guarded punctuation-normalized recovery |
 | `backend/direct_tts_client.py` | Spanish voice lookup, defensive pre-TTS target-text validation, 16 kHz mono Int16 PCM, full-segment atomic buffering, first-audio/completion timing, active-call cancellation, no retries |
 | `backend/staged_pipeline.py` | One ASR consumer, one NMT worker, one TTS worker, bounded queues, ordered drain, first-failure ownership, per-stage telemetry |
 | `staged_pipeline_smoke.py` | Real-time WAV feed, direct three-service run, raw PCM output, JSON report, and an overall terminal deadline |
@@ -33,8 +33,9 @@ while TTS synthesizes segment `n`.
 TTS output is atomic per segment. Although Magpie streams response chunks, the
 adapter publishes only after the RPC has completed and every nonempty chunk
 has been validated. A failed request therefore cannot leak partial audio and
-then duplicate it during a later attempt. The current milestone performs zero
-retries.
+then duplicate it during a later attempt. TTS performs zero retries. NMT has
+only the narrow, source-normalizing recovery described below; it never repeats
+an unchanged request.
 
 ## Pinned services
 
@@ -53,16 +54,32 @@ return fluent-looking output for an empty or whitespace-only request. Blank
 segments are rejected before the RPC, and NMT output must contain exactly one
 nonempty `es-US` translation before it can reach TTS.
 
-The full-sample canary exposed a second content boundary. Isolated hesitation
-fillers such as `uh.` are suppressed by the segmenter before a sequence ID is
-allocated, and the discard is recorded in privacy-safe telemetry. Narrow,
-deterministic Spanish overrides cover standalone `OK`/`Okay` and `Amen`, whose
-pinned-model outputs were observed to use the wrong script. All other NMT
-output is normalized and validated immediately after NMT and again before TTS:
-Spanish must contain at least one letter or digit, every letter must be Latin
-script, and control/format characters, symbols, and detached marks are
-rejected. Invalid output fails closed. An unchanged NMT or TTS request is
-never blindly retried.
+The full-sample canary exposed a second content boundary. Configured isolated
+hesitation fillers are suppressed by the segmenter before a sequence ID is
+allocated, and each discard is recorded in privacy-safe telemetry. A small,
+deterministic allowlist handles known standalone expressions whose
+pinned-model outputs used the wrong script.
+
+All other NMT output is normalized and validated immediately after NMT and
+again before TTS: Spanish must contain at least one letter or digit, every
+letter must be Latin script, and control/format characters, symbols, and
+detached marks are rejected. Invalid output fails closed.
+
+A later controlled replay isolated another pinned NMT `1.5.2` boundary: a
+single short ASCII token followed by terminal punctuation produced invalid
+wrong-script text in 5/5 isolated requests, while removing only the terminal
+punctuation passed validation in 5/5 requests. Neighboring context also passed
+in 5/5 requests for each tested context shape. The adapter therefore permits
+exactly one punctuation-removed request only after
+`TargetTextValidationError`, only for exact `es-US`, and only for 1-32 ASCII
+letters followed by one `.`, `?`, or `!`. It retains the original segment,
+sequence ID, and provenance, revalidates the second output, and still sends
+nothing to TTS unless validation succeeds. RPC, cardinality, language,
+ineligible-input, and second-attempt failures are not retried. See
+[Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
+A recovered completion records `retry_count=1` on its NMT event; the normal
+path records zero, and the session summary's `nmt_retry_count` must equal the
+sum across completed NMT events.
 
 ## Data flow and bounds
 
@@ -216,6 +233,10 @@ allocation. The staged integrity validator passed with one ordered natural
 completion, no PCM after completion, and no failure, cleanup error, incomplete
 ID, container restart, or GPU OOM.
 
+This is preserved historical evidence. It predates the narrow NMT recovery,
+closed-export settling, and allowlisted failed-capture retention, so the
+current code requires a fresh preflight and sample matrix.
+
 | Metric | Observed |
 |---|---:|
 | Source input | 1,888.1045 s |
@@ -266,8 +287,9 @@ tail is under one second.
 
 ## Remaining work
 
-1. Run Sample 01 and Sample 02 through the same resumable staged batch harness;
-   Sample 03's operational gate is passed.
+1. Run a fresh staged WebSocket preflight, then Sample 02, then all three
+   samples from one clean provenance-frozen commit; Sample 03's earlier
+   operational gate remains historical evidence.
 2. Use the browser's existing 1.00x/1.05x/1.10x controller to record actual
    Web Audio queue seconds.
 3. Add synchronized marked-phrase/joke measurements; service tail alone does

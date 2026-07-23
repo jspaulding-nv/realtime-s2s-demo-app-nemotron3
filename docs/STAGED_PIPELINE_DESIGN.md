@@ -12,6 +12,8 @@ direct NMT/TTS adapters, bounded overlapping workers, ordered drain, and a
 successful one-minute live preflight; see
 [Bounded staged NMT and TTS pipeline](STAGED_NMT_TTS_PIPELINE.md) and
 [feature-flagged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+The later, fail-closed short-segment recovery is specified separately in
+[Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
 
 The first full staged sample canary is also complete. Sample 03 attempt 3
 processed all 1,888.1045 seconds, delivered 646 consecutive ordered sequence
@@ -162,9 +164,8 @@ finals, Unicode punctuation, and end-of-input residuals.
 ## NMT-to-TTS content safety
 
 The staged path applies narrow deterministic `es-US` source overrides only to
-standalone `OK`/`Okay` and `Amen` variants, preserving supported punctuation
-and matched quote wrappers. They become `De acuerdo.` or `Amén.` (with Spanish
-question/exclamation marks where applicable), bypass the NMT RPC, and remain
+a small fixed allowlist of standalone expressions, preserving supported
+punctuation and matched quote wrappers. These bypass the NMT RPC and remain
 observable through `source_override_applied`. Sentence context and all other
 short utterances still use NMT.
 
@@ -175,9 +176,18 @@ digits, an explicit Spanish Magpie-safe punctuation allowlist, non-control
 whitespace, and Latin-attached combining marks. CJK punctuation such as
 `U+3002`, non-Latin or mixed-script letters, detached marks, symbols, and
 control/format characters fail closed with sequence-scoped, privacy-safe
-metadata. Invalid output is never sent to Magpie. The pipeline does not retry
+metadata. Invalid output is never sent to Magpie. The pipeline never retries
 an unchanged NMT or TTS payload because that cannot make deterministic invalid
 text safe and can produce inconsistent or wrong-language audio.
+
+One diagnosed request-shape boundary has a narrower alternate input. If the
+first result raises `TargetTextValidationError`, exact `es-US` source text
+containing 1-32 ASCII letters plus one `.`, `?`, or `!` may be requested
+exactly once with only that punctuation removed. The original segment,
+sequence ID, source timing, ASR-final provenance, and emission reason remain
+unchanged. The second response must pass cardinality, exact response-language,
+and full target-text validation before TTS. RPC, cardinality, language,
+ineligible-input, and second-attempt failures remain terminal.
 
 ## Bounded queues and backpressure
 
@@ -259,8 +269,11 @@ which sequence IDs did not complete.
 - Give every session and segment a stable ID in logs.
 - Fail closed on invalid or wrong-script target text before TTS, with no
   unchanged NMT/TTS retry.
-- Retry only failures proven to be transient, cap retry counts, and never treat
-  deterministic content validation as transient.
+- Permit only the documented one-shot punctuation-normalized alternate request
+  for the diagnosed deterministic request-shape boundary. This is not a
+  transient retry, and a second failure remains terminal.
+- Retry other failures only if they are separately proven transient, cap retry
+  counts, and keep that policy outside this recovery.
 - Make TTS retry output atomic so a partial first attempt is not followed by a
   duplicated full segment.
 - Surface stage failure to the WebSocket client with the affected sequence ID.
@@ -294,6 +307,10 @@ retry_count
 error_code
 source_override_applied
 ```
+
+The session summary must also include `nmt_retry_count`, equal to the sum of
+`retry_count` over completed NMT events. Each such event is constrained to zero
+or one.
 
 Recommended events are:
 
@@ -342,12 +359,14 @@ offset measurement.
 7. **Completed:** pass the one-minute preflight and the first full staged
    sample operational canary. Sample 03 attempt 3 processed 1,888.1045 seconds
    and delivered all 646 ordered IDs without errors.
-8. Run Sample 01 and Sample 02, then complete the staged three-sample comparison
-   matrix with identical models, input, EOU, and playback policy.
-9. Cross-check scheduling in browser Web Audio and measure marked-phrase or
+8. **Completed:** diagnose the pinned NMT short-token punctuation boundary and
+   add one fail-closed punctuation-normalized recovery with retry telemetry.
+9. Run a fresh preflight and Sample 02, then complete the staged three-sample
+   comparison matrix with identical models, input, EOU, and playback policy.
+10. Cross-check scheduling in browser Web Audio and measure marked-phrase or
    punchline delay; the 64.038-second Sample 03 fixed listener tail leaves this
    audience gate open.
-10. Increase workers only if stage telemetry justifies it.
+11. Increase workers only if stage telemetry justifies it.
 
 ## Validation gates
 
@@ -355,6 +374,8 @@ offset measurement.
   pre-ID `filler_discarded` record, or the terminal residual.
 - Every emitted segment ID reaches ordered output or has an explicit error
   record.
+- Every successful NMT recovery retains its original identity/provenance,
+  reports one retry, and passes target validation before TTS.
 - End-of-input drains every stage and the browser without a fixed arbitrary
   sleep.
 - Queue bounds hold under injected slow-NMT and slow-TTS tests.

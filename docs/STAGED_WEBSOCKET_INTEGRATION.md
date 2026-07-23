@@ -13,10 +13,11 @@ long run also showed that operational health does not prove the audience stays
 within roughly 5–10 seconds of scheduled Spanish playback. The remaining live
 promotion sequence is:
 
-1. Sample 01 and Sample 02 through the resumable staged batch harness;
-2. executed browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
-3. a synchronized English-phrase to audible-Spanish measurement; and
-4. native-Spanish review of any playback/prosody acceleration.
+1. a fresh preflight and targeted Sample 02 pass from the recovery commit;
+2. a new three-sample run through the resumable staged batch harness;
+3. executed browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
+4. a synchronized English-phrase to audible-Spanish measurement; and
+5. native-Spanish review of any playback/prosody acceleration.
 
 ## Selecting the backend path
 
@@ -101,24 +102,30 @@ or replacement by another single-user session awaits staged cleanup.
 - A generation token prevents audio or terminal messages from an older stream
   leaking into a restarted stream.
 
-The implementation does not retry NMT or TTS. That is deliberate until any
-future retry policy can prove it will not duplicate audible speech.
+TTS is never retried. NMT is normally a single request and never repeats an
+unchanged request. One diagnosed short-segment case may issue a single
+punctuation-removed request before TTS has started, while retaining the same
+sequence ID and provenance. The second result must pass the full target-text
+validator, so the recovery cannot duplicate audible speech. See
+[Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
 
 ## Content-safety boundary
 
 The full-sample attempts established a fail-closed boundary before Magpie:
 
-- configured standalone hesitation fillers such as `uh.` are suppressed by
-  the segmenter before sequence ID allocation and counted in privacy-safe
-  telemetry;
-- narrow deterministic Spanish overrides apply only to standalone
-  `OK`/`Okay` and `Amen` variants observed to produce wrong-script NMT output;
+- configured standalone hesitation fillers are suppressed by the segmenter
+  before sequence ID allocation and counted in privacy-safe telemetry;
+- narrow deterministic Spanish overrides apply only to a small fixed allowlist
+  of standalone expressions observed to produce wrong-script NMT output;
 - target text is normalized and validated immediately after NMT and
   defensively again before TTS; Spanish output must contain at least one
   letter or digit, every letter must be Latin script, and control/format
-  characters, symbols, and detached marks are rejected; and
-- every other invalid result terminates the session. There is no blind retry
-  of unchanged NMT or TTS input.
+  characters, symbols, and detached marks are rejected;
+- after a first-pass `TargetTextValidationError`, exact `es-US` input shaped as
+  1-32 ASCII letters plus one `.`, `?`, or `!` may be requested once without
+  that punctuation; and
+- every ineligible or second-attempt invalid result terminates the session.
+  There is no blind retry of unchanged NMT or TTS input.
 
 Suppression happens before ID allocation. Once an ID exists, its translated
 text/audio is never silently dropped: it must complete in order or make the
@@ -128,8 +135,11 @@ session fail.
 
 `GET /api/test/export` retains its existing `events` array and adds a nullable
 `stagedPipeline` object. For a staged run it contains the pipeline summary,
-detailed stage events, and successful WebSocket send evidence after the stream
-has closed.
+detailed stage events, and successful WebSocket send evidence. Shutdown now
+retains an immediate snapshot before asynchronous cleanup and replaces it with
+the finalized `closed` snapshot. The batch client waits through a bounded
+close-settling interval for that final object rather than losing evidence in
+the cleanup window.
 
 Important fields include:
 
@@ -138,6 +148,8 @@ Important fields include:
 - maximum queue depths and blocked-put counts;
 - per-event segment identity, ASR-final provenance, and emission reason;
 - NMT/TTS processing, first-audio, and queue-residence times;
+- per-completed-NMT `retry_count` plus the summary `nmt_retry_count`;
+- sequence/provenance and `retry_count=1` on an exhausted recovery error;
 - audio bytes and duration;
 - `websocket_sent_sequence_ids`; and
 - `websocket_send_events` with sequence ID and monotonic send time.
@@ -173,8 +185,12 @@ requires all three conditions:
 3. the scheduled Web Audio queue reached zero.
 
 A server error or a 300-second terminal timeout produces an explicit failed
-run while preserving statistics and CSV export. Manual Stop remains a manual
-cancellation and does not wait for natural completion.
+run while preserving statistics and CSV export. The long-form harness retains
+only an allowlisted generated CSV, summary, and plot for failed captures, with
+neutral filenames, owner-only permissions, and manifest hashes under the
+ignored run directory. It does not copy source or generated audio into that
+failure record. Manual Stop remains a manual cancellation and does not wait
+for natural completion.
 
 ## One-minute WebSocket preflight
 
@@ -204,7 +220,10 @@ Before promotion, require:
 - translated audio is nonempty;
 - exactly one natural completion follows all PCM;
 - staged outcome is `complete`;
+- the staged snapshot state is `closed`;
 - cleanup and incomplete-sequence lists are empty;
+- every completed NMT event has `retry_count` zero or one and their sum equals
+  `nmt_retry_count`;
 - dequeued and successfully sent sequence IDs match exactly; and
 - every observed queue depth is within its recorded capacity.
 

@@ -46,6 +46,7 @@ class FakeStagedPipeline:
 
     def summary(self, include_events=False):
         return {
+            "state": "closed" if self.closed else "running",
             "outcome": "complete",
             "cleanup_errors": [],
             "completed_sequence_ids": list(self.dequeued_audio_sequence_ids),
@@ -624,6 +625,36 @@ async def test_shutdown_shields_yielding_pipeline_cleanup_from_relay_cancel(
     assert not pipeline.close_cancelled
     assert pipeline.close_calls == 1
     assert session.status is SessionStatus.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_staged_telemetry_remains_exportable_while_cleanup_yields(
+    mock_websocket,
+):
+    pipeline = YieldingCleanupPipeline()
+    manager = SessionManager(
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+    session = await manager.create_session(mock_websocket)
+    await session.start_stream("es-US")
+
+    stop = asyncio.create_task(session.stop_stream())
+    await asyncio.wait_for(pipeline.close_started.wait(), timeout=1)
+
+    in_progress = manager.get_staged_telemetry()
+    assert isinstance(in_progress, dict)
+    assert in_progress["state"] == "running"
+    assert manager.clear_staged_telemetry() is False
+
+    pipeline.release_close.set()
+    await asyncio.wait_for(stop, timeout=1)
+
+    finalized = manager.get_staged_telemetry()
+    assert finalized["state"] == "closed"
+    assert manager.clear_staged_telemetry() is True
+    assert manager.get_staged_telemetry() is None
+    await manager.remove_session(session)
 
 
 @pytest.mark.asyncio

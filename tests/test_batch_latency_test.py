@@ -7,6 +7,7 @@ from batch_latency_test import (
     TestResult as BatchTestResult,
     TimingEvent,
     compute_playback_metrics,
+    fetch_backend_export,
     fetch_backend_config,
     generate_summary,
     resolve_pipeline_mode,
@@ -49,6 +50,7 @@ def successful_staged_export():
                     "stage": "nmt",
                     "event": "completed",
                     "sequence_id": sequence_id,
+                    "retry_count": 0,
                 },
                 {
                     "stage": "tts",
@@ -70,6 +72,7 @@ def successful_staged_export():
         "outcome": "complete",
         "segments_emitted": 2,
         "audio_segments_produced": 2,
+        "nmt_retry_count": 0,
         "completed_sequence_ids": completed,
         "incomplete_sequence_ids": [],
         "failure": None,
@@ -252,6 +255,143 @@ def test_staged_integrity_accepts_complete_ordered_bounded_export():
     )
 
     assert errors == []
+
+
+def test_staged_integrity_accepts_and_reconciles_one_shot_nmt_recovery():
+    export = successful_staged_export()
+    nmt_completed = [
+        event
+        for event in export["events"]
+        if event["stage"] == "nmt" and event["event"] == "completed"
+    ]
+    nmt_completed[1]["retry_count"] = 1
+    export["nmt_retry_count"] = 1
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config(),
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("event_retry", [-1, 2, True, None])
+def test_staged_integrity_rejects_invalid_nmt_recovery_telemetry(event_retry):
+    export = successful_staged_export()
+    nmt_event = next(
+        event
+        for event in export["events"]
+        if event["stage"] == "nmt" and event["event"] == "completed"
+    )
+    nmt_event["retry_count"] = event_retry
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config(),
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert any("retry_count must be zero or one" in error for error in errors)
+
+
+def test_staged_integrity_rejects_unclosed_or_mismatched_retry_summary():
+    export = successful_staged_export()
+    export["state"] = "failed"
+    export["nmt_retry_count"] = 1
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config(),
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert any("state must be 'closed'" in error for error in errors)
+    assert any("sum of nmt/completed event retries" in error for error in errors)
+
+
+def test_fetch_backend_export_waits_for_closed_staged_snapshot(monkeypatch):
+    snapshots = [
+        {"events": [], "stagedPipeline": None},
+        {
+            "events": [{"stage": "nmt"}],
+            "stagedPipeline": {"state": "failed", "outcome": "failed"},
+        },
+        {
+            "events": [{"stage": "pipeline"}],
+            "stagedPipeline": {"state": "closed", "outcome": "failed"},
+        },
+    ]
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, timeout):
+        calls.append((url, timeout))
+        return Response(snapshots.pop(0))
+
+    monkeypatch.setattr("batch_latency_test.requests.get", fake_get)
+    monkeypatch.setattr("batch_latency_test.EXPORT_POLL_INTERVAL_SECONDS", 0)
+
+    exported = asyncio.run(
+        fetch_backend_export(
+            "http://backend/",
+            pipeline_mode="staged",
+            backend_config=staged_config(),
+        )
+    )
+
+    assert exported["stagedPipeline"]["state"] == "closed"
+    assert exported["events"] == [{"stage": "pipeline"}]
+    assert calls == [("http://backend/api/test/export", 30)] * 3
+
+
+def test_fetch_backend_export_timeout_returns_latest_failure_snapshot(monkeypatch):
+    failed = {
+        "events": [{"stage": "nmt", "event": "error"}],
+        "stagedPipeline": {"state": "failed", "outcome": "failed"},
+    }
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return failed
+
+    class Clock:
+        def __init__(self):
+            self.ticks = iter((0.0, 31.0))
+
+        def monotonic(self):
+            return next(self.ticks)
+
+    monkeypatch.setattr(
+        "batch_latency_test.requests.get",
+        lambda _url, timeout: Response(),
+    )
+    monkeypatch.setattr("batch_latency_test.time", Clock())
+
+    exported = asyncio.run(
+        fetch_backend_export(
+            "http://backend",
+            pipeline_mode="staged",
+            backend_config={"pipelineMode": "staged", "stagedConfig": {}},
+        )
+    )
+
+    assert exported is failed
 
 
 def test_staged_integrity_reports_lifecycle_order_and_queue_failures():

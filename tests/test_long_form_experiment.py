@@ -253,6 +253,73 @@ def test_capture_artifact_validation_requires_csv_and_summary(tmp_path):
     assert "hash differs" in reason
 
 
+def test_failed_capture_retains_only_allowlisted_diagnostics(
+    monkeypatch,
+    tmp_path,
+):
+    audio = tmp_path / "long-form-02.mp3"
+    audio.write_bytes(b"source audio remains outside staging")
+    run_dir = tmp_path / "run"
+    entry = {
+        "repeat": 1,
+        "sample": "sample_02",
+        "csv": "repeat-01/long-form-02_results.csv",
+        "summary": "repeat-01/long-form-02_summary.json",
+        "plot": "repeat-01/long-form-02_latency.png",
+        "failure_artifacts": [],
+    }
+
+    async def failed_capture(audio_path, _backend_url, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / f"{audio_path.stem}_results.csv").write_text(
+            "source,stage,timestamp_ms,chunk_index,source_position_sec,audio_bytes\n",
+            encoding="utf-8",
+        )
+        (output_dir / f"{audio_path.stem}_summary.json").write_text(
+            '{"server_error":"safe typed failure"}\n',
+            encoding="utf-8",
+        )
+        (output_dir / f"{audio_path.stem}_latency.png").write_bytes(b"plot")
+        (output_dir / "unallowlisted.raw").write_bytes(b"must not survive")
+        raise experiment.ExperimentError("safe typed failure")
+
+    monkeypatch.setattr(experiment, "capture_one", failed_capture)
+
+    with pytest.raises(experiment.ExperimentError, match="safe typed failure"):
+        asyncio.run(
+            experiment.capture_and_promote(
+                audio,
+                "http://localhost:8000",
+                run_dir,
+                entry,
+                expected_pipeline={},
+            )
+        )
+
+    assert not (run_dir / entry["csv"]).exists()
+    assert not (run_dir / entry["summary"]).exists()
+    assert not (run_dir / entry["plot"]).exists()
+    assert list((run_dir / ".staging").iterdir()) == []
+    assert not list(run_dir.rglob("*.raw"))
+
+    assert len(entry["failure_artifacts"]) == 1
+    retained = entry["failure_artifacts"][0]
+    assert set(retained["artifacts"]) == {"csv", "summary", "plot"}
+    assert set(retained["sha256"]) == {"csv", "summary", "plot"}
+    for key, relative_path in retained["artifacts"].items():
+        path = run_dir / relative_path
+        assert path.is_file()
+        assert retained["sha256"][key] == experiment.sha256_file(path)
+        assert path.stat().st_mode & 0o777 == 0o600
+    assert (
+        run_dir / "failures" / "repeat-01-sample_02" / "attempt-01"
+    ).stat().st_mode & 0o777 == 0o700
+    assert (run_dir / "failures").stat().st_mode & 0o777 == 0o700
+    assert (
+        run_dir / "failures" / "repeat-01-sample_02"
+    ).stat().st_mode & 0o777 == 0o700
+
+
 def test_candidate_sla_miss_is_reported_without_operational_failure():
     analysis = {
         "traces": [

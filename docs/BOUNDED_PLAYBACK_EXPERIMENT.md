@@ -264,7 +264,19 @@ and reaching the 300-second drain maximum is a capture failure.
 New artifacts are generated in a temporary `.staging` directory. The harness
 validates the full CSV/summary/plot set, promotes it into `preflight` or
 `repeat-NN`, records SHA-256 hashes, and validates the promoted set again before
-marking the manifest entry complete.
+marking the manifest entry complete. If validation fails after generated
+artifacts exist, only the event CSV, summary JSON, and latency plot are moved
+into an ignored, owner-private `failures` directory under neutral filenames.
+The manifest records their relative paths and hashes under
+`failure_artifacts`; source audio, generated audio, credentials, logs, and
+arbitrary staging files are not copied. Sanitize even these local diagnostics
+before sharing them.
+
+For staged captures, the client also polls `/api/test/export` through a bounded
+close-settling interval and requires the finalized pipeline state to be
+`closed`. This avoids mistaking the short asynchronous-cleanup window for a
+missing staged summary while still failing integrity validation if cleanup
+never finishes.
 
 Each live arrival trace produces two derived playback conditions:
 
@@ -391,12 +403,16 @@ and the staged backend design.
 - [ ] Automated one-minute preflight produces translated audio
 - [ ] Every automated capture receives terminal `completed` before 300 seconds
 - [ ] No generator, final-flush, or PCM WebSocket send error is reported
+- [ ] Every staged export reaches `closed`; NMT event retry totals match the
+  staged summary
 - [ ] Three samples complete sequentially with nonzero translated responses
 - [ ] At least three live traces per file; each is replayed as a matched fixed and adaptive pair
 - [ ] Interrupted-run recovery is verified with `--resume-dir` when applicable
 - [ ] Resume commit, clean worktree, sample hashes, and artifact hashes validate
 - [ ] CSV event counts and received-byte totals match every summary
 - [ ] Generated manifest, raw traces, summaries, plots, and compact analysis retained
+- [ ] Any failed-capture record contains only the allowlisted generated files
+  under neutral names and remains outside Git
 - [ ] Separate browser run reaches natural `end_input` and complete Web Audio drain
 - [ ] Browser CSV contains playback schedule and queue sample fields
 - [ ] Python replay is cross-checked against browser queue scheduling

@@ -162,6 +162,7 @@ def build_manifest(
                     "started_at_utc": None,
                     "completed_at_utc": None,
                     "error": None,
+                    "failure_artifacts": [],
                 }
             )
 
@@ -188,6 +189,7 @@ def build_manifest(
             "csv": f"preflight/{Path(PREFLIGHT_FILE).stem}_results.csv",
             "plot": f"preflight/{Path(PREFLIGHT_FILE).stem}_latency.png",
             "error": None,
+            "failure_artifacts": [],
         },
         "samples": samples,
         "runs": sorted(
@@ -790,20 +792,41 @@ async def capture_and_promote(
     prefix = f"repeat-{entry.get('repeat', 0):02d}-{entry.get('sample', 'preflight')}-"
     with tempfile.TemporaryDirectory(prefix=prefix, dir=staging_root) as temporary:
         staging_dir = Path(temporary)
-        artifacts = await capture_one(audio_path, backend_url, staging_dir)
-        valid, reason = validate_artifact_set(
-            Path(artifacts["csv"]),
-            Path(artifacts["summary"]),
-            Path(artifacts["plot"]),
-            expected_pipeline=expected_pipeline,
-        )
-        if not valid:
-            raise ExperimentError(reason)
+        try:
+            artifacts = await capture_one(audio_path, backend_url, staging_dir)
+            valid, reason = validate_artifact_set(
+                Path(artifacts["csv"]),
+                Path(artifacts["summary"]),
+                Path(artifacts["plot"]),
+                expected_pipeline=expected_pipeline,
+            )
+            if not valid:
+                raise ExperimentError(reason)
 
-        for key in ("csv", "summary", "plot"):
-            destination = run_dir / entry[key]
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            Path(artifacts[key]).replace(destination)
+            for key in ("csv", "summary", "plot"):
+                destination = run_dir / entry[key]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                Path(artifacts[key]).replace(destination)
+        except Exception as exc:
+            try:
+                _retain_failed_capture_artifacts(
+                    audio_path=audio_path,
+                    staging_dir=staging_dir,
+                    run_dir=run_dir,
+                    entry=entry,
+                    reason=str(exc) or type(exc).__name__,
+                )
+            except Exception as retention_exc:
+                entry.setdefault("failure_artifacts", []).append(
+                    {
+                        "captured_at_utc": utc_now(),
+                        "reason": str(exc) or type(exc).__name__,
+                        "retention_error": type(retention_exc).__name__,
+                        "artifacts": {},
+                        "sha256": {},
+                    }
+                )
+            raise
 
     entry["artifact_sha256"] = _artifact_hashes(run_dir, entry)
     valid, reason = capture_artifacts_valid(
@@ -813,6 +836,72 @@ async def capture_and_promote(
     )
     if not valid:
         raise ExperimentError(f"promoted artifact validation failed: {reason}")
+
+
+def _retain_failed_capture_artifacts(
+    *,
+    audio_path: Path,
+    staging_dir: Path,
+    run_dir: Path,
+    entry: dict[str, Any],
+    reason: str,
+) -> None:
+    """Retain only generated, privacy-safe diagnostics from a failed capture."""
+    failure_records = entry.setdefault("failure_artifacts", [])
+    attempt = len(failure_records) + 1
+    label = (
+        f"repeat-{entry.get('repeat', 0):02d}-"
+        f"{entry.get('sample', 'preflight')}"
+    )
+    failure_root = run_dir / "failures"
+    label_dir = failure_root / label
+    for private_directory in (failure_root, label_dir):
+        private_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        private_directory.chmod(0o700)
+
+    relative_dir = Path("failures") / label / f"attempt-{attempt:02d}"
+    destination_dir = run_dir / relative_dir
+    while destination_dir.exists():
+        attempt += 1
+        relative_dir = Path("failures") / label / f"attempt-{attempt:02d}"
+        destination_dir = run_dir / relative_dir
+    destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination_dir.chmod(0o700)
+
+    generated = {
+        "csv": staging_dir / f"{audio_path.stem}_results.csv",
+        "summary": staging_dir / f"{audio_path.stem}_summary.json",
+        "plot": staging_dir / f"{audio_path.stem}_latency.png",
+    }
+    neutral_names = {
+        "csv": "events.csv",
+        "summary": "summary.json",
+        "plot": "latency.png",
+    }
+    retained: dict[str, str] = {}
+    hashes: dict[str, str] = {}
+    for key, source in generated.items():
+        if not source.is_file():
+            continue
+        destination = destination_dir / neutral_names[key]
+        source.replace(destination)
+        destination.chmod(0o600)
+        relative = str(relative_dir / neutral_names[key])
+        retained[key] = relative
+        hashes[key] = sha256_file(destination)
+
+    if not retained:
+        destination_dir.rmdir()
+        return
+
+    failure_records.append(
+        {
+            "captured_at_utc": utc_now(),
+            "reason": reason,
+            "artifacts": retained,
+            "sha256": hashes,
+        }
+    )
 
 
 def _entry_audio_path(entry: dict[str, Any]) -> Path:

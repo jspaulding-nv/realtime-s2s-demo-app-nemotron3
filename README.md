@@ -30,7 +30,7 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
 - Browser acceptance that requires server completion as well as an empty Web Audio queue
-- Standalone hesitation-filler suppression before sequence allocation, narrow Spanish `OK`/`Okay`/`Amen` overrides, and fail-closed target-script validation before TTS
+- Standalone hesitation-filler suppression before sequence allocation, narrow known-short-utterance overrides, fail-closed target-script validation, and one guarded punctuation-normalized NMT recovery before TTS
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
@@ -44,11 +44,11 @@ errors. The staged Sample 01/Sample 02 matrix, actual browser queue, marked-phra
 delay, and native-listener speed/quality gates remain open before it should be
 treated as the preferred live path.
 
-That live canary predates the final edge-case hardening. Its raw trace satisfies
-the newly added terminal-order and PCM count/byte checks, but the final code
-snapshot has deterministic test coverage rather than a repeated full GPU
-canary. Its saved summary is historical and cannot resume under the tightened
-provenance schema.
+That live canary predates the final target-text, short-segment recovery, and
+failure-evidence hardening. Its raw trace satisfies the later terminal-order
+and PCM count/byte checks, but the current code snapshot still needs a fresh
+GPU preflight and three-sample run. Its saved summary is historical and cannot
+resume under the tightened provenance schema.
 
 ## Architecture
 
@@ -472,15 +472,23 @@ intentionally not resumable.
 
 Captures are written under `.staging` and promoted only after their CSV,
 summary, and plot validate; their SHA-256 hashes are then stored in the
-manifest. The CLI waits for the backend's terminal `completed` status rather
-than treating five seconds of silence as success. Failure to receive that
-status within the 300-second drain maximum fails the capture. A Riva
+manifest. If a capture fails after those generated files exist, the harness
+retains only the CSV, summary, and plot under an ignored owner-private
+`failures` directory, gives them neutral filenames, and records their relative
+paths and hashes under `failure_artifacts`. It does not copy source or generated
+audio into that record.
+
+The CLI waits for the backend's terminal `completed` status rather than
+treating five seconds of silence as success. Failure to receive that status
+within the 300-second drain maximum fails the capture. A Riva
 generator/final-flush error or any pending PCM WebSocket send failure also
-emits `error` and invalidates the capture. Staged validation also rejects a
-completion before `end_input`, PCM after completion, or any frame-count/byte
-mismatch between successful server sends and client receives. The summary
-records completed-terminal arrival lag separately from the longer harness
-polling/settle observation. A backend-keyed local file lock
+emits `error` and invalidates the capture. In staged mode, the client waits
+through a bounded export-settling interval for the finalized `closed` pipeline
+snapshot. Staged validation also rejects a completion before `end_input`, PCM
+after completion, an unclosed staged snapshot, inconsistent NMT retry totals,
+or any frame-count/byte mismatch between successful server sends and client
+receives. The summary records completed-terminal arrival lag separately from
+the longer harness polling/settle observation. A backend-keyed local file lock
 prevents two harness processes on the same machine from using the
 single-session backend concurrently.
 
@@ -539,6 +547,7 @@ Detailed guides:
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)
 - [Bounded staged NMT/TTS pipeline, preflight, and full canary](docs/STAGED_NMT_TTS_PIPELINE.md)
 - [Feature-flagged staged WebSocket integration](docs/STAGED_WEBSOCKET_INTEGRATION.md)
+- [Narrow NMT short-segment recovery and failed-capture evidence](docs/NMT_SHORT_SEGMENT_RECOVERY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)
 - [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)

@@ -687,7 +687,15 @@ class TranslationSession:
 
     def clear_staged_telemetry(self) -> bool:
         """Clear retained evidence unless a staged stream is still active."""
-        if self._staged_pipeline is not None or self._staged_output_task is not None:
+        cleanup_active = (
+            self._staged_cleanup_task is not None
+            and not self._staged_cleanup_task.done()
+        )
+        if (
+            self._staged_pipeline is not None
+            or self._staged_output_task is not None
+            or cleanup_active
+        ):
             return False
         self._last_staged_summary = None
         self._staged_audio_sequence_ids_sent = []
@@ -706,6 +714,11 @@ class TranslationSession:
             self._staged_terminal_generation = self._staged_generation
         pipeline = self._staged_pipeline
         output_task = self._staged_output_task
+        if pipeline is not None:
+            # Keep an immediately exportable failure snapshot while aclose()
+            # yields. A second snapshot below records the finalized CLOSED
+            # state and any cleanup errors.
+            self._retain_staged_summary(pipeline)
         self._staged_pipeline = None
         self._staged_output_task = None
 
@@ -824,6 +837,7 @@ class TranslationSession:
         if pipeline is not None or output_task is not None:
             self._staged_generation += 1
         if pipeline is not None:
+            self._retain_staged_summary(pipeline)
             try:
                 self._ensure_staged_cleanup_task(pipeline)
             except RuntimeError:

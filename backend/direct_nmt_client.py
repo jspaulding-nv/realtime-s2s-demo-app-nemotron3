@@ -13,19 +13,48 @@ import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
 from config import riva_config
 from staged_models import TextSegment, TranslatedSegment
-from target_text_validation import validate_target_text
+from target_text_validation import TargetTextValidationError, validate_target_text
 
 
 class DirectNMTResponseError(RuntimeError):
     """Raised when NMT returns a response unsafe to pass to TTS."""
 
 
+class DirectNMTRecoveryError(RuntimeError):
+    """A privacy-safe terminal error after the one allowed alternate request."""
+
+    retry_count = 1
+
+    def __init__(
+        self,
+        *,
+        segment: TextSegment,
+        initial_error: TargetTextValidationError,
+        retry_error: Exception,
+    ) -> None:
+        self.segment = segment
+        self.sequence_id = segment.sequence_id
+        self.initial_reason = initial_error.reason
+        self.retry_error_code = type(retry_error).__name__
+        self.retry_reason = getattr(retry_error, "reason", "")
+        message = (
+            "NMT punctuation recovery failed "
+            f"for sequence {self.sequence_id} after one retry; "
+            f"initial_reason={self.initial_reason}; "
+            f"retry_error={self.retry_error_code}"
+        )
+        if self.retry_reason:
+            message += f"; retry_reason={self.retry_reason}"
+        super().__init__(message)
+
+
 class DirectNMTClient:
     """Blocking unary NMT client intended for one staged-pipeline worker.
 
     ``translate_segment`` performs blocking gRPC I/O and must therefore run in
-    a worker thread rather than on the asyncio event loop. Retry policy belongs
-    to the orchestrator; this adapter issues exactly one RPC per call.
+    a worker thread rather than on the asyncio event loop. The adapter normally
+    issues one RPC. It owns one narrow, deterministic recovery because only it
+    can alter request text without changing the source segment's provenance.
     """
 
     def __init__(
@@ -137,18 +166,69 @@ class DirectNMTClient:
             )
 
         started_ms = self._clock_ms()
+        retry_count = 0
+        try:
+            translated_text, response_language = self._translate_once(
+                client=client,
+                auth=auth,
+                source_text=segment.text,
+                target_language=resolved_target,
+                sequence_id=segment.sequence_id,
+            )
+        except TargetTextValidationError as initial_error:
+            recovery_source = _short_punctuation_recovery_source(
+                segment.text,
+                resolved_target,
+            )
+            if recovery_source is None:
+                raise
+            retry_count = 1
+            try:
+                translated_text, response_language = self._translate_once(
+                    client=client,
+                    auth=auth,
+                    source_text=recovery_source,
+                    target_language=resolved_target,
+                    sequence_id=segment.sequence_id,
+                )
+            except Exception as retry_error:
+                raise DirectNMTRecoveryError(
+                    segment=segment,
+                    initial_error=initial_error,
+                    retry_error=retry_error,
+                ) from retry_error
+        completed_ms = self._clock_ms()
+
+        return TranslatedSegment(
+            segment=segment,
+            text=translated_text,
+            language=response_language,
+            started_monotonic_ms=started_ms,
+            completed_monotonic_ms=completed_ms,
+            retry_count=retry_count,
+        )
+
+    def _translate_once(
+        self,
+        *,
+        client: object,
+        auth: object,
+        source_text: str,
+        target_language: str,
+        sequence_id: int,
+    ) -> tuple[str, str]:
+        """Issue and validate one request without applying any retry policy."""
         request = riva_nmt_pb2.TranslateTextRequest(
-            texts=[segment.text],
+            texts=[source_text],
             model=self.model,
             source_language=self.source_language,
-            target_language=resolved_target,
+            target_language=target_language,
         )
         response = client.stub.TranslateText(
             request,
             metadata=auth.get_auth_metadata(),
             timeout=self.rpc_timeout_s,
         )
-        completed_ms = self._clock_ms()
 
         translations = tuple(getattr(response, "translations", ()) or ())
         if len(translations) != 1:
@@ -159,30 +239,38 @@ class DirectNMTClient:
         translation = translations[0]
         translated_text = str(getattr(translation, "text", ""))
         response_language = str(getattr(translation, "language", "")).strip()
-        if response_language != resolved_target:
+        if response_language != target_language:
             raise DirectNMTResponseError(
                 "NMT response language mismatch: "
-                f"expected {resolved_target!r}, received {response_language!r}"
+                f"expected {target_language!r}, received {response_language!r}"
             )
         translated_text = validate_target_text(
             translated_text,
             language=response_language,
-            sequence_id=segment.sequence_id,
+            sequence_id=sequence_id,
         )
-
-        return TranslatedSegment(
-            segment=segment,
-            text=translated_text,
-            language=response_language,
-            started_monotonic_ms=started_ms,
-            completed_monotonic_ms=completed_ms,
-        )
+        return translated_text, response_language
 
 
 _STANDALONE_ES_US_OVERRIDE = re.compile(
     r"^(?P<term>ok(?:ay)?|amen)(?P<terminal>[.!?]?)$",
     re.IGNORECASE,
 )
+
+_SHORT_PUNCTUATED_ASCII_TOKEN = re.compile(
+    r"^(?P<token>[A-Za-z]{1,32})[.!?]$"
+)
+
+
+def _short_punctuation_recovery_source(
+    text: str,
+    target_language: str,
+) -> Optional[str]:
+    """Return a one-shot normalized source for the diagnosed NMT edge case."""
+    if target_language != "es-US":
+        return None
+    match = _SHORT_PUNCTUATED_ASCII_TOKEN.fullmatch(text.strip())
+    return match.group("token") if match is not None else None
 
 
 def _standalone_es_us_override(text: str, target_language: str) -> Optional[str]:

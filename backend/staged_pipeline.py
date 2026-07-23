@@ -273,6 +273,11 @@ class StagedPipelineSession:
             "audio_segments_produced": self._audio_segments_produced,
             "fillers_discarded": self._fillers_discarded,
             "segments_emitted": len(self._emitted_sequence_ids),
+            "nmt_retry_count": sum(
+                event.retry_count
+                for event in self._telemetry
+                if event.stage == "nmt" and event.event == "completed"
+            ),
             "completed_sequence_ids": list(self._consumed_sequence_ids),
             "incomplete_sequence_ids": sorted(
                 set(self._emitted_sequence_ids) - set(self._consumed_sequence_ids)
@@ -534,6 +539,7 @@ class StagedPipelineSession:
                     monotonic_ms=translation.completed_monotonic_ms,
                     text_chars=len(translation.text),
                     processing_duration_ms=translation.processing_duration_ms,
+                    retry_count=translation.retry_count,
                 )
                 await self._enqueue(
                     self._tts_queue, translation, "tts", "enqueued"
@@ -706,9 +712,21 @@ class StagedPipelineSession:
             self._failure = (stage, message)
             self._outcome = "failed"
             self._state = StagedPipelineState.FAILED
+            failure_segment = getattr(exc, "segment", None)
+            if not isinstance(failure_segment, TextSegment):
+                failure_segment = None
+            retry_count = getattr(exc, "retry_count", 0)
+            if (
+                not isinstance(retry_count, int)
+                or isinstance(retry_count, bool)
+                or retry_count < 0
+            ):
+                retry_count = 0
             self._record(
                 stage=stage,
                 event="error",
+                segment=failure_segment,
+                retry_count=retry_count,
                 error_code=type(exc).__name__,
             )
             current = asyncio.current_task()
@@ -805,6 +823,7 @@ class StagedPipelineSession:
         text_chars: int = 0,
         audio_bytes: int = 0,
         audio_duration_ms: float = 0.0,
+        retry_count: int = 0,
         error_code: str = "",
         monotonic_ms: Optional[float] = None,
     ) -> None:
@@ -836,6 +855,7 @@ class StagedPipelineSession:
             text_chars=text_chars,
             audio_bytes=audio_bytes,
             audio_duration_ms=audio_duration_ms,
+            retry_count=retry_count,
             error_code=error_code,
         )
         if self._retain_telemetry:

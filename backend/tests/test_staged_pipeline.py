@@ -5,6 +5,7 @@ import time
 import pytest
 
 from config import StagedPipelineConfig
+from direct_nmt_client import DirectNMTRecoveryError
 from staged_models import (
     ASRStreamEvent,
     ASRStreamEventKind,
@@ -22,6 +23,7 @@ from staged_pipeline import (
     StagedPipelineSession,
     StagedPipelineState,
 )
+from target_text_validation import TargetTextValidationError
 
 
 def now_ms():
@@ -92,10 +94,11 @@ class FakeASRClient:
 
 
 class FakeNMTClient:
-    def __init__(self, delay_s=0, fail_sequence=None):
+    def __init__(self, delay_s=0, fail_sequence=None, retry_count=0):
         self.connected = True
         self.delay_s = delay_s
         self.fail_sequence = fail_sequence
+        self.retry_count = retry_count
         self.sequences = []
         self.starts = {}
         self.ends = {}
@@ -129,6 +132,7 @@ class FakeNMTClient:
             language=target_language,
             started_monotonic_ms=completed - self.delay_s * 1_000,
             completed_monotonic_ms=completed,
+            retry_count=self.retry_count,
         )
 
 
@@ -197,6 +201,30 @@ class RaisingDisconnectNMT(FakeNMTClient):
     def disconnect(self):
         self.disconnect_count += 1
         raise RuntimeError("disconnect failed")
+
+
+class RecoveryFailingNMT(FakeNMTClient):
+    def translate_segment(self, segment, target_language):
+        del target_language
+        initial = TargetTextValidationError(
+            sequence_id=segment.sequence_id,
+            language="es-US",
+            reason="unsupported_characters",
+            unsupported_code_points=("U+3002",),
+            unsupported_scripts=("UnsupportedPunctuation",),
+        )
+        retry = TargetTextValidationError(
+            sequence_id=segment.sequence_id,
+            language="es-US",
+            reason="unsupported_characters",
+            unsupported_code_points=("U+0400",),
+            unsupported_scripts=("Cyrillic",),
+        )
+        raise DirectNMTRecoveryError(
+            segment=segment,
+            initial_error=initial,
+            retry_error=retry,
+        ) from retry
 
 
 def config(**overrides):
@@ -270,6 +298,82 @@ async def test_ordered_natural_drain_flushes_residual_and_overlaps_nmt_tts():
     assert [event.monotonic_ms for event in first_audio_events] == [
         segment.first_audio_monotonic_ms for segment in audio
     ]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_nmt_recovery_retry_is_observable_without_changing_order_or_tts_count():
+    nmt = FakeNMTClient(retry_count=1)
+    tts = FakeTTSClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "Peace."), COMPLETE]),
+        nmt_client=nmt,
+        tts_client=tts,
+        config=config(),
+        session_id="nmt-recovery",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO,
+        StagedOutputEventKind.COMPLETE,
+    ]
+    assert nmt.sequences == [0]
+    assert tts.sequences == [0]
+    nmt_completed = [
+        event
+        for event in session.telemetry
+        if event.stage == "nmt" and event.event == "completed"
+    ]
+    assert len(nmt_completed) == 1
+    assert nmt_completed[0].sequence_id == 0
+    assert nmt_completed[0].retry_count == 1
+    summary = session.summary(include_events=True)
+    assert summary["nmt_retry_count"] == 1
+    assert sum(
+        event["retry_count"]
+        for event in summary["events"]
+        if event["stage"] == "nmt" and event["event"] == "completed"
+    ) == 1
+    assert all("text" not in event for event in summary["events"])
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_nmt_recovery_records_sequence_and_retry_before_tts():
+    tts = FakeTTSClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "Peace."), COMPLETE]),
+        nmt_client=RecoveryFailingNMT(),
+        tts_client=tts,
+        config=config(),
+        session_id="nmt-recovery-failed",
+    )
+
+    await session.start()
+    session.finish_input()
+    terminal = await session.next_output(timeout_s=2)
+
+    assert terminal.kind is StagedOutputEventKind.ERROR
+    assert terminal.stage == "nmt"
+    assert tts.sequences == []
+    recovery_error = next(
+        event
+        for event in session.telemetry
+        if event.stage == "nmt" and event.event == "error"
+    )
+    assert recovery_error.sequence_id == 0
+    assert recovery_error.retry_count == 1
+    assert recovery_error.error_code == "DirectNMTRecoveryError"
+    assert recovery_error.contributing_final_ids == (0,)
+    assert "text" not in recovery_error.to_dict()
+    summary = session.summary(include_events=True)
+    assert summary["nmt_retry_count"] == 0
+    assert summary["incomplete_sequence_ids"] == [0]
+    assert summary["failure"]["stage"] == "nmt"
     await session.aclose()
 
 

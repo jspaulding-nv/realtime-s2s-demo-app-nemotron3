@@ -3,7 +3,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from direct_nmt_client import DirectNMTClient, DirectNMTResponseError
+from direct_nmt_client import (
+    DirectNMTClient,
+    DirectNMTRecoveryError,
+    DirectNMTResponseError,
+)
 from staged_models import EmissionReason, TextSegment, TranslatedSegment
 from target_text_validation import TargetTextValidationError
 
@@ -79,6 +83,141 @@ def test_translate_segment_builds_single_request_and_preserves_provenance():
     assert result.started_monotonic_ms == 2_000
     assert result.completed_monotonic_ms == 2_250
     assert result.source_override_applied is False
+    assert result.retry_count == 0
+    assert result.to_dict()["retry_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("source_text", "recovery_text"),
+    [
+        ("Peace.", "Peace"),
+        ("Peace?", "Peace"),
+        ("Peace!", "Peace"),
+        ("  Peace.  ", "Peace"),
+    ],
+)
+def test_short_ascii_punctuated_source_retries_once_without_terminal_punctuation(
+    source_text,
+    recovery_text,
+):
+    client, auth, rpc = configured_client()
+    segment = make_segment(source_text)
+    requests = (object(), object())
+    rpc.side_effect = [
+        SimpleNamespace(translations=[translation(text="好。")]),
+        SimpleNamespace(translations=[translation(text="Paz.")]),
+    ]
+
+    with patch(
+        "direct_nmt_client.riva_nmt_pb2.TranslateTextRequest",
+        side_effect=requests,
+    ) as request_cls:
+        result = client.translate_segment(segment, "es-US")
+
+    assert request_cls.call_args_list[0].kwargs == {
+        "texts": [source_text],
+        "model": "test-model",
+        "source_language": "en-US",
+        "target_language": "es-US",
+    }
+    assert request_cls.call_args_list[1].kwargs == {
+        "texts": [recovery_text],
+        "model": "test-model",
+        "source_language": "en-US",
+        "target_language": "es-US",
+    }
+    assert [call.args[0] for call in rpc.call_args_list] == list(requests)
+    assert all(call.kwargs["timeout"] == 4.5 for call in rpc.call_args_list)
+    assert auth.get_auth_metadata.call_count == 2
+    assert result.segment is segment
+    assert result.text == "Paz."
+    assert result.language == "es-US"
+    assert result.started_monotonic_ms == 2_000
+    assert result.completed_monotonic_ms == 2_250
+    assert result.retry_count == 1
+    assert result.to_dict()["retry_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "Peace",
+        "Peace...",
+        "Two words.",
+        "A1.",
+        "O'clock.",
+        "well-known.",
+        "Péace.",
+        "Peace。",
+        "“Peace.”",
+        f"{'A' * 33}.",
+    ],
+)
+def test_punctuation_recovery_rejects_ineligible_source_shapes(source_text):
+    client, _, rpc = configured_client(
+        response=SimpleNamespace(translations=[translation(text="好。")])
+    )
+
+    with pytest.raises(TargetTextValidationError):
+        client.translate_segment(make_segment(source_text), "es-US")
+
+    assert rpc.call_count == 1
+
+
+def test_punctuation_recovery_fails_closed_after_one_invalid_retry():
+    unsafe_outputs = ("好。", "Привет.")
+    client, _, rpc = configured_client()
+    rpc.side_effect = [
+        SimpleNamespace(translations=[translation(text=text)])
+        for text in unsafe_outputs
+    ]
+
+    segment = make_segment("Peace.")
+    with pytest.raises(DirectNMTRecoveryError) as failure:
+        client.translate_segment(segment, "es-US")
+
+    assert rpc.call_count == 2
+    assert failure.value.segment is segment
+    assert failure.value.sequence_id == segment.sequence_id
+    assert failure.value.retry_count == 1
+    assert failure.value.initial_reason == "unsupported_characters"
+    assert failure.value.retry_error_code == "TargetTextValidationError"
+    assert failure.value.retry_reason == "unsupported_characters"
+    assert all(text not in str(failure.value) for text in unsafe_outputs)
+
+
+def test_punctuation_recovery_does_not_mask_invalid_retry_response_shape():
+    client, _, rpc = configured_client()
+    rpc.side_effect = [
+        SimpleNamespace(translations=[translation(text="好。")]),
+        SimpleNamespace(translations=[]),
+    ]
+
+    segment = make_segment("Peace.")
+    with pytest.raises(DirectNMTRecoveryError) as failure:
+        client.translate_segment(segment, "es-US")
+
+    assert rpc.call_count == 2
+    assert failure.value.segment is segment
+    assert failure.value.retry_count == 1
+    assert failure.value.retry_error_code == "DirectNMTResponseError"
+    assert "exactly one" not in str(failure.value)
+
+
+def test_punctuation_recovery_only_applies_to_es_us():
+    client, _, rpc = configured_client(
+        response=SimpleNamespace(
+            translations=[translation(text="Paz.", language="es-ES")]
+        )
+    )
+
+    with pytest.raises(
+        TargetTextValidationError,
+        match="unsupported_language_policy",
+    ):
+        client.translate_segment(make_segment("Peace."), "es-ES")
+
+    assert rpc.call_count == 1
 
 
 def test_blank_source_is_rejected_before_request_or_rpc():
@@ -107,12 +246,14 @@ def test_blank_target_is_rejected_before_rpc(target_language):
 
 @pytest.mark.parametrize("translations", [[], [translation(), translation()]])
 def test_response_requires_exactly_one_translation(translations):
-    client, _, _ = configured_client(
+    client, _, rpc = configured_client(
         response=SimpleNamespace(translations=translations)
     )
 
     with pytest.raises(DirectNMTResponseError, match="exactly one"):
-        client.translate_segment(make_segment(), "es-US")
+        client.translate_segment(make_segment("Peace."), "es-US")
+
+    assert rpc.call_count == 1
 
 
 @pytest.mark.parametrize("text", ["", "   "])
@@ -190,6 +331,7 @@ def test_standalone_source_overrides_bypass_nmt_and_are_observable(
     assert result.language == "es-US"
     assert result.source_override_applied is True
     assert result.to_dict()["source_override_applied"] is True
+    assert result.retry_count == 0
     rpc.assert_not_called()
     auth.get_auth_metadata.assert_not_called()
 
@@ -217,12 +359,14 @@ def test_source_override_rejects_mismatched_or_non_standalone_quotes(source_text
 
 @pytest.mark.parametrize("language", ["", "es-ES", "en-US"])
 def test_response_requires_exact_requested_language(language):
-    client, _, _ = configured_client(
+    client, _, rpc = configured_client(
         response=SimpleNamespace(translations=[translation(language=language)])
     )
 
     with pytest.raises(DirectNMTResponseError, match="language mismatch"):
-        client.translate_segment(make_segment(), "es-US")
+        client.translate_segment(make_segment("Peace."), "es-US")
+
+    assert rpc.call_count == 1
 
 
 def test_rpc_failure_propagates_for_orchestrator_classification():
@@ -231,10 +375,23 @@ def test_rpc_failure_propagates_for_orchestrator_classification():
     rpc.side_effect = service_error
 
     with pytest.raises(RuntimeError, match="NMT unavailable") as caught:
-        client.translate_segment(make_segment(), "es-US")
+        client.translate_segment(make_segment("Peace."), "es-US")
 
     assert caught.value is service_error
     assert rpc.call_count == 1
+
+
+@pytest.mark.parametrize("retry_count", [-1, 2, True, 1.5])
+def test_translated_segment_rejects_invalid_retry_count(retry_count):
+    with pytest.raises(ValueError, match="retry_count"):
+        TranslatedSegment(
+            segment=make_segment(),
+            text="Paz.",
+            language="es-US",
+            started_monotonic_ms=2_000,
+            completed_monotonic_ms=2_250,
+            retry_count=retry_count,
+        )
 
 
 def test_disconnected_client_rejects_translation():

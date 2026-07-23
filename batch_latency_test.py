@@ -47,6 +47,7 @@ CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE  # 9600
 CHUNK_DURATION = CHUNK_SAMPLES / SAMPLE_RATE      # 0.3 s
 DRAIN_MAX_SECONDS = 300
 TERMINAL_SETTLE_SECONDS = 0.25
+EXPORT_POLL_INTERVAL_SECONDS = 0.1
 TARGET_LANGUAGE = "es-US"
 
 AUDIO_DIR = Path(os.environ.get("S2S_TEST_AUDIO_DIR", "test_audio")).expanduser()
@@ -190,6 +191,11 @@ def validate_staged_pipeline_integrity(
     if not isinstance(staged_pipeline, dict):
         return ["/api/test/export.stagedPipeline must be a JSON object"]
 
+    if staged_pipeline.get("state") != "closed":
+        errors.append(
+            "staged state must be 'closed' "
+            f"(got {staged_pipeline.get('state')!r})"
+        )
     if not isinstance(websocket_receive_events, list):
         errors.append("websocket_receive_events must be a list")
     else:
@@ -407,6 +413,7 @@ def validate_staged_pipeline_integrity(
         ("tts", "completed"): [],
         ("output", "dequeued"): [],
     }
+    nmt_event_retry_total = 0
     for index, event in enumerate(events):
         if not isinstance(event, dict):
             errors.append(f"events[{index}] must be an object")
@@ -423,6 +430,19 @@ def validate_staged_pipeline_integrity(
                 errors.append(f"events[{index}].sequence_id is invalid")
             else:
                 event_sequences[key].append(sequence_id)
+
+        if key in {("nmt", "completed"), ("nmt", "error")}:
+            retry_count = event.get("retry_count")
+            if (
+                not isinstance(retry_count, int)
+                or isinstance(retry_count, bool)
+                or retry_count not in {0, 1}
+            ):
+                errors.append(
+                    f"events[{index}].retry_count must be zero or one"
+                )
+            elif key == ("nmt", "completed"):
+                nmt_event_retry_total += retry_count
 
         queue_depth = event.get("queue_depth")
         queue_capacity = event.get("queue_capacity")
@@ -451,6 +471,19 @@ def validate_staged_pipeline_integrity(
                     f"{stage}/{event_name} sequence order must exactly match "
                     "completed_sequence_ids"
                 )
+
+    nmt_retry_count = staged_pipeline.get("nmt_retry_count")
+    if (
+        not isinstance(nmt_retry_count, int)
+        or isinstance(nmt_retry_count, bool)
+        or nmt_retry_count < 0
+    ):
+        errors.append("nmt_retry_count must be a non-negative integer")
+    elif nmt_retry_count != nmt_event_retry_total:
+        errors.append(
+            "nmt_retry_count must equal the sum of nmt/completed event retries "
+            f"({nmt_retry_count} != {nmt_event_retry_total})"
+        )
 
     staged_config = backend_config.get("stagedConfig")
     if staged_config is not None and not isinstance(staged_config, dict):
@@ -1034,11 +1067,11 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     requests.post(f"{backend_url}/api/test/stop", timeout=10)
 
     try:
-        export_resp = requests.get(f"{backend_url}/api/test/export", timeout=30)
-        export_resp.raise_for_status()
-        export_data = export_resp.json()
-        if not isinstance(export_data, dict):
-            raise ValueError("/api/test/export must return a JSON object")
+        export_data = await fetch_backend_export(
+            backend_url,
+            pipeline_mode=result.pipeline_mode,
+            backend_config=result.backend_config,
+        )
         result.staged_pipeline = export_data.get("stagedPipeline")
         for ev in export_data.get("events", []):
             result.backend_events.append(TimingEvent(
@@ -1087,6 +1120,60 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     compute_playback_metrics(result)
 
     return result
+
+
+async def fetch_backend_export(
+    backend_url: str,
+    *,
+    pipeline_mode: str,
+    backend_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Fetch a finalized staged snapshot without discarding failure evidence."""
+    wait_seconds = 0.0
+    if pipeline_mode == "staged":
+        close_timeout = (
+            backend_config.get("stagedConfig", {}).get("closeTimeoutSeconds")
+            if isinstance(backend_config.get("stagedConfig"), dict)
+            else None
+        )
+        if (
+            not isinstance(close_timeout, (int, float))
+            or isinstance(close_timeout, bool)
+            or not math.isfinite(close_timeout)
+            or close_timeout <= 0
+        ):
+            close_timeout = 10.0
+        wait_seconds = max(5.0, 3.0 * float(close_timeout))
+
+    deadline = time.monotonic() + wait_seconds
+    latest_export: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    while True:
+        try:
+            response = requests.get(
+                f"{backend_url.rstrip('/')}/api/test/export",
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("/api/test/export must return a JSON object")
+            latest_export = payload
+            staged = payload.get("stagedPipeline")
+            if pipeline_mode != "staged" or (
+                isinstance(staged, dict) and staged.get("state") == "closed"
+            ):
+                return payload
+        except Exception as exc:
+            last_error = exc
+
+        if time.monotonic() >= deadline:
+            if latest_export is not None:
+                return latest_export
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("backend timing export was unavailable")
+        await asyncio.sleep(EXPORT_POLL_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------

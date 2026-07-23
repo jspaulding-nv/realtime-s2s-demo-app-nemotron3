@@ -8,6 +8,8 @@ segmenter boundary. The current implementation is connected to `/ws/translate`
 behind `S2S_PIPELINE_MODE=staged`, while monolithic mode remains the default and
 rollback path; see the later
 [feature-flagged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+Its original no-recovery wording is superseded by the tightly scoped behavior
+in [Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
 
 Implemented and validated:
 
@@ -143,10 +145,9 @@ segments, and pushing more text after flush fails explicitly.
 ## Current NMT-to-TTS safety contract
 
 The current staged adapter has narrow deterministic Spanish source overrides
-for standalone `OK`/`Okay` and `Amen` variants only. It preserves supported
-punctuation and matched quote wrappers, produces `De acuerdo.` or `Amén.` (with
-Spanish question/exclamation marks when applicable), bypasses the NMT RPC, and
-sets `source_override_applied`. Sentence context and other short utterances
+for a small fixed allowlist of standalone expressions. It preserves supported
+punctuation and matched quote wrappers, bypasses the NMT RPC, and sets
+`source_override_applied`. Sentence context and all other short utterances
 continue through NMT.
 
 All translated `es-US` text is NFC-normalized and validated immediately after
@@ -156,9 +157,15 @@ whitespace, and Latin-attached combining marks only. Here, `punctuation` means
 the explicit Spanish Magpie-safe allowlist; CJK punctuation such as `U+3002`
 fails closed. Non-Latin or mixed-script letters, detached marks, symbols, and
 control/format characters also fail with sequence-scoped metadata; raw text is
-not included in the diagnostic and invalid text never reaches Magpie. The
-pipeline does not retry an unchanged NMT or TTS payload, because deterministic
-invalid content cannot become safe by repetition.
+not included in the diagnostic and invalid text never reaches Magpie.
+
+The pipeline never retries an unchanged NMT or TTS payload. After a first-pass
+`TargetTextValidationError`, the direct NMT adapter has exactly one narrower
+option: for exact `es-US` and a source containing 1-32 ASCII letters followed
+by one `.`, `?`, or `!`, it may make one request with only that punctuation
+removed. The original segment identity and provenance remain unchanged, and
+the second result must pass full validation before TTS. All other failures,
+including a second validation failure, remain terminal.
 
 The wider Unicode punctuation list used by the source-side segmenter above is
 only for finding ASR boundaries. It does not define what target text may cross

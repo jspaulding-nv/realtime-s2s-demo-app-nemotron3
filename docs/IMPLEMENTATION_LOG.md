@@ -514,6 +514,72 @@ An actual browser/Web Audio run, synchronized English-to-Spanish phrase timing,
 native Spanish quality review, and a new full staged Sample 01/Sample 02/Sample 03
 matrix remain required.
 
+## 2026-07-23: narrow NMT recovery and failure evidence
+
+A new staged Sample 02 run failed closed when Riva Translate 1.6B `1.5.2`
+declared `es-US` but returned unsupported wrong-script content for one isolated
+short source segment. The target validator prevented that text from reaching
+TTS. Privacy-safe controlled replay isolated a deterministic request-shape
+boundary:
+
+| Replay condition | Validation result |
+|---|---:|
+| Exact isolated ASCII-token plus punctuation shape | failed, 5/5 |
+| Same token without terminal punctuation | passed, 5/5 |
+| Same token with preceding context | passed, 5/5 |
+| Same token with following context | passed, 5/5 |
+| Same token with both neighboring contexts | passed, 5/5 |
+
+This evidence ruled out a transient RPC, TTS, concurrency, or GPU-capacity
+failure. Repeating the unchanged request was therefore rejected as a recovery
+strategy.
+
+The direct NMT adapter now owns one narrowly defined alternate request:
+
+- exact target `es-US`;
+- source text, after trimming, of 1-32 ASCII letters followed by exactly one
+  `.`, `?`, or `!`;
+- first RPC cardinality and response language are valid, but translated text
+  raises `TargetTextValidationError`; and
+- one second request removes only the terminal punctuation.
+
+The returned object keeps the original segment, sequence ID, ASR-final
+provenance, source timing, and emission reason. The second NMT response is
+fully revalidated before TTS. RPC, cardinality, response-language, ineligible
+source, and second-attempt failures receive no extra attempt. Neither NMT nor
+TTS ever repeats an unchanged payload.
+
+Recovery is observable without recording transcript text. A completed NMT
+event carries `retry_count` zero or one, and the staged summary's
+`nmt_retry_count` must equal the sum across those events. If the alternate
+request also fails, a typed NMT error event retains the original sequence and
+provenance with `retry_count=1`; no translated text enters telemetry or TTS.
+
+Failure evidence handling was hardened at the same boundary:
+
+- staged shutdown retains an exportable snapshot before asynchronous cleanup
+  and a finalized snapshot afterward;
+- the batch client polls for the finalized `closed` snapshot for a bounded
+  close-settling interval;
+- staged integrity requires the closed state and consistent retry totals; and
+- a failed long-form capture retains only its generated event CSV, summary, and
+  latency plot under neutral names in an ignored owner-private directory, with
+  paths and SHA-256 hashes recorded under `failure_artifacts`.
+
+Source audio, generated audio, arbitrary temporary files, logs, and credentials
+are not copied into the failed-capture record. The complete behavior,
+verification gates, and clean rerun order are documented in
+[Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
+A fresh GPU preflight, targeted Sample 02 pass, and clean three-sample matrix
+remain required before promotion.
+
+Local verification passed `376` Python tests with one skipped integration test,
+all `88` frontend tests, frontend lint, and the production build. All three
+pinned service HTTP readiness probes returned ready. A privacy-safe live call
+through the updated direct adapter used the exact protected failure segment and
+reported one retry, preserved sequence 77, returned exact `es-US`, and passed
+target validation without printing source or translated text.
+
 ## Reproducible validation commands
 
 Authenticate and start the pinned Riva services:
