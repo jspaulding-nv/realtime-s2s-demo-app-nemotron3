@@ -329,6 +329,209 @@ def successful_websocket_receive_events_v2():
     ]
 
 
+def staged_config_v3():
+    config = staged_config()
+    config["stagedConfig"].update(
+        {
+            "telemetrySchemaVersion": 3,
+            "ttsIncrementalPublishEnabled": True,
+            "ttsIncrementalFrameMs": 100,
+            "ttsSubsegmentMaxChars": 0,
+        }
+    )
+    return config
+
+
+def successful_staged_export_v3():
+    parent_specs = {
+        0: {
+            "retry_count": 0,
+            "frame_bytes": [3200, 1600],
+        },
+        1: {
+            "retry_count": 1,
+            "frame_bytes": [2400],
+        },
+    }
+    events = []
+    frame_keys = []
+    frame_bytes = []
+    parent_summaries = []
+    websocket_send_events = []
+    for parent_sequence_id, spec in parent_specs.items():
+        retry_count = spec["retry_count"]
+        events.extend(
+            [
+                {
+                    "stage": "segmenter",
+                    "event": "emitted",
+                    "sequence_id": parent_sequence_id,
+                },
+                {
+                    "stage": "nmt",
+                    "event": "completed",
+                    "sequence_id": parent_sequence_id,
+                    "retry_count": 0,
+                },
+            ]
+        )
+        for audio_frame_id, pcm_bytes in enumerate(spec["frame_bytes"]):
+            identity = {
+                "sequence_id": parent_sequence_id,
+                "parent_sequence_id": parent_sequence_id,
+                "audio_frame_id": audio_frame_id,
+            }
+            key = {
+                "parent_sequence_id": parent_sequence_id,
+                "audio_frame_id": audio_frame_id,
+            }
+            frame_keys.append(key)
+            frame_bytes.append(pcm_bytes)
+            events.extend(
+                [
+                    {
+                        **identity,
+                        "stage": "tts",
+                        "event": "frame_received",
+                        "audio_bytes": pcm_bytes,
+                        "retry_count": retry_count,
+                    },
+                    {
+                        **identity,
+                        "stage": "output",
+                        "event": "frame_enqueued",
+                        "audio_bytes": pcm_bytes,
+                        "queue_depth": 1,
+                        "queue_capacity": 4,
+                    },
+                    {
+                        **identity,
+                        "stage": "output",
+                        "event": "frame_dequeued",
+                        "audio_bytes": pcm_bytes,
+                        "queue_depth": 0,
+                        "queue_capacity": 4,
+                    },
+                ]
+            )
+            websocket_send_events.append(
+                {
+                    **identity,
+                    "sent_monotonic_ms": 1000.0 + len(frame_keys),
+                    "audio_bytes": pcm_bytes,
+                }
+            )
+
+        summary = {
+            "parent_sequence_id": parent_sequence_id,
+            "audio_frame_count": len(spec["frame_bytes"]),
+            "audio_bytes": sum(spec["frame_bytes"]),
+            "retry_count": retry_count,
+        }
+        parent_summaries.append(summary)
+        events.extend(
+            [
+                {
+                    "stage": "tts",
+                    "event": "completed",
+                    "sequence_id": parent_sequence_id,
+                    **summary,
+                },
+                {
+                    "stage": "output",
+                    "event": "parent_complete_enqueued",
+                    "sequence_id": parent_sequence_id,
+                    **summary,
+                    "queue_depth": 1,
+                    "queue_capacity": 4,
+                },
+                {
+                    "stage": "output",
+                    "event": "parent_complete_dequeued",
+                    "sequence_id": parent_sequence_id,
+                    **summary,
+                    "queue_depth": 0,
+                    "queue_capacity": 4,
+                },
+            ]
+        )
+
+    completed = list(parent_specs)
+    return {
+        "telemetry_schema_version": 3,
+        "tts_incremental_publish_enabled": True,
+        "tts_incremental_frame_ms": 100,
+        "tts_incremental_frame_bytes": 3200,
+        "tts_subsegmentation_enabled": False,
+        "session_id": "session-v3",
+        "state": "closed",
+        "outcome": "complete",
+        "segments_emitted": len(completed),
+        "audio_segments_produced": len(completed),
+        "audio_frames_produced": len(frame_keys),
+        "nmt_retry_count": 0,
+        "tts_retry_count": sum(
+            spec["retry_count"] for spec in parent_specs.values()
+        ),
+        "completed_sequence_ids": completed,
+        "incomplete_sequence_ids": [],
+        "published_audio_frame_keys": [dict(key) for key in frame_keys],
+        "dequeued_audio_frame_keys": [dict(key) for key in frame_keys],
+        "websocket_sent_audio_frame_keys": [
+            dict(key) for key in frame_keys
+        ],
+        "published_audio_frame_bytes": list(frame_bytes),
+        "dequeued_audio_frame_bytes": list(frame_bytes),
+        "websocket_sent_audio_frame_bytes": list(frame_bytes),
+        "produced_parent_summaries": [
+            dict(summary) for summary in parent_summaries
+        ],
+        "completed_parent_summaries": [
+            dict(summary) for summary in parent_summaries
+        ],
+        "websocket_completed_parent_summaries": [
+            dict(summary) for summary in parent_summaries
+        ],
+        "failure": None,
+        "cleanup_errors": [],
+        "max_queue_depths": {"nmt": 2, "tts": 1, "output": 1},
+        "blocked_put_counts": {"nmt": 0, "tts": 0, "output": 0},
+        "events": events,
+        "websocket_sent_sequence_ids": completed,
+        "websocket_send_events": websocket_send_events,
+    }
+
+
+def successful_websocket_receive_events_v3():
+    return [
+        {
+            "order": 0,
+            "timestamp_ms": 1.0,
+            "frame_type": "control",
+            "message_type": "status",
+            "status": "connected",
+            "audio_bytes": 0,
+        },
+        *[
+            {
+                "order": index,
+                "timestamp_ms": 1.0 + index,
+                "frame_type": "pcm",
+                "audio_bytes": audio_bytes,
+            }
+            for index, audio_bytes in enumerate((3200, 1600, 2400), start=1)
+        ],
+        {
+            "order": 4,
+            "timestamp_ms": 5.0,
+            "frame_type": "control",
+            "message_type": "status",
+            "status": "completed",
+            "audio_bytes": 0,
+        },
+    ]
+
+
 def test_generate_summary_records_capture_integrity(tmp_path):
     config = staged_config()
     staged_pipeline = successful_staged_export()
@@ -472,6 +675,17 @@ def test_staged_integrity_accepts_schema_v2_composite_child_lifecycle():
     assert errors == []
 
 
+def test_staged_integrity_accepts_schema_v3_incremental_frame_lifecycle():
+    errors = validate_staged_pipeline_integrity(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert errors == []
+
+
 def test_staged_integrity_rejects_identity_free_positive_audio_dequeue():
     export = successful_staged_export_v2()
     terminal_dequeue = export["events"][-1]
@@ -519,9 +733,9 @@ def test_staged_integrity_rejects_schema_config_disagreement():
 
 def test_staged_integrity_rejects_unknown_schema_version():
     export = successful_staged_export()
-    export["telemetry_schema_version"] = 3
+    export["telemetry_schema_version"] = 4
     config = staged_config()
-    config["stagedConfig"]["telemetrySchemaVersion"] = 3
+    config["stagedConfig"]["telemetrySchemaVersion"] = 4
 
     errors = validate_staged_pipeline_integrity(
         export,
@@ -530,7 +744,109 @@ def test_staged_integrity_rejects_unknown_schema_version():
         2.75,
     )
 
-    assert sum("must be 1 or 2" in error for error in errors) == 2
+    assert sum("must be 1, 2, or 3" in error for error in errors) == 2
+
+
+def test_staged_integrity_v3_rejects_frame_key_layer_mismatch():
+    export = successful_staged_export_v3()
+    export["dequeued_audio_frame_keys"][1]["audio_frame_id"] = 7
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "dequeued_audio_frame_keys must exactly match "
+        "published_audio_frame_keys" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_frame_byte_layer_mismatch():
+    export = successful_staged_export_v3()
+    export["websocket_sent_audio_frame_bytes"][2] += 2
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "websocket_sent_audio_frame_bytes must exactly match "
+        "published_audio_frame_bytes" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_noncontiguous_frame_ids():
+    export = successful_staged_export_v3()
+    for field in (
+        "published_audio_frame_keys",
+        "dequeued_audio_frame_keys",
+        "websocket_sent_audio_frame_keys",
+    ):
+        export[field][1]["audio_frame_id"] = 2
+    export["websocket_send_events"][1]["audio_frame_id"] = 2
+    for event in export["events"]:
+        if (
+            event.get("parent_sequence_id") == 0
+            and event.get("audio_frame_id") == 1
+        ):
+            event["audio_frame_id"] = 2
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "published audio frame keys must be contiguous within every parent"
+        in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_parent_summary_layer_mismatch():
+    export = successful_staged_export_v3()
+    export["completed_parent_summaries"][0]["audio_bytes"] += 2
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "completed_parent_summaries must exactly match "
+        "produced_parent_summaries" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_retry_count_above_one():
+    export = successful_staged_export_v3()
+    export["produced_parent_summaries"][1]["retry_count"] = 2
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "produced_parent_summaries[1].retry_count must be zero or one"
+        in error
+        for error in errors
+    )
 
 
 def test_staged_integrity_requires_explicit_v2_websocket_composite_key():

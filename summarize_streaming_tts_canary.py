@@ -1,0 +1,1402 @@
+#!/usr/bin/env python3
+"""Compare matched atomic and incremental TTS-publication canary captures.
+
+The input captures remain operational evidence and may contain local paths or
+session identifiers.  This program validates those fields but emits only
+privacy-safe aggregate metrics and boolean provenance conclusions.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+
+ARMS = (("atomic", 1, False), ("streaming", 3, True))
+IMAGE_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+SOURCE_TIME_DIGITS = 3
+MATCH_TOLERANCE_SECONDS = 1e-6
+MATERIAL_AUDIO_DIFFERENCE_PERCENT = 1.0
+INTENDED_CONFIG_DIFFERENCES = (
+    "stagedConfig.telemetrySchemaVersion",
+    "stagedConfig.ttsIncrementalPublishEnabled",
+    "stagedConfig.ttsIncrementalFrameMs",
+)
+
+
+def _load_json(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label}: required JSON could not be read") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: JSON root must be an object")
+    return value
+
+
+def _object(value: Any, *, field: str, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: {field} must be an object")
+    return value
+
+
+def _list(value: Any, *, field: str, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label}: {field} must be a list")
+    return value
+
+
+def _integer(
+    value: Any,
+    *,
+    field: str,
+    label: str,
+    positive: bool = False,
+) -> int:
+    minimum = 1 if positive else 0
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+    ):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{label}: {field} must be a {qualifier} integer")
+    return value
+
+
+def _number(
+    value: Any,
+    *,
+    field: str,
+    label: str,
+    positive: bool = False,
+    nonnegative: bool = True,
+) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or (positive and value <= 0)
+        or (nonnegative and value < 0)
+    ):
+        qualifier = (
+            "positive" if positive else "non-negative" if nonnegative else ""
+        )
+        raise ValueError(
+            f"{label}: {field} must be {qualifier + ' ' if qualifier else ''}"
+            "finite"
+        )
+    return float(value)
+
+
+def _nearest_rank(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        raise ValueError("cannot summarize an empty metric")
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
+
+
+def _distribution(values: Iterable[float]) -> dict[str, float]:
+    materialized = list(values)
+    if not materialized:
+        raise ValueError("cannot summarize an empty metric")
+    return {
+        "p50": _nearest_rank(materialized, 0.50),
+        "p95": _nearest_rank(materialized, 0.95),
+        "max": max(materialized),
+    }
+
+
+def _round_floats(value: Any, digits: int = 6) -> Any:
+    if isinstance(value, float):
+        return round(value, digits)
+    if isinstance(value, dict):
+        return {
+            key: _round_floats(item, digits) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_round_floats(item, digits) for item in value]
+    return value
+
+
+def _optional_time(value: Any, *, field: str, label: str) -> float | None:
+    if value is None:
+        return None
+    return round(
+        _number(value, field=field, label=label),
+        SOURCE_TIME_DIGITS,
+    )
+
+
+def _run_info(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError("run_info: required run_info.txt could not be read") from exc
+    result: dict[str, str] = {}
+    for line in lines:
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        result[key] = value
+    prefix_sha256 = result.get("prefix_sha256", "")
+    if re.fullmatch(r"[0-9a-f]{64}", prefix_sha256) is None:
+        raise ValueError("run_info: prefix_sha256 must be a SHA-256 digest")
+    return result
+
+
+def _backend_provenance(
+    config: dict[str, Any],
+    *,
+    schema: int,
+    incremental: bool,
+    label: str,
+) -> dict[str, Any]:
+    if config.get("pipelineMode") != "staged":
+        raise ValueError(f"{label}: backend pipeline mode must be staged")
+    for field in ("sampleRate", "chunkSize", "channels"):
+        _integer(config.get(field), field=field, label=label, positive=True)
+
+    models = _object(config.get("modelConfig"), field="modelConfig", label=label)
+    for service_name in ("asr", "nmt", "tts"):
+        service = _object(
+            models.get(service_name),
+            field=f"modelConfig.{service_name}",
+            label=label,
+        )
+        image = service.get("image")
+        endpoint = service.get("endpoint")
+        digest = service.get("imageDigest")
+        if (
+            not isinstance(image, str)
+            or not image
+            or image.endswith(":latest")
+        ):
+            raise ValueError(
+                f"{label}: modelConfig.{service_name}.image must be pinned"
+            )
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError(
+                f"{label}: modelConfig.{service_name}.endpoint is missing"
+            )
+        if (
+            not isinstance(digest, str)
+            or IMAGE_DIGEST_PATTERN.fullmatch(digest) is None
+        ):
+            raise ValueError(
+                f"{label}: modelConfig.{service_name}.imageDigest must be "
+                "an immutable digest"
+            )
+
+    staged = _object(
+        config.get("stagedConfig"),
+        field="stagedConfig",
+        label=label,
+    )
+    if staged.get("telemetrySchemaVersion") != schema:
+        raise ValueError(f"{label}: backend telemetry schema mismatch")
+    if staged.get("ttsSubsegmentMaxChars") != 0:
+        raise ValueError(f"{label}: post-NMT TTS splitting must be disabled")
+    if staged.get("ttsResponseChunkTelemetryEnabled") is not True:
+        raise ValueError(
+            f"{label}: TTS response-chunk telemetry must be enabled"
+        )
+    reported_incremental = staged.get(
+        "ttsIncrementalPublishEnabled",
+        False,
+    )
+    if reported_incremental is not incremental:
+        raise ValueError(f"{label}: incremental-publication flag mismatch")
+    if incremental:
+        _integer(
+            staged.get("ttsIncrementalFrameMs"),
+            field="ttsIncrementalFrameMs",
+            label=label,
+            positive=True,
+        )
+
+    projection = copy.deepcopy(config)
+    projection_staged = projection["stagedConfig"]
+    for field in (
+        "telemetrySchemaVersion",
+        "ttsIncrementalPublishEnabled",
+        "ttsIncrementalFrameMs",
+    ):
+        projection_staged.pop(field, None)
+    return projection
+
+
+def _upstream_structure(
+    events: list[dict[str, Any]],
+    *,
+    label: str,
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]], float]:
+    pipeline_starts = [
+        event
+        for event in events
+        if (event.get("stage"), event.get("event"))
+        == ("pipeline", "started")
+    ]
+    if len(pipeline_starts) != 1:
+        raise ValueError(f"{label}: exactly one pipeline start is required")
+    pipeline_start_ms = _number(
+        pipeline_starts[0].get("monotonic_ms"),
+        field="pipeline start",
+        label=label,
+    )
+
+    finals: list[tuple[Any, ...]] = []
+    segments: list[tuple[Any, ...]] = []
+    nmt_records: list[tuple[Any, ...]] = []
+    nmt_by_parent: dict[int, dict[str, Any]] = {}
+    for index, event in enumerate(events):
+        event_label = f"{label}: event {index}"
+        event_type = (event.get("stage"), event.get("event"))
+        if event_type == ("asr", "final"):
+            final_id = _integer(
+                event.get("asr_final_id"),
+                field="asr_final_id",
+                label=event_label,
+            )
+            finals.append(
+                (
+                    final_id,
+                    _integer(
+                        event.get("text_chars"),
+                        field="text_chars",
+                        label=event_label,
+                        positive=True,
+                    ),
+                    _optional_time(
+                        event.get("source_start_ms"),
+                        field="source_start_ms",
+                        label=event_label,
+                    ),
+                    _optional_time(
+                        event.get("source_end_ms"),
+                        field="source_end_ms",
+                        label=event_label,
+                    ),
+                )
+            )
+        elif event_type in {
+            ("segmenter", "emitted"),
+            ("nmt", "completed"),
+        }:
+            parent_id = _integer(
+                event.get("sequence_id"),
+                field="sequence_id",
+                label=event_label,
+            )
+            contributing = _list(
+                event.get("contributing_final_ids"),
+                field="contributing_final_ids",
+                label=event_label,
+            )
+            contributing_ids = tuple(
+                _integer(
+                    item,
+                    field="contributing_final_ids",
+                    label=event_label,
+                )
+                for item in contributing
+            )
+            reason = event.get("emission_reason")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError(
+                    f"{event_label}: emission_reason must be non-empty"
+                )
+            record = (
+                parent_id,
+                contributing_ids,
+                reason,
+                _integer(
+                    event.get("text_chars"),
+                    field="text_chars",
+                    label=event_label,
+                    positive=True,
+                ),
+                _optional_time(
+                    event.get("source_start_ms"),
+                    field="source_start_ms",
+                    label=event_label,
+                ),
+                _optional_time(
+                    event.get("source_end_ms"),
+                    field="source_end_ms",
+                    label=event_label,
+                ),
+            )
+            if event_type[0] == "segmenter":
+                segments.append(record)
+            else:
+                if parent_id in nmt_by_parent:
+                    raise ValueError(f"{label}: duplicate NMT parent")
+                nmt_records.append(record)
+                nmt_by_parent[parent_id] = event
+
+    if not finals or not segments or not nmt_records:
+        raise ValueError(f"{label}: upstream evidence is incomplete")
+    if [item[0] for item in finals] != list(range(len(finals))):
+        raise ValueError(f"{label}: ASR final IDs are not contiguous")
+    expected_parents = list(range(len(segments)))
+    if [item[0] for item in segments] != expected_parents:
+        raise ValueError(f"{label}: segment parent IDs are not contiguous")
+    if [item[0] for item in nmt_records] != expected_parents:
+        raise ValueError(f"{label}: NMT parent IDs are not contiguous")
+    return (
+        {
+            "asr_finals": finals,
+            "segments": segments,
+            "nmt_parents": nmt_records,
+        },
+        nmt_by_parent,
+        pipeline_start_ms,
+    )
+
+
+def _event_parent_map(
+    events: list[dict[str, Any]],
+    *,
+    stage: str,
+    event_name: str,
+    parent_count: int,
+    label: str,
+) -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = {}
+    for event in events:
+        if (event.get("stage"), event.get("event")) != (stage, event_name):
+            continue
+        parent = _integer(
+            event.get("sequence_id"),
+            field=f"{stage}/{event_name}.sequence_id",
+            label=label,
+        )
+        if parent in result:
+            raise ValueError(f"{label}: duplicate {stage}/{event_name} parent")
+        result[parent] = event
+    if sorted(result) != list(range(parent_count)):
+        raise ValueError(
+            f"{label}: {stage}/{event_name} parent structure is incomplete"
+        )
+    return result
+
+
+def _elapsed_seconds(
+    later: dict[str, Any],
+    earlier: dict[str, Any],
+    *,
+    field: str,
+    label: str,
+) -> float:
+    later_ms = _number(
+        later.get("monotonic_ms"),
+        field=f"{field}.later",
+        label=label,
+    )
+    earlier_ms = _number(
+        earlier.get("monotonic_ms"),
+        field=f"{field}.earlier",
+        label=label,
+    )
+    value = (later_ms - earlier_ms) / 1_000.0
+    if value < -1e-6:
+        raise ValueError(f"{label}: {field} is negative")
+    return max(0.0, value)
+
+
+def _boundary_seconds(
+    event: dict[str, Any],
+    *,
+    pipeline_start_ms: float,
+    label: str,
+) -> float:
+    event_ms = _number(
+        event.get("monotonic_ms"),
+        field="monotonic_ms",
+        label=label,
+    )
+    source_end_ms = _number(
+        event.get("source_end_ms"),
+        field="source_end_ms",
+        label=label,
+    )
+    return (event_ms - pipeline_start_ms - source_end_ms) / 1_000.0
+
+
+def _tts_metrics(
+    staged: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    parent_count: int,
+    nmt_by_parent: dict[int, dict[str, Any]],
+    pipeline_start_ms: float,
+    schema: int,
+    label: str,
+) -> tuple[dict[str, Any], dict[int, int]]:
+    started = _event_parent_map(
+        events,
+        stage="tts",
+        event_name="started",
+        parent_count=parent_count,
+        label=label,
+    )
+    first = _event_parent_map(
+        events,
+        stage="tts",
+        event_name="first_audio",
+        parent_count=parent_count,
+        label=label,
+    )
+    completed = _event_parent_map(
+        events,
+        stage="tts",
+        event_name="completed",
+        parent_count=parent_count,
+        label=label,
+    )
+    completed_bytes: dict[int, int] = {}
+    for parent, event in completed.items():
+        completed_bytes[parent] = _integer(
+            event.get("audio_bytes"),
+            field="tts/completed.audio_bytes",
+            label=label,
+            positive=True,
+        )
+
+    sidecar = _object(
+        staged.get("tts_response_chunk_telemetry"),
+        field="tts_response_chunk_telemetry",
+        label=label,
+    )
+    if sidecar.get("schema_version") != 1:
+        raise ValueError(f"{label}: unsupported response telemetry schema")
+    if sidecar.get("segments_observed") != parent_count:
+        raise ValueError(f"{label}: response parent count mismatch")
+    chunks = _list(
+        sidecar.get("chunks"),
+        field="tts_response_chunk_telemetry.chunks",
+        label=label,
+    )
+    if sidecar.get("response_chunk_count") != len(chunks):
+        raise ValueError(f"{label}: response chunk count mismatch")
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for chunk in chunks:
+        item = _object(chunk, field="response chunk", label=label)
+        parent = _integer(
+            item.get("parent_sequence_id"),
+            field="response parent_sequence_id",
+            label=label,
+        )
+        if item.get("subsequence_id") != 0 or item.get("subsequence_count") != 1:
+            raise ValueError(f"{label}: TTS response was unexpectedly split")
+        grouped[parent].append(item)
+    if sorted(grouped) != list(range(parent_count)):
+        raise ValueError(f"{label}: response parent identities are incomplete")
+
+    first_response_seconds: list[float] = []
+    last_response_seconds: list[float] = []
+    response_counts: list[float] = []
+    for parent, observed in grouped.items():
+        declared = len(observed)
+        cumulative = 0
+        for index, item in enumerate(observed):
+            if (
+                item.get("response_index") != index
+                or item.get("response_count") != declared
+            ):
+                raise ValueError(f"{label}: response indices are inconsistent")
+            cumulative += _integer(
+                item.get("audio_bytes"),
+                field="response audio_bytes",
+                label=label,
+                positive=True,
+            )
+            if item.get("cumulative_audio_bytes") != cumulative:
+                raise ValueError(
+                    f"{label}: cumulative response bytes are inconsistent"
+                )
+        if cumulative != completed_bytes[parent]:
+            raise ValueError(
+                f"{label}: response bytes do not match TTS completion"
+            )
+        first_response_seconds.append(
+            _number(
+                observed[0].get("since_request_start_ms"),
+                field="first response latency",
+                label=label,
+            )
+            / 1_000.0
+        )
+        last_response_seconds.append(
+            _number(
+                observed[-1].get("since_request_start_ms"),
+                field="last response latency",
+                label=label,
+            )
+            / 1_000.0
+        )
+        response_counts.append(float(declared))
+
+    websocket_events = _list(
+        staged.get("websocket_send_events"),
+        field="websocket_send_events",
+        label=label,
+    )
+    websocket_by_parent: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for event in websocket_events:
+        item = _object(event, field="websocket send event", label=label)
+        parent_field = (
+            "parent_sequence_id"
+            if schema == 3
+            else "sequence_id"
+        )
+        parent = _integer(
+            item.get(parent_field),
+            field=parent_field,
+            label=label,
+        )
+        websocket_by_parent[parent].append(item)
+    if sorted(websocket_by_parent) != list(range(parent_count)):
+        raise ValueError(f"{label}: WebSocket parent identities are incomplete")
+
+    nmt_to_request = []
+    request_to_first = []
+    request_to_full = []
+    first_to_full = []
+    boundary_to_request = []
+    boundary_to_first = []
+    boundary_to_full = []
+    boundary_to_first_websocket = []
+    first_to_websocket = []
+    first_websocket_lead_over_full = []
+    for parent in range(parent_count):
+        first_ws = websocket_by_parent[parent][0]
+        request = started[parent]
+        first_audio = first[parent]
+        full_audio = completed[parent]
+        nmt_to_request.append(
+            _elapsed_seconds(
+                request,
+                nmt_by_parent[parent],
+                field="NMT completion to TTS request",
+                label=label,
+            )
+        )
+        request_to_first.append(
+            _elapsed_seconds(
+                first_audio,
+                request,
+                field="TTS request to first response",
+                label=label,
+            )
+        )
+        request_to_full.append(
+            _elapsed_seconds(
+                full_audio,
+                request,
+                field="TTS request to full response",
+                label=label,
+            )
+        )
+        first_to_full.append(
+            _elapsed_seconds(
+                full_audio,
+                first_audio,
+                field="TTS first to full response",
+                label=label,
+            )
+        )
+        boundary_to_request.append(
+            _boundary_seconds(
+                request,
+                pipeline_start_ms=pipeline_start_ms,
+                label=label,
+            )
+        )
+        boundary_to_first.append(
+            _boundary_seconds(
+                first_audio,
+                pipeline_start_ms=pipeline_start_ms,
+                label=label,
+            )
+        )
+        boundary_to_full.append(
+            _boundary_seconds(
+                full_audio,
+                pipeline_start_ms=pipeline_start_ms,
+                label=label,
+            )
+        )
+        source_end_ms = _number(
+            request.get("source_end_ms"),
+            field="TTS source_end_ms",
+            label=label,
+        )
+        ws_ms = _number(
+            first_ws.get("sent_monotonic_ms"),
+            field="WebSocket sent_monotonic_ms",
+            label=label,
+        )
+        boundary_to_first_websocket.append(
+            (ws_ms - pipeline_start_ms - source_end_ms) / 1_000.0
+        )
+        first_to_websocket.append(
+            (ws_ms - _number(
+                first_audio.get("monotonic_ms"),
+                field="TTS first monotonic_ms",
+                label=label,
+            ))
+            / 1_000.0
+        )
+        if first_to_websocket[-1] < -1e-6:
+            raise ValueError(
+                f"{label}: WebSocket publication preceded first TTS response"
+            )
+        first_websocket_lead_over_full.append(
+            (
+                _number(
+                    full_audio.get("monotonic_ms"),
+                    field="TTS full monotonic_ms",
+                    label=label,
+                )
+                - ws_ms
+            )
+            / 1_000.0
+        )
+
+    return (
+        {
+            "requests": parent_count,
+            "response_chunks": len(chunks),
+            "websocket_audio_messages": len(websocket_events),
+            "nmt_complete_to_request_seconds": _distribution(nmt_to_request),
+            "request_to_first_response_seconds": _distribution(request_to_first),
+            "request_to_last_response_seconds": _distribution(
+                last_response_seconds
+            ),
+            "request_to_full_response_seconds": _distribution(request_to_full),
+            "first_to_full_response_seconds": _distribution(first_to_full),
+            "first_response_to_first_websocket_seconds": _distribution(
+                first_to_websocket
+            ),
+            "first_websocket_lead_over_full_response_seconds": _distribution(
+                first_websocket_lead_over_full
+            ),
+            "source_boundary_to_request_seconds": _distribution(
+                boundary_to_request
+            ),
+            "source_boundary_to_first_response_seconds": _distribution(
+                boundary_to_first
+            ),
+            "source_boundary_to_full_response_seconds": _distribution(
+                boundary_to_full
+            ),
+            "source_boundary_to_first_websocket_seconds": _distribution(
+                boundary_to_first_websocket
+            ),
+            "response_count_per_request": _distribution(response_counts),
+        },
+        completed_bytes,
+    )
+
+
+def _playback_metrics(
+    analysis: dict[str, Any],
+    *,
+    output_seconds: float,
+    audio_messages: int,
+    expected_csv_name: str,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if analysis.get("schema_version") != 1:
+        raise ValueError(f"{label}: unsupported playback schema")
+    policy = _object(analysis.get("policy"), field="policy", label=label)
+    traces = _list(analysis.get("traces"), field="traces", label=label)
+    if len(traces) != 1:
+        raise ValueError(f"{label}: exactly one playback trace is required")
+    trace = _object(traces[0], field="trace", label=label)
+    if trace.get("trace_csv") != expected_csv_name:
+        raise ValueError(f"{label}: playback trace does not match capture")
+    translated = _number(
+        trace.get("translated_audio_seconds"),
+        field="translated_audio_seconds",
+        label=label,
+        positive=True,
+    )
+    if not math.isclose(translated, output_seconds, abs_tol=0.005):
+        raise ValueError(f"{label}: playback duration does not match capture")
+
+    result: dict[str, Any] = {}
+    for mode in ("fixed_1x", "adaptive"):
+        source = _object(trace.get(mode), field=mode, label=label)
+        if source.get("chunks_scheduled") != audio_messages:
+            raise ValueError(
+                f"{label}: scheduled playback chunks do not match audio messages"
+            )
+        if source.get("chunks_dropped") != 0:
+            raise ValueError(f"{label}: playback analysis dropped audio")
+        result[mode] = {
+            key: _number(source.get(key), field=f"{mode}.{key}", label=label)
+            for key in (
+                "listener_tail_seconds",
+                "time_weighted_queue_p50_seconds",
+                "time_weighted_queue_p95_seconds",
+                "peak_queue_depth_seconds",
+                "percent_playback_window_above_limit",
+                "urgent_source_percent",
+            )
+        }
+    return result, copy.deepcopy(policy)
+
+
+def _load_arm(
+    arm_dir: Path,
+    *,
+    schema: int,
+    incremental: bool,
+    arm_name: str,
+) -> dict[str, Any]:
+    summaries = sorted(arm_dir.glob("*_summary.json"))
+    if len(summaries) != 1:
+        raise ValueError(f"{arm_name}: exactly one capture summary is required")
+    summary_path = summaries[0]
+    root = _load_json(summary_path, label=arm_name)
+    integrity = _object(
+        root.get("staged_integrity"),
+        field="staged_integrity",
+        label=arm_name,
+    )
+    if (
+        integrity.get("applicable") is not True
+        or integrity.get("passed") is not True
+        or integrity.get("errors") != []
+    ):
+        raise ValueError(f"{arm_name}: staged integrity did not pass")
+    if (
+        root.get("pipeline_mode") != "staged"
+        or root.get("translation_completed") is not True
+        or root.get("input_completed") is not True
+        or root.get("connection_lost") is not False
+        or root.get("drain_timed_out") is not False
+        or root.get("server_error") not in {"", None}
+    ):
+        raise ValueError(f"{arm_name}: capture did not complete cleanly")
+
+    config = _object(
+        root.get("backend_config"),
+        field="backend_config",
+        label=arm_name,
+    )
+    config_projection = _backend_provenance(
+        config,
+        schema=schema,
+        incremental=incremental,
+        label=arm_name,
+    )
+    staged = _object(
+        root.get("staged_pipeline"),
+        field="staged_pipeline",
+        label=arm_name,
+    )
+    if (
+        staged.get("telemetry_schema_version") != schema
+        or staged.get("tts_subsegmentation_enabled") is not False
+        or staged.get("tts_response_chunk_telemetry_enabled") is not True
+    ):
+        raise ValueError(f"{arm_name}: staged feature flags are inconsistent")
+    if (staged.get("tts_incremental_publish_enabled", False) is not incremental):
+        raise ValueError(f"{arm_name}: staged incremental flag is inconsistent")
+    if (
+        staged.get("state") != "closed"
+        or staged.get("outcome") != "complete"
+        or staged.get("failure") is not None
+        or staged.get("cleanup_errors") != []
+        or staged.get("incomplete_sequence_ids") != []
+    ):
+        raise ValueError(f"{arm_name}: staged pipeline did not close cleanly")
+
+    raw_events = _list(staged.get("events"), field="events", label=arm_name)
+    events = [
+        _object(item, field=f"events[{index}]", label=arm_name)
+        for index, item in enumerate(raw_events)
+    ]
+    upstream, nmt_by_parent, pipeline_start_ms = _upstream_structure(
+        events,
+        label=arm_name,
+    )
+    parent_count = len(upstream["segments"])
+    if staged.get("segments_emitted") != parent_count:
+        raise ValueError(f"{arm_name}: emitted parent count mismatch")
+    if staged.get("completed_sequence_ids") != list(range(parent_count)):
+        raise ValueError(f"{arm_name}: completed parent IDs mismatch")
+
+    tts, completed_bytes = _tts_metrics(
+        staged,
+        events,
+        parent_count=parent_count,
+        nmt_by_parent=nmt_by_parent,
+        pipeline_start_ms=pipeline_start_ms,
+        schema=schema,
+        label=arm_name,
+    )
+    received_bytes = _integer(
+        root.get("total_received_bytes"),
+        field="total_received_bytes",
+        label=arm_name,
+        positive=True,
+    )
+    if sum(completed_bytes.values()) != received_bytes:
+        raise ValueError(f"{arm_name}: total TTS bytes do not match capture")
+    audio_messages = _integer(
+        root.get("audio_responses"),
+        field="audio_responses",
+        label=arm_name,
+        positive=True,
+    )
+    if audio_messages != tts["websocket_audio_messages"]:
+        raise ValueError(f"{arm_name}: WebSocket audio message count mismatch")
+    if not incremental and audio_messages != parent_count:
+        raise ValueError(f"{arm_name}: atomic message count mismatch")
+    if incremental and staged.get("audio_frames_produced") != audio_messages:
+        raise ValueError(f"{arm_name}: streaming frame count mismatch")
+
+    sample_rate = config["sampleRate"]
+    channels = config["channels"]
+    output_seconds = _number(
+        root.get("output_duration_sec"),
+        field="output_duration_sec",
+        label=arm_name,
+        positive=True,
+    )
+    expected_seconds = received_bytes / (sample_rate * channels * 2)
+    if not math.isclose(output_seconds, expected_seconds, abs_tol=1e-6):
+        raise ValueError(f"{arm_name}: PCM bytes and duration do not reconcile")
+    input_seconds = _number(
+        root.get("input_duration_sec"),
+        field="input_duration_sec",
+        label=arm_name,
+        positive=True,
+    )
+
+    playback, playback_policy = _playback_metrics(
+        _load_json(
+            arm_dir / "playback_policy_analysis.json",
+            label=f"{arm_name}/playback",
+        ),
+        output_seconds=output_seconds,
+        audio_messages=audio_messages,
+        expected_csv_name=summary_path.name.removesuffix("_summary.json")
+        + "_results.csv",
+        label=f"{arm_name}/playback",
+    )
+
+    input_reference = root.get("audio_path")
+    if not isinstance(input_reference, str) or not input_reference:
+        raise ValueError(f"{arm_name}: input reference is missing")
+    return {
+        "arm": arm_name,
+        "telemetry_schema_version": schema,
+        "incremental_publication_enabled": incremental,
+        "parent_translation_calls": parent_count,
+        "audio_messages": audio_messages,
+        "input_duration_seconds": input_seconds,
+        "output_audio_bytes": received_bytes,
+        "output_audio_seconds": output_seconds,
+        "output_to_input_duration_ratio": output_seconds / input_seconds,
+        "first_translated_audio_seconds": _number(
+            root.get("first_audio_latency_sec"),
+            field="first_audio_latency_sec",
+            label=arm_name,
+        ),
+        "service_tail_lag_seconds": _number(
+            root.get("tail_lag_sec"),
+            field="tail_lag_sec",
+            label=arm_name,
+        ),
+        "captured_listener_tail_seconds": _number(
+            root.get("playback_tail_sec"),
+            field="playback_tail_sec",
+            label=arm_name,
+        ),
+        "tts": tts,
+        "playback": playback,
+        "_match": {
+            "input_reference": input_reference,
+            "input_duration_seconds": input_seconds,
+            "chunks_sent": _integer(
+                root.get("chunks_sent"),
+                field="chunks_sent",
+                label=arm_name,
+                positive=True,
+            ),
+            "backend_config": config_projection,
+            "playback_policy": playback_policy,
+            "upstream": upstream,
+            "parent_audio_bytes": [
+                completed_bytes[parent] for parent in range(parent_count)
+            ],
+        },
+    }
+
+
+def _difference(
+    atomic: float,
+    streaming: float,
+) -> dict[str, float | None]:
+    return {
+        "streaming_minus_atomic": streaming - atomic,
+        "reduction": atomic - streaming,
+        "reduction_percent": (
+            (atomic - streaming) / atomic * 100.0 if atomic > 0 else None
+        ),
+    }
+
+
+def build_canary_summary(input_dir: Path) -> dict[str, Any]:
+    """Load both arms, fail closed on matching, and return safe aggregates."""
+
+    run_info = _run_info(input_dir / "run_info.txt")
+    prefix_path = input_dir / "shared-prefix.wav"
+    try:
+        actual_prefix_sha256 = hashlib.sha256(prefix_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError("shared source prefix could not be read") from exc
+    if actual_prefix_sha256 != run_info["prefix_sha256"]:
+        raise ValueError("shared source prefix digest does not match run_info")
+
+    loaded = [
+        _load_arm(
+            input_dir / arm_name,
+            schema=schema,
+            incremental=incremental,
+            arm_name=arm_name,
+        )
+        for arm_name, schema, incremental in ARMS
+    ]
+    atomic, streaming = loaded
+    atomic_match = atomic["_match"]
+    streaming_match = streaming["_match"]
+    if atomic_match["input_reference"] != streaming_match["input_reference"]:
+        raise ValueError("streaming: input reference does not match atomic")
+    if Path(atomic_match["input_reference"]).resolve() != prefix_path.resolve():
+        raise ValueError("capture input reference is not the shared prefix")
+    for field in ("chunks_sent", "backend_config", "playback_policy", "upstream"):
+        if atomic_match[field] != streaming_match[field]:
+            raise ValueError(f"streaming: matched {field} evidence differs")
+    if not math.isclose(
+        atomic_match["input_duration_seconds"],
+        streaming_match["input_duration_seconds"],
+        abs_tol=MATCH_TOLERANCE_SECONDS,
+        rel_tol=0.0,
+    ):
+        raise ValueError("streaming: input duration does not match atomic")
+    atomic_parent_bytes = atomic_match["parent_audio_bytes"]
+    streaming_parent_bytes = streaming_match["parent_audio_bytes"]
+    if len(atomic_parent_bytes) != len(streaming_parent_bytes):
+        raise ValueError("streaming: TTS parent count does not match atomic")
+    for arm in loaded:
+        arm.pop("_match")
+
+    comparison = {
+        "first_translated_audio": _difference(
+            atomic["first_translated_audio_seconds"],
+            streaming["first_translated_audio_seconds"],
+        ),
+        "captured_listener_tail": _difference(
+            atomic["captured_listener_tail_seconds"],
+            streaming["captured_listener_tail_seconds"],
+        ),
+        "service_tail_lag": _difference(
+            atomic["service_tail_lag_seconds"],
+            streaming["service_tail_lag_seconds"],
+        ),
+        "output_audio_bytes": _difference(
+            float(atomic["output_audio_bytes"]),
+            float(streaming["output_audio_bytes"]),
+        ),
+        "output_audio_seconds": _difference(
+            atomic["output_audio_seconds"],
+            streaming["output_audio_seconds"],
+        ),
+        "output_to_input_duration_ratio": _difference(
+            atomic["output_to_input_duration_ratio"],
+            streaming["output_to_input_duration_ratio"],
+        ),
+        "first_websocket_publication_p95": _difference(
+            atomic["tts"]["source_boundary_to_first_websocket_seconds"]["p95"],
+            streaming["tts"]["source_boundary_to_first_websocket_seconds"]["p95"],
+        ),
+        "first_response_withheld_p95": _difference(
+            atomic["tts"]["first_response_to_first_websocket_seconds"]["p95"],
+            streaming["tts"]["first_response_to_first_websocket_seconds"]["p95"],
+        ),
+        "tts_request_to_first_response_p95": _difference(
+            atomic["tts"]["request_to_first_response_seconds"]["p95"],
+            streaming["tts"]["request_to_first_response_seconds"]["p95"],
+        ),
+        "tts_request_to_full_response_p95": _difference(
+            atomic["tts"]["request_to_full_response_seconds"]["p95"],
+            streaming["tts"]["request_to_full_response_seconds"]["p95"],
+        ),
+        "fixed_queue_p95": _difference(
+            atomic["playback"]["fixed_1x"][
+                "time_weighted_queue_p95_seconds"
+            ],
+            streaming["playback"]["fixed_1x"][
+                "time_weighted_queue_p95_seconds"
+            ],
+        ),
+        "adaptive_queue_p95": _difference(
+            atomic["playback"]["adaptive"][
+                "time_weighted_queue_p95_seconds"
+            ],
+            streaming["playback"]["adaptive"][
+                "time_weighted_queue_p95_seconds"
+            ],
+        ),
+        "adaptive_listener_tail": _difference(
+            atomic["playback"]["adaptive"]["listener_tail_seconds"],
+            streaming["playback"]["adaptive"]["listener_tail_seconds"],
+        ),
+    }
+    byte_difference_percent = (
+        abs(
+            streaming["output_audio_bytes"]
+            - atomic["output_audio_bytes"]
+        )
+        / atomic["output_audio_bytes"]
+        * 100.0
+    )
+    duration_difference_percent = (
+        abs(
+            streaming["output_audio_seconds"]
+            - atomic["output_audio_seconds"]
+        )
+        / atomic["output_audio_seconds"]
+        * 100.0
+    )
+    parent_byte_difference_percent = [
+        abs(streaming_bytes - atomic_bytes) / atomic_bytes * 100.0
+        for atomic_bytes, streaming_bytes in zip(
+            atomic_parent_bytes,
+            streaming_parent_bytes,
+        )
+    ]
+    parent_byte_difference_distribution = _distribution(
+        parent_byte_difference_percent
+    )
+    materially_different_audio = max(
+        byte_difference_percent,
+        duration_difference_percent,
+        parent_byte_difference_distribution["max"],
+    ) > MATERIAL_AUDIO_DIFFERENCE_PERCENT
+    playback_status = (
+        "inconclusive_confounded_by_translated_audio_difference"
+        if materially_different_audio
+        else "descriptive_matched_workload_comparison"
+    )
+    return _round_floats(
+        {
+            "schema_version": 1,
+            "source_format": (
+                "validated matched batch captures and playback analyses"
+            ),
+            "privacy": {
+                "contains_transcript_text": False,
+                "contains_audio": False,
+                "contains_input_paths_or_filenames": False,
+                "contains_endpoints": False,
+                "contains_session_ids": False,
+            },
+            "matched_design": {
+                "passed": True,
+                "shared_prefix_content_hash_matched": True,
+                "input_reference_matched": True,
+                "input_duration_and_chunks_matched": True,
+                "backend_config_and_model_provenance_matched": True,
+                "playback_policy_matched": True,
+                "asr_final_structure_matched": True,
+                "parent_segmentation_matched": True,
+                "nmt_parent_structure_matched": True,
+                "intended_backend_config_differences": list(
+                    INTENDED_CONFIG_DIFFERENCES
+                ),
+            },
+            "arms": loaded,
+            "comparison": comparison,
+            "audio_output_comparability": {
+                "material_difference_threshold_percent": (
+                    MATERIAL_AUDIO_DIFFERENCE_PERCENT
+                ),
+                "absolute_byte_difference_percent": byte_difference_percent,
+                "absolute_duration_difference_percent": (
+                    duration_difference_percent
+                ),
+                "absolute_parent_byte_difference_percent": (
+                    parent_byte_difference_distribution
+                ),
+                "materially_different": materially_different_audio,
+                "exact_cross_arm_byte_equality_required": False,
+            },
+            "cross_arm_playback_conclusion": {
+                "status": playback_status,
+                "confounded": materially_different_audio,
+                "automatic_latency_conclusion_allowed": False,
+                "reason": (
+                    "Queue and tail differences combine publication timing "
+                    "with materially different total duration or per-parent "
+                    "translated-audio bytes."
+                    if materially_different_audio
+                    else
+                    "Queue and tail differences are descriptive; repeated "
+                    "runs and listening review remain required."
+                ),
+            },
+            "primary_incremental_evidence": {
+                "classification": "within_arm_direct_measurement",
+                "first_response_to_first_websocket_seconds": streaming["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ],
+                "first_websocket_lead_over_full_response_seconds": streaming[
+                    "tts"
+                ]["first_websocket_lead_over_full_response_seconds"],
+                "interpretation": (
+                    "Positive full-response lead means schema 3 published "
+                    "the first PCM before the TTS RPC completed."
+                ),
+            },
+            "interpretation": {
+                "positive_reduction_is_better_for_latency_or_queue_metrics": True,
+                "audio_byte_and_duration_differences_are_not_quality_proof": True,
+                "native_language_listening_review_required": True,
+            },
+        }
+    )
+
+
+def _seconds(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):.3f}s"
+
+
+def _percent(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):.1f}%"
+
+
+def render_markdown(summary: dict[str, Any]) -> str:
+    """Render a compact comparison without copying identifying evidence."""
+
+    arms = {arm["arm"]: arm for arm in summary["arms"]}
+    atomic = arms["atomic"]
+    streaming = arms["streaming"]
+    comparison = summary["comparison"]
+    comparability = summary["audio_output_comparability"]
+    playback_conclusion = summary["cross_arm_playback_conclusion"]
+    primary = summary["primary_incremental_evidence"]
+    warning = (
+        "Cross-arm playback queue and tail results are **inconclusive**: "
+        "translated-audio duration differed materially, so those deltas mix "
+        "publication timing with a different playback workload."
+        if playback_conclusion["confounded"]
+        else
+        "Cross-arm playback metrics are descriptive matched-workload results; "
+        "they are not an automatic promotion decision."
+    )
+    lines = [
+        "# Matched Incremental TTS Publication Canary",
+        "",
+        "The source prefix, model provenance, ASR-final structure, parent "
+        "segmentation, NMT parent structure, and playback policy matched.",
+        "",
+        warning,
+        "",
+        "Direct within-arm schema-3 result: first PCM reached the WebSocket "
+        "{delay} after the first TTS response (p95) and {lead} before the full "
+        "TTS response completed (p95; positive means earlier publication).".format(
+            delay=_seconds(
+                primary["first_response_to_first_websocket_seconds"]["p95"]
+            ),
+            lead=_seconds(
+                primary[
+                    "first_websocket_lead_over_full_response_seconds"
+                ]["p95"]
+            ),
+        ),
+        "",
+        "| Metric | Atomic | Incremental | Incremental benefit |",
+        "|---|---:|---:|---:|",
+        "| First translated audio | {a} | {s} | {b} |".format(
+            a=_seconds(atomic["first_translated_audio_seconds"]),
+            s=_seconds(streaming["first_translated_audio_seconds"]),
+            b=_seconds(comparison["first_translated_audio"]["reduction"]),
+        ),
+        "| Captured listener tail | {a} | {s} | {b} |".format(
+            a=_seconds(atomic["captured_listener_tail_seconds"]),
+            s=_seconds(streaming["captured_listener_tail_seconds"]),
+            b=_seconds(comparison["captured_listener_tail"]["reduction"]),
+        ),
+        "| Service tail lag | {a} | {s} | {b} |".format(
+            a=_seconds(atomic["service_tail_lag_seconds"]),
+            s=_seconds(streaming["service_tail_lag_seconds"]),
+            b=_seconds(comparison["service_tail_lag"]["reduction"]),
+        ),
+        "| Source boundary → first WebSocket (p95) | {a} | {s} | {b} |".format(
+            a=_seconds(
+                atomic["tts"][
+                    "source_boundary_to_first_websocket_seconds"
+                ]["p95"]
+            ),
+            s=_seconds(
+                streaming["tts"][
+                    "source_boundary_to_first_websocket_seconds"
+                ]["p95"]
+            ),
+            b=_seconds(
+                comparison["first_websocket_publication_p95"]["reduction"]
+            ),
+        ),
+        "| TTS first response withheld (p95) | {a} | {s} | {b} |".format(
+            a=_seconds(
+                atomic["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ]["p95"]
+            ),
+            s=_seconds(
+                streaming["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ]["p95"]
+            ),
+            b=_seconds(
+                comparison["first_response_withheld_p95"]["reduction"]
+            ),
+        ),
+        "| TTS request → first response (p95) | {a} | {s} | {b} |".format(
+            a=_seconds(
+                atomic["tts"]["request_to_first_response_seconds"]["p95"]
+            ),
+            s=_seconds(
+                streaming["tts"]["request_to_first_response_seconds"]["p95"]
+            ),
+            b=_seconds(
+                comparison["tts_request_to_first_response_p95"]["reduction"]
+            ),
+        ),
+        "| TTS request → full response (p95) | {a} | {s} | {b} |".format(
+            a=_seconds(
+                atomic["tts"]["request_to_full_response_seconds"]["p95"]
+            ),
+            s=_seconds(
+                streaming["tts"]["request_to_full_response_seconds"]["p95"]
+            ),
+            b=_seconds(
+                comparison["tts_request_to_full_response_p95"]["reduction"]
+            ),
+        ),
+        "| Adaptive queue p95 | {a} | {s} | {b} |".format(
+            a=_seconds(
+                atomic["playback"]["adaptive"][
+                    "time_weighted_queue_p95_seconds"
+                ]
+            ),
+            s=_seconds(
+                streaming["playback"]["adaptive"][
+                    "time_weighted_queue_p95_seconds"
+                ]
+            ),
+            b=_seconds(comparison["adaptive_queue_p95"]["reduction"]),
+        ),
+        "| Adaptive listener tail | {a} | {s} | {b} |".format(
+            a=_seconds(
+                atomic["playback"]["adaptive"]["listener_tail_seconds"]
+            ),
+            s=_seconds(
+                streaming["playback"]["adaptive"]["listener_tail_seconds"]
+            ),
+            b=_seconds(comparison["adaptive_listener_tail"]["reduction"]),
+        ),
+        "",
+        "## Audio parity",
+        "",
+        "- Atomic: {bytes:,} bytes / {seconds}".format(
+            bytes=atomic["output_audio_bytes"],
+            seconds=_seconds(atomic["output_audio_seconds"]),
+        ),
+        "- Incremental: {bytes:,} bytes / {seconds}".format(
+            bytes=streaming["output_audio_bytes"],
+            seconds=_seconds(streaming["output_audio_seconds"]),
+        ),
+        "- Byte difference: {delta:+.0f} ({percent})".format(
+            delta=comparison["output_audio_bytes"]["streaming_minus_atomic"],
+            percent=_percent(
+                -comparison["output_audio_bytes"]["reduction_percent"]
+                if comparison["output_audio_bytes"]["reduction_percent"]
+                is not None
+                else None
+            ),
+        ),
+        "- Material-difference threshold: {threshold:.1f}%".format(
+            threshold=comparability[
+                "material_difference_threshold_percent"
+            ]
+        ),
+        "- Maximum corresponding-parent byte difference: {percent}".format(
+            percent=_percent(
+                comparability[
+                    "absolute_parent_byte_difference_percent"
+                ]["max"]
+            )
+        ),
+        "- Materially different: {value}".format(
+            value="yes" if comparability["materially_different"] else "no"
+        ),
+        "",
+        "Positive benefit values mean lower latency, tail, or queue depth. "
+        "Audio-duration similarity is necessary evidence, not a listening-"
+        "quality verdict; native-language review remains required.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def create_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--markdown-output", type=Path)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = create_argument_parser().parse_args(argv)
+    summary = build_canary_summary(args.input_dir)
+    json_output = (
+        args.json_output
+        or args.input_dir / "streaming_tts_canary_comparison.json"
+    )
+    markdown_output = (
+        args.markdown_output
+        or args.input_dir / "streaming_tts_canary_comparison.md"
+    )
+    if json_output.resolve() == markdown_output.resolve():
+        raise SystemExit("JSON and Markdown outputs must be different")
+    json_output.parent.mkdir(parents=True, exist_ok=True)
+    markdown_output.parent.mkdir(parents=True, exist_ok=True)
+    json_output.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    markdown_output.write_text(render_markdown(summary), encoding="utf-8")
+    print(f"Wrote {json_output}")
+    print(f"Wrote {markdown_output}")
+
+
+if __name__ == "__main__":
+    main()

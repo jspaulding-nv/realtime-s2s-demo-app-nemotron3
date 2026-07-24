@@ -14,7 +14,7 @@ from typing import Any, Iterable, Sequence
 
 
 ANALYSIS_SCHEMA_VERSION = 1
-SUPPORTED_TELEMETRY_SCHEMA_VERSIONS = {1, 2}
+SUPPORTED_TELEMETRY_SCHEMA_VERSIONS = {1, 2, 3}
 SOURCE_TIME_TOLERANCE_MS = 1e-3
 PCM_BYTES_PER_SAMPLE = 2
 
@@ -49,6 +49,7 @@ class SampleLatency:
     parent_websocket_first_sends: tuple[TimedObservation, ...]
     parent_websocket_final_sends: tuple[TimedObservation, ...]
     tts_response_series: tuple["TTSResponseSeries", ...]
+    incremental_publications: tuple["IncrementalPublicationSeries", ...]
 
     @property
     def sample_label(self) -> str:
@@ -56,6 +57,8 @@ class SampleLatency:
 
     @property
     def tts_withheld_seconds(self) -> tuple[float, ...]:
+        if self.telemetry_schema_version == 3:
+            return ()
         return tuple(
             (sent.pipeline_elapsed_ms - first.pipeline_elapsed_ms) / 1_000.0
             for first, sent in zip(
@@ -63,6 +66,67 @@ class SampleLatency:
                 self.websocket_sends,
             )
         )
+
+
+@dataclass(frozen=True)
+class IncrementalPublicationSeries:
+    """Validated frame-publication evidence for one schema-v3 parent."""
+
+    identity: tuple[int]
+    source_end_ms: float
+    total_audio_bytes: int
+    frame_audio_bytes: tuple[int, ...]
+    frame_send_elapsed_ms: tuple[float, ...]
+    tts_first_elapsed_ms: float
+    tts_completed_elapsed_ms: float
+
+    @property
+    def frame_count(self) -> int:
+        return len(self.frame_audio_bytes)
+
+    @property
+    def first_send_elapsed_ms(self) -> float:
+        return self.frame_send_elapsed_ms[0]
+
+    @property
+    def final_send_elapsed_ms(self) -> float:
+        return self.frame_send_elapsed_ms[-1]
+
+    @property
+    def first_response_to_first_publish_seconds(self) -> float:
+        return (
+            self.first_send_elapsed_ms - self.tts_first_elapsed_ms
+        ) / 1_000.0
+
+    @property
+    def atomic_withholding_equivalent_seconds(self) -> float:
+        """Time an atomic publisher necessarily waits for RPC completion."""
+
+        return (
+            self.tts_completed_elapsed_ms - self.tts_first_elapsed_ms
+        ) / 1_000.0
+
+    @property
+    def first_publish_lead_over_tts_completion_seconds(self) -> float:
+        """Positive when the first frame was sent before RPC completion."""
+
+        return (
+            self.tts_completed_elapsed_ms - self.first_send_elapsed_ms
+        ) / 1_000.0
+
+    @property
+    def tts_completion_to_final_publish_seconds(self) -> float:
+        """Signed output-drain interval after the TTS iterator completed."""
+
+        return (
+            self.final_send_elapsed_ms - self.tts_completed_elapsed_ms
+        ) / 1_000.0
+
+    @property
+    def first_to_final_publish_seconds(self) -> float:
+        return (
+            self.final_send_elapsed_ms - self.first_send_elapsed_ms
+        ) / 1_000.0
 
 
 @dataclass(frozen=True)
@@ -218,14 +282,16 @@ def _tts_key(
         field=f"{field}.sequence_id",
         label=label,
     )
-    if schema_version == 1:
+    if schema_version in {1, 3}:
         if event.get("subsequence_id") is not None:
             raise ValueError(
-                f"{label}: {field} has subsequence identity in schema v1"
+                f"{label}: {field} has subsequence identity in schema "
+                f"v{schema_version}"
             )
         if event.get("subsequence_count") is not None:
             raise ValueError(
-                f"{label}: {field} has subsequence identity in schema v1"
+                f"{label}: {field} has subsequence identity in schema "
+                f"v{schema_version}"
             )
         parent_sequence_id = event.get("parent_sequence_id")
         if (
@@ -262,6 +328,129 @@ def _tts_key(
             f"{label}: {field}.subsequence_id is outside subsequence_count"
         )
     return (parent_sequence_id, subsequence_id, subsequence_count)
+
+
+def _audio_frame_key(
+    event: dict[str, Any],
+    *,
+    field: str,
+    label: str,
+    require_sequence_alias: bool,
+) -> tuple[int, int]:
+    parent_sequence_id = _require_nonnegative_int(
+        event.get("parent_sequence_id"),
+        field=f"{field}.parent_sequence_id",
+        label=label,
+    )
+    if require_sequence_alias:
+        sequence_id = _require_nonnegative_int(
+            event.get("sequence_id"),
+            field=f"{field}.sequence_id",
+            label=label,
+        )
+        if sequence_id != parent_sequence_id:
+            raise ValueError(
+                f"{label}: {field}.sequence_id does not match "
+                "parent_sequence_id"
+            )
+    audio_frame_id = _require_nonnegative_int(
+        event.get("audio_frame_id"),
+        field=f"{field}.audio_frame_id",
+        label=label,
+    )
+    if (
+        event.get("subsequence_id") is not None
+        or event.get("subsequence_count") is not None
+    ):
+        raise ValueError(
+            f"{label}: {field} mixes frame and subsequence identity"
+        )
+    return parent_sequence_id, audio_frame_id
+
+
+def _audio_frame_keys(
+    value: Any,
+    *,
+    field: str,
+    label: str,
+) -> tuple[tuple[int, int], ...]:
+    raw = _require_list(value, field=field, label=label)
+    return tuple(
+        _audio_frame_key(
+            _require_object(
+                item,
+                field=f"{field}[{index}]",
+                label=label,
+            ),
+            field=f"{field}[{index}]",
+            label=label,
+            require_sequence_alias=False,
+        )
+        for index, item in enumerate(raw)
+    )
+
+
+def _positive_int_list(
+    value: Any,
+    *,
+    field: str,
+    label: str,
+) -> tuple[int, ...]:
+    raw = _require_list(value, field=field, label=label)
+    return tuple(
+        _require_positive_int(
+            item,
+            field=f"{field}[{index}]",
+            label=label,
+        )
+        for index, item in enumerate(raw)
+    )
+
+
+def _parent_summaries(
+    value: Any,
+    *,
+    field: str,
+    label: str,
+) -> tuple[tuple[int, int, int, int], ...]:
+    raw = _require_list(value, field=field, label=label)
+    summaries: list[tuple[int, int, int, int]] = []
+    for index, item in enumerate(raw):
+        item_field = f"{field}[{index}]"
+        summary = _require_object(item, field=item_field, label=label)
+        parent_sequence_id = _require_nonnegative_int(
+            summary.get("parent_sequence_id"),
+            field=f"{item_field}.parent_sequence_id",
+            label=label,
+        )
+        audio_frame_count = _require_positive_int(
+            summary.get("audio_frame_count"),
+            field=f"{item_field}.audio_frame_count",
+            label=label,
+        )
+        audio_bytes = _require_positive_int(
+            summary.get("audio_bytes"),
+            field=f"{item_field}.audio_bytes",
+            label=label,
+        )
+        retry_count = _require_nonnegative_int(
+            summary.get("retry_count"),
+            field=f"{item_field}.retry_count",
+            label=label,
+        )
+        if retry_count not in {0, 1}:
+            raise ValueError(
+                f"{label}: {item_field}.retry_count must be zero or one"
+            )
+        summaries.append(
+            (
+                parent_sequence_id,
+                audio_frame_count,
+                audio_bytes,
+                retry_count,
+            )
+        )
+    return tuple(summaries)
 
 
 def _event_observation(
@@ -381,6 +570,24 @@ def _pcm_bytes_per_second(
         label=label,
     )
     return sample_rate * channels * PCM_BYTES_PER_SAMPLE
+
+
+def _pcm_frame_alignment_bytes(
+    root: dict[str, Any],
+    *,
+    label: str,
+) -> int:
+    backend_config = _require_object(
+        root.get("backend_config"),
+        field="backend_config",
+        label=label,
+    )
+    channels = _require_positive_int(
+        backend_config.get("channels"),
+        field="backend_config.channels",
+        label=label,
+    )
+    return channels * PCM_BYTES_PER_SAMPLE
 
 
 def _validate_parent_children(
@@ -754,6 +961,328 @@ def _load_tts_response_series(
     return tuple(series)
 
 
+def _load_incremental_publication_series(
+    staged: dict[str, Any],
+    *,
+    events: list[dict[str, Any]],
+    pipeline_start_ms: float,
+    pcm_bytes_per_second: int,
+    pcm_frame_alignment_bytes: int,
+    parent_ids: tuple[int, ...],
+    segments: dict[int, TimedObservation],
+    tts_first: dict[tuple[int, int, int], TimedObservation],
+    tts_full: dict[tuple[int, int, int], TimedObservation],
+    tts_audio_bytes: dict[tuple[int, int, int], int],
+    tts_first_frame_counts: dict[tuple[int, int, int], int],
+    tts_audio_frame_counts: dict[tuple[int, int, int], int],
+    tts_retry_counts: dict[tuple[int, int, int], int],
+    label: str,
+) -> tuple[
+    dict[tuple[int, int, int], TimedObservation],
+    tuple[IncrementalPublicationSeries, ...],
+]:
+    """Validate schema-v3 frame identity, bytes, and publication timing."""
+
+    if staged.get("tts_incremental_publish_enabled") is not True:
+        raise ValueError(
+            f"{label}: schema v3 requires incremental TTS publication"
+        )
+    if staged.get("tts_subsegmentation_enabled") is not False:
+        raise ValueError(
+            f"{label}: schema v3 prohibits TTS subsegmentation"
+        )
+    frame_duration_ms = _require_positive_int(
+        staged.get("tts_incremental_frame_ms"),
+        field="staged_pipeline.tts_incremental_frame_ms",
+        label=label,
+    )
+    configured_frame_bytes = _require_positive_int(
+        staged.get("tts_incremental_frame_bytes"),
+        field="staged_pipeline.tts_incremental_frame_bytes",
+        label=label,
+    )
+    expected_frame_bytes = pcm_bytes_per_second * frame_duration_ms / 1_000.0
+    if (
+        not expected_frame_bytes.is_integer()
+        or configured_frame_bytes != int(expected_frame_bytes)
+    ):
+        raise ValueError(
+            f"{label}: incremental frame duration and PCM bytes do not "
+            "reconcile"
+        )
+
+    frame_key_fields = (
+        "published_audio_frame_keys",
+        "dequeued_audio_frame_keys",
+        "websocket_sent_audio_frame_keys",
+    )
+    parsed_key_layers = tuple(
+        _audio_frame_keys(
+            staged.get(field),
+            field=f"staged_pipeline.{field}",
+            label=label,
+        )
+        for field in frame_key_fields
+    )
+    if parsed_key_layers[1:] != parsed_key_layers[:-1]:
+        raise ValueError(
+            f"{label}: schema-v3 frame identity layers do not reconcile"
+        )
+    frame_keys = parsed_key_layers[0]
+
+    frame_byte_fields = (
+        "published_audio_frame_bytes",
+        "dequeued_audio_frame_bytes",
+        "websocket_sent_audio_frame_bytes",
+    )
+    parsed_byte_layers = tuple(
+        _positive_int_list(
+            staged.get(field),
+            field=f"staged_pipeline.{field}",
+            label=label,
+        )
+        for field in frame_byte_fields
+    )
+    if parsed_byte_layers[1:] != parsed_byte_layers[:-1]:
+        raise ValueError(
+            f"{label}: schema-v3 frame byte layers do not reconcile"
+        )
+    frame_bytes = parsed_byte_layers[0]
+    if len(frame_keys) != len(frame_bytes):
+        raise ValueError(
+            f"{label}: schema-v3 frame identities and bytes differ in length"
+        )
+    _require_numeric_count(
+        staged,
+        field="audio_frames_produced",
+        expected=len(frame_keys),
+        label=label,
+    )
+
+    parent_fields = (
+        "produced_parent_summaries",
+        "completed_parent_summaries",
+        "websocket_completed_parent_summaries",
+    )
+    parsed_parent_layers = tuple(
+        _parent_summaries(
+            staged.get(field),
+            field=f"staged_pipeline.{field}",
+            label=label,
+        )
+        for field in parent_fields
+    )
+    if parsed_parent_layers[1:] != parsed_parent_layers[:-1]:
+        raise ValueError(
+            f"{label}: schema-v3 parent completion layers do not reconcile"
+        )
+    parent_summaries = parsed_parent_layers[0]
+    if tuple(item[0] for item in parent_summaries) != parent_ids:
+        raise ValueError(
+            f"{label}: schema-v3 parent summaries do not match segments"
+        )
+
+    expected_keys: list[tuple[int, int]] = []
+    parent_slices: dict[int, slice] = {}
+    offset = 0
+    for parent_id, frame_count, audio_bytes, retry_count in parent_summaries:
+        request_key = (parent_id, 0, 1)
+        if request_key not in tts_full:
+            raise ValueError(
+                f"{label}: parent completion has no matching TTS request"
+            )
+        if (
+            tts_audio_bytes[request_key] != audio_bytes
+            or tts_first_frame_counts.get(request_key) != frame_count
+            or tts_audio_frame_counts.get(request_key) != frame_count
+            or tts_retry_counts[request_key] != retry_count
+        ):
+            raise ValueError(
+                f"{label}: TTS completion and parent summary do not reconcile"
+            )
+        parent_slice = slice(offset, offset + frame_count)
+        parent_slices[parent_id] = parent_slice
+        sizes = frame_bytes[parent_slice]
+        if len(sizes) != frame_count or sum(sizes) != audio_bytes:
+            raise ValueError(
+                f"{label}: parent {parent_id} frame bytes do not reconcile"
+            )
+        if (
+            any(size != configured_frame_bytes for size in sizes[:-1])
+            or sizes[-1] > configured_frame_bytes
+            or any(size % pcm_frame_alignment_bytes for size in sizes)
+        ):
+            raise ValueError(
+                f"{label}: parent {parent_id} violates incremental PCM "
+                "framing"
+            )
+        expected_keys.extend(
+            (parent_id, audio_frame_id)
+            for audio_frame_id in range(frame_count)
+        )
+        offset += frame_count
+    if tuple(expected_keys) != frame_keys or offset != len(frame_bytes):
+        raise ValueError(
+            f"{label}: schema-v3 frame identities are not contiguous by parent"
+        )
+
+    websocket_events = _require_list(
+        staged.get("websocket_send_events"),
+        field="staged_pipeline.websocket_send_events",
+        label=label,
+    )
+    websocket_keys: list[tuple[int, int]] = []
+    websocket_bytes: list[int] = []
+    websocket_elapsed_ms: list[float] = []
+    prior_sent_ms = pipeline_start_ms
+    for index, raw_event in enumerate(websocket_events):
+        field = f"staged_pipeline.websocket_send_events[{index}]"
+        event = _require_object(raw_event, field=field, label=label)
+        websocket_keys.append(
+            _audio_frame_key(
+                event,
+                field=field,
+                label=label,
+                require_sequence_alias=True,
+            )
+        )
+        websocket_bytes.append(
+            _require_positive_int(
+                event.get("audio_bytes"),
+                field=f"{field}.audio_bytes",
+                label=label,
+            )
+        )
+        sent_ms = _require_nonnegative_finite(
+            event.get("sent_monotonic_ms"),
+            field=f"{field}.sent_monotonic_ms",
+            label=label,
+        )
+        if sent_ms < prior_sent_ms:
+            raise ValueError(
+                f"{label}: schema-v3 WebSocket sends are not time-ordered"
+            )
+        prior_sent_ms = sent_ms
+        websocket_elapsed_ms.append(sent_ms - pipeline_start_ms)
+    if tuple(websocket_keys) != frame_keys:
+        raise ValueError(
+            f"{label}: WebSocket frame identities do not reconcile"
+        )
+    if tuple(websocket_bytes) != frame_bytes:
+        raise ValueError(
+            f"{label}: WebSocket frame bytes do not reconcile"
+        )
+
+    frame_event_names = (
+        ("tts", "frame_received"),
+        ("output", "frame_enqueued"),
+        ("output", "frame_dequeued"),
+    )
+    frame_event_records: dict[
+        tuple[str, str],
+        tuple[list[tuple[int, int]], list[int]],
+    ] = {
+        name: ([], []) for name in frame_event_names
+    }
+    parent_event_names = (
+        ("output", "parent_complete_enqueued"),
+        ("output", "parent_complete_dequeued"),
+    )
+    parent_event_records: dict[
+        tuple[str, str],
+        list[tuple[int, int, int, int]],
+    ] = {name: [] for name in parent_event_names}
+    for index, event in enumerate(events):
+        event_name = (event.get("stage"), event.get("event"))
+        field = f"staged_pipeline.events[{index}]"
+        if event_name in frame_event_records:
+            keys, sizes = frame_event_records[event_name]
+            keys.append(
+                _audio_frame_key(
+                    event,
+                    field=field,
+                    label=label,
+                    require_sequence_alias=True,
+                )
+            )
+            sizes.append(
+                _require_positive_int(
+                    event.get("audio_bytes"),
+                    field=f"{field}.audio_bytes",
+                    label=label,
+                )
+            )
+        elif event_name in parent_event_records:
+            summary = _parent_summaries(
+                [
+                    {
+                        "parent_sequence_id": event.get(
+                            "parent_sequence_id",
+                            event.get("sequence_id"),
+                        ),
+                        "audio_frame_count": event.get("audio_frame_count"),
+                        "audio_bytes": event.get("audio_bytes"),
+                        "retry_count": event.get("retry_count"),
+                    }
+                ],
+                field=field,
+                label=label,
+            )[0]
+            if event.get("sequence_id") != summary[0]:
+                raise ValueError(
+                    f"{label}: {field}.sequence_id does not match parent"
+                )
+            parent_event_records[event_name].append(summary)
+    for event_name, (keys, sizes) in frame_event_records.items():
+        if tuple(keys) != frame_keys or tuple(sizes) != frame_bytes:
+            raise ValueError(
+                f"{label}: {event_name[0]}/{event_name[1]} frame evidence "
+                "does not reconcile"
+            )
+    for event_name, summaries in parent_event_records.items():
+        if tuple(summaries) != parent_summaries:
+            raise ValueError(
+                f"{label}: {event_name[0]}/{event_name[1]} parent evidence "
+                "does not reconcile"
+            )
+
+    logical_sends: dict[tuple[int, int, int], TimedObservation] = {}
+    series: list[IncrementalPublicationSeries] = []
+    for parent_id, _, audio_bytes, _ in parent_summaries:
+        request_key = (parent_id, 0, 1)
+        parent_slice = parent_slices[parent_id]
+        send_times = tuple(websocket_elapsed_ms[parent_slice])
+        sizes = tuple(frame_bytes[parent_slice])
+        first_tts_ms = tts_first[request_key].pipeline_elapsed_ms
+        completed_tts_ms = tts_full[request_key].pipeline_elapsed_ms
+        if first_tts_ms > completed_tts_ms:
+            raise ValueError(
+                f"{label}: TTS first/completed timing order is invalid"
+            )
+        if send_times[0] < first_tts_ms:
+            raise ValueError(
+                f"{label}: first schema-v3 frame was sent before first TTS PCM"
+            )
+        source_end_ms = segments[parent_id].source_end_ms
+        logical_sends[request_key] = TimedObservation(
+            identity=request_key,
+            source_end_ms=source_end_ms,
+            pipeline_elapsed_ms=send_times[-1],
+        )
+        series.append(
+            IncrementalPublicationSeries(
+                identity=(parent_id,),
+                source_end_ms=source_end_ms,
+                total_audio_bytes=audio_bytes,
+                frame_audio_bytes=sizes,
+                frame_send_elapsed_ms=send_times,
+                tts_first_elapsed_ms=first_tts_ms,
+                tts_completed_elapsed_ms=completed_tts_ms,
+            )
+        )
+    return logical_sends, tuple(series)
+
+
 def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
     """Load and validate one completed staged batch summary.
 
@@ -778,6 +1307,10 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
     staged = _validate_complete_summary(root, label=label)
     harness_frame_duration_ms = _harness_frame_duration_ms(root, label=label)
     pcm_bytes_per_second = _pcm_bytes_per_second(root, label=label)
+    pcm_frame_alignment_bytes = _pcm_frame_alignment_bytes(
+        root,
+        label=label,
+    )
 
     schema_version = staged.get("telemetry_schema_version", 1)
     if (
@@ -786,7 +1319,7 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
         or schema_version not in SUPPORTED_TELEMETRY_SCHEMA_VERSIONS
     ):
         raise ValueError(
-            f"{label}: telemetry_schema_version must be one or two"
+            f"{label}: telemetry_schema_version must be one, two, or three"
         )
 
     events = _require_list(
@@ -823,6 +1356,8 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
     tts_first: dict[tuple[int, int, int], TimedObservation] = {}
     tts_full: dict[tuple[int, int, int], TimedObservation] = {}
     tts_audio_bytes: dict[tuple[int, int, int], int] = {}
+    tts_first_frame_counts: dict[tuple[int, int, int], int] = {}
+    tts_audio_frame_counts: dict[tuple[int, int, int], int] = {}
     tts_retry_counts: dict[tuple[int, int, int], int] = {}
 
     for index, event in enumerate(events):
@@ -897,6 +1432,17 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
                 field=field,
                 label=label,
             )
+            if schema_version == 3 and event_name != "started":
+                parent_sequence_id = _require_nonnegative_int(
+                    event.get("parent_sequence_id"),
+                    field=f"{field}.parent_sequence_id",
+                    label=label,
+                )
+                if parent_sequence_id != key[0]:
+                    raise ValueError(
+                        f"{label}: {field}.parent_sequence_id does not "
+                        "match sequence_id"
+                    )
             observation = _event_observation(
                 event,
                 identity=key,
@@ -920,6 +1466,12 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
                     field="TTS first-response",
                     label=label,
                 )
+                if schema_version == 3:
+                    tts_first_frame_counts[key] = _require_positive_int(
+                        event.get("audio_frame_count"),
+                        field=f"{field}.audio_frame_count",
+                        label=label,
+                    )
             else:
                 _store_unique(
                     tts_full,
@@ -933,6 +1485,12 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
                     field=f"{field}.audio_bytes",
                     label=label,
                 )
+                if schema_version == 3:
+                    tts_audio_frame_counts[key] = _require_positive_int(
+                        event.get("audio_frame_count"),
+                        field=f"{field}.audio_frame_count",
+                        label=label,
+                    )
                 retry_count = _require_nonnegative_int(
                     event.get("retry_count"),
                     field=f"{field}.retry_count",
@@ -987,61 +1545,85 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
                 "match its contributing ASR finals"
             )
 
-    websocket_events = _require_list(
-        staged.get("websocket_send_events"),
-        field="staged_pipeline.websocket_send_events",
-        label=label,
-    )
-    websocket_sends: dict[tuple[int, int, int], TimedObservation] = {}
-    for index, raw_event in enumerate(websocket_events):
-        event = _require_object(
-            raw_event,
-            field=f"staged_pipeline.websocket_send_events[{index}]",
-            label=label,
-        )
-        field = f"staged_pipeline.websocket_send_events[{index}]"
-        key = _tts_key(
-            event,
-            schema_version=schema_version,
-            field=field,
-            label=label,
-        )
-        if key not in tts_full:
-            raise ValueError(
-                f"{label}: WebSocket send has no matching TTS request"
+    incremental_publications: tuple[
+        IncrementalPublicationSeries,
+        ...,
+    ] = ()
+    if schema_version == 3:
+        websocket_sends, incremental_publications = (
+            _load_incremental_publication_series(
+                staged,
+                events=events,
+                pipeline_start_ms=pipeline_start_ms,
+                pcm_bytes_per_second=pcm_bytes_per_second,
+                pcm_frame_alignment_bytes=pcm_frame_alignment_bytes,
+                parent_ids=parent_ids,
+                segments=segments,
+                tts_first=tts_first,
+                tts_full=tts_full,
+                    tts_audio_bytes=tts_audio_bytes,
+                    tts_first_frame_counts=tts_first_frame_counts,
+                    tts_audio_frame_counts=tts_audio_frame_counts,
+                tts_retry_counts=tts_retry_counts,
+                label=label,
             )
-        sent_monotonic_ms = _require_nonnegative_finite(
-            event.get("sent_monotonic_ms"),
-            field=f"{field}.sent_monotonic_ms",
+        )
+    else:
+        websocket_events = _require_list(
+            staged.get("websocket_send_events"),
+            field="staged_pipeline.websocket_send_events",
             label=label,
         )
-        sent_elapsed_ms = sent_monotonic_ms - pipeline_start_ms
-        if sent_elapsed_ms < 0:
-            raise ValueError(f"{label}: {field} precedes pipeline start")
-        audio_bytes = _require_positive_int(
-            event.get("audio_bytes"),
-            field=f"{field}.audio_bytes",
-            label=label,
-        )
-        if audio_bytes != tts_audio_bytes[key]:
-            raise ValueError(
-                f"{label}: WebSocket and TTS byte counts do not match"
+        websocket_sends = {}
+        for index, raw_event in enumerate(websocket_events):
+            event = _require_object(
+                raw_event,
+                field=f"staged_pipeline.websocket_send_events[{index}]",
+                label=label,
             )
-        _store_unique(
-            websocket_sends,
-            key,
-            TimedObservation(
-                identity=key,
-                source_end_ms=tts_full[key].source_end_ms,
-                pipeline_elapsed_ms=sent_elapsed_ms,
-            ),
-            field="WebSocket send",
-            label=label,
-        )
-    if set(websocket_sends) != set(tts_full):
-        raise ValueError(
-            f"{label}: WebSocket and TTS request identities do not match"
-        )
+            field = f"staged_pipeline.websocket_send_events[{index}]"
+            key = _tts_key(
+                event,
+                schema_version=schema_version,
+                field=field,
+                label=label,
+            )
+            if key not in tts_full:
+                raise ValueError(
+                    f"{label}: WebSocket send has no matching TTS request"
+                )
+            sent_monotonic_ms = _require_nonnegative_finite(
+                event.get("sent_monotonic_ms"),
+                field=f"{field}.sent_monotonic_ms",
+                label=label,
+            )
+            sent_elapsed_ms = sent_monotonic_ms - pipeline_start_ms
+            if sent_elapsed_ms < 0:
+                raise ValueError(f"{label}: {field} precedes pipeline start")
+            audio_bytes = _require_positive_int(
+                event.get("audio_bytes"),
+                field=f"{field}.audio_bytes",
+                label=label,
+            )
+            if audio_bytes != tts_audio_bytes[key]:
+                raise ValueError(
+                    f"{label}: WebSocket and TTS byte counts do not match"
+                )
+            _store_unique(
+                websocket_sends,
+                key,
+                TimedObservation(
+                    identity=key,
+                    source_end_ms=tts_full[key].source_end_ms,
+                    pipeline_elapsed_ms=sent_elapsed_ms,
+                ),
+                field="WebSocket send",
+                label=label,
+            )
+        if set(websocket_sends) != set(tts_full):
+            raise ValueError(
+                f"{label}: WebSocket and TTS request identities do not match"
+            )
 
     ordered_tts_keys = tuple(sorted(tts_first))
     for key in ordered_tts_keys:
@@ -1059,10 +1641,11 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
             raise ValueError(
                 f"{label}: TTS source boundary does not match its parent segment"
             )
-        if (
-            tts_first[key].pipeline_elapsed_ms
-            > tts_full[key].pipeline_elapsed_ms
-            or tts_full[key].pipeline_elapsed_ms
+        if tts_first[key].pipeline_elapsed_ms > tts_full[
+            key
+        ].pipeline_elapsed_ms or (
+            schema_version != 3
+            and tts_full[key].pipeline_elapsed_ms
             > websocket_sends[key].pipeline_elapsed_ms
         ):
             raise ValueError(
@@ -1120,6 +1703,9 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
     parent_full: list[TimedObservation] = []
     parent_ws_first: list[TimedObservation] = []
     parent_ws_final: list[TimedObservation] = []
+    incremental_by_parent = {
+        item.identity[0]: item for item in incremental_publications
+    }
     for parent_id in parent_ids:
         keys = tuple(key for key in ordered_tts_keys if key[0] == parent_id)
         first = min(
@@ -1130,14 +1716,19 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
             (tts_full[key] for key in keys),
             key=lambda item: item.pipeline_elapsed_ms,
         )
-        ws_first = min(
-            (websocket_sends[key] for key in keys),
-            key=lambda item: item.pipeline_elapsed_ms,
-        )
-        ws_final = max(
-            (websocket_sends[key] for key in keys),
-            key=lambda item: item.pipeline_elapsed_ms,
-        )
+        if schema_version == 3:
+            publication = incremental_by_parent[parent_id]
+            ws_first_elapsed_ms = publication.first_send_elapsed_ms
+            ws_final_elapsed_ms = publication.final_send_elapsed_ms
+        else:
+            ws_first_elapsed_ms = min(
+                (websocket_sends[key] for key in keys),
+                key=lambda item: item.pipeline_elapsed_ms,
+            ).pipeline_elapsed_ms
+            ws_final_elapsed_ms = max(
+                (websocket_sends[key] for key in keys),
+                key=lambda item: item.pipeline_elapsed_ms,
+            ).pipeline_elapsed_ms
         parent_first.append(
             TimedObservation(
                 identity=(parent_id,),
@@ -1156,14 +1747,14 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
             TimedObservation(
                 identity=(parent_id,),
                 source_end_ms=segments[parent_id].source_end_ms,
-                pipeline_elapsed_ms=ws_first.pipeline_elapsed_ms,
+                pipeline_elapsed_ms=ws_first_elapsed_ms,
             )
         )
         parent_ws_final.append(
             TimedObservation(
                 identity=(parent_id,),
                 source_end_ms=segments[parent_id].source_end_ms,
-                pipeline_elapsed_ms=ws_final.pipeline_elapsed_ms,
+                pipeline_elapsed_ms=ws_final_elapsed_ms,
             )
         )
 
@@ -1186,6 +1777,7 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
         parent_websocket_first_sends=tuple(parent_ws_first),
         parent_websocket_final_sends=tuple(parent_ws_final),
         tts_response_series=tts_response_series,
+        incremental_publications=incremental_publications,
     )
 
 
@@ -1276,6 +1868,11 @@ def _observed_metrics(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             for observation in getattr(sample, attribute):
                 yield observation.boundary_to_event_seconds
 
+    withheld = tuple(
+        seconds
+        for sample in samples
+        for seconds in sample.tts_withheld_seconds
+    )
     return {
         "source_boundary_to_event_seconds": {
             "asr_final": _distribution(boundaries("asr_finals")),
@@ -1288,10 +1885,53 @@ def _observed_metrics(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             ),
             "websocket_send": _distribution(boundaries("websocket_sends")),
         },
-        "tts_first_response_to_websocket_send_seconds": _distribution(
-            seconds
-            for sample in samples
-            for seconds in sample.tts_withheld_seconds
+        "tts_first_response_to_websocket_send_seconds": (
+            _optional_distribution(withheld)
+        ),
+    }
+
+
+def _incremental_publication_metrics(
+    samples: Sequence[SampleLatency],
+) -> dict[str, Any]:
+    series = tuple(
+        item
+        for sample in samples
+        for item in sample.incremental_publications
+    )
+    if not series:
+        return {"available": False}
+    return {
+        "available": True,
+        "comparison_basis": (
+            "within-parent same generated PCM; TTS completion is the "
+            "earliest atomic publication point"
+        ),
+        "cross_arm_audio_duration_comparison": False,
+        "parent_count": len(series),
+        "audio_frame_count": sum(item.frame_count for item in series),
+        "audio_bytes": sum(item.total_audio_bytes for item in series),
+        "frames_per_parent": _distribution(
+            item.frame_count for item in series
+        ),
+        "tts_first_response_to_first_websocket_send_seconds": (
+            _distribution(
+                item.first_response_to_first_publish_seconds
+                for item in series
+            )
+        ),
+        "atomic_withholding_equivalent_seconds": _distribution(
+            item.atomic_withholding_equivalent_seconds for item in series
+        ),
+        "first_publish_lead_over_tts_completion_seconds": _distribution(
+            item.first_publish_lead_over_tts_completion_seconds
+            for item in series
+        ),
+        "tts_completion_to_final_websocket_send_seconds": _distribution(
+            item.tts_completion_to_final_publish_seconds for item in series
+        ),
+        "first_to_final_websocket_send_seconds": _distribution(
+            item.first_to_final_publish_seconds for item in series
         ),
     }
 
@@ -1344,17 +1984,52 @@ def _initial_path(sample: SampleLatency) -> dict[str, Any]:
     request_index = sample.tts_first_responses.index(first_tts)
     full = sample.tts_full_responses[request_index]
     websocket = sample.websocket_sends[request_index]
-    return {
+    result = {
         "asr_final": _initial_event_payload(first_asr),
         "segment_emitted": _initial_event_payload(first_segment),
         "tts_first_response": _initial_event_payload(first_tts),
         "tts_full_response": _initial_event_payload(full),
         "websocket_send": _initial_event_payload(websocket),
         "tts_first_response_to_websocket_send_seconds": (
-            websocket.pipeline_elapsed_ms - first_tts.pipeline_elapsed_ms
-        )
-        / 1_000.0,
+            None
+            if sample.telemetry_schema_version == 3
+            else (
+                websocket.pipeline_elapsed_ms
+                - first_tts.pipeline_elapsed_ms
+            )
+            / 1_000.0
+        ),
     }
+    if sample.telemetry_schema_version == 3:
+        publication = next(
+            item
+            for item in sample.incremental_publications
+            if item.identity[0] == first_tts.identity[0]
+        )
+        result.update(
+            {
+                "first_websocket_send": _initial_event_payload(
+                    TimedObservation(
+                        identity=publication.identity,
+                        source_end_ms=publication.source_end_ms,
+                        pipeline_elapsed_ms=(
+                            publication.first_send_elapsed_ms
+                        ),
+                    )
+                ),
+                "atomic_withholding_equivalent_seconds": (
+                    publication.atomic_withholding_equivalent_seconds
+                ),
+                "tts_first_response_to_first_websocket_send_seconds": (
+                    publication.first_response_to_first_publish_seconds
+                ),
+                "first_publish_lead_over_tts_completion_seconds": (
+                    publication
+                    .first_publish_lead_over_tts_completion_seconds
+                ),
+            }
+        )
+    return result
 
 
 def _structural_digest(samples: Sequence[SampleLatency]) -> str:
@@ -1401,6 +2076,24 @@ def _structural_digest(samples: Sequence[SampleLatency]) -> str:
                     ],
                 ]
             )
+        for publication in sample.incremental_publications:
+            records.append(
+                [
+                    sample.sample_index,
+                    sample.telemetry_schema_version,
+                    "incremental_publication_series",
+                    list(publication.identity),
+                    round(publication.source_end_ms, 6),
+                    publication.total_audio_bytes,
+                    list(publication.frame_audio_bytes),
+                    [
+                        round(value, 6)
+                        for value in publication.frame_send_elapsed_ms
+                    ],
+                    round(publication.tts_first_elapsed_ms, 6),
+                    round(publication.tts_completed_elapsed_ms, 6),
+                ]
+            )
     encoded = json.dumps(
         records,
         separators=(",", ":"),
@@ -1432,9 +2125,16 @@ def _sample_payload(sample: SampleLatency) -> dict[str, Any]:
             "tts_requests": len(sample.tts_first_responses),
             "tts_parents": len(sample.parent_tts_first_responses),
             "websocket_sends": len(sample.websocket_sends),
+            "websocket_audio_frames": sum(
+                item.frame_count
+                for item in sample.incremental_publications
+            ),
         },
         "request_level": _observed_metrics((sample,)),
         "parent_level": _parent_metrics((sample,)),
+        "incremental_tts_publication": (
+            _incremental_publication_metrics((sample,))
+        ),
         "tts_response_chunk_diagnostic": _response_chunk_metrics((sample,)),
         "initial_server_path": _initial_path(sample),
     }
@@ -1466,6 +2166,11 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
         ),
         "websocket_sends": sum(
             len(sample.websocket_sends) for sample in normalized
+        ),
+        "websocket_audio_frames": sum(
+            item.frame_count
+            for sample in normalized
+            for item in sample.incremental_publications
         ),
         "tts_response_diagnostic_requests": sum(
             len(sample.tts_response_series) for sample in normalized
@@ -1504,9 +2209,21 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             "parent_level_v2_full": "latest child event for each parent",
             "tts_withheld_opportunity": (
                 "corresponding WebSocket send time minus server receipt of "
-                "the first TTS PCM response"
+                "the first TTS PCM response; this legacy metric applies only "
+                "to atomic telemetry schemas 1 and 2"
             ),
             "tts_withheld_is_an_upper_bound_on_recoverable_delay": True,
+            "schema_v3_logical_websocket_send": (
+                "final incremental PCM frame for the parent"
+            ),
+            "schema_v3_atomic_withholding_equivalent": (
+                "TTS completed time minus first TTS PCM response time"
+            ),
+            "schema_v3_first_publish_lead": (
+                "TTS completed time minus first WebSocket PCM frame send; "
+                "positive values show how much earlier incremental "
+                "publication began"
+            ),
             "negative_boundary_latency_is_retained": True,
         },
         "caveats": {
@@ -1519,6 +2236,13 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
                 "Every schema-v2 TTS subsequence inherits its parent segment "
                 "source range, so request-level distributions weight parents "
                 "with more subsequences more heavily."
+            ),
+            "schema_v3_counterfactual": (
+                "The atomic-withholding equivalent measures server-side RPC "
+                "buffering avoided by incremental publication within the same "
+                "generated parent PCM. It does not compare audio duration "
+                "across runs, is not a microphone-to-ear latency reduction, "
+                "and does not include browser playback queue behavior."
             ),
             "batch_harness_frame_dispatch": (
                 "The standard batch harness dispatches whole 300 ms PCM "
@@ -1537,6 +2261,9 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             "counts": aggregate_counts,
             "request_level": _observed_metrics(normalized),
             "parent_level": _parent_metrics(normalized),
+            "incremental_tts_publication": (
+                _incremental_publication_metrics(normalized)
+            ),
             "tts_response_chunk_diagnostic": _response_chunk_metrics(
                 normalized
             ),
@@ -1598,6 +2325,8 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, distribution in rows:
+        if distribution is None:
+            continue
         lines.append(
             "| {name} | {count:,} | {minimum} | {p50} | {p95} | "
             "{maximum} | {mean} | {total} |".format(
@@ -1611,6 +2340,67 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                 total=_format_seconds(distribution["cumulative"]),
             )
         )
+
+    incremental = aggregate["incremental_tts_publication"]
+    if incremental["available"]:
+        lines.extend(
+            [
+                "",
+                "## Incremental TTS publication (schema v3)",
+                "",
+                (
+                    f"Observed {incremental['audio_frame_count']:,} PCM "
+                    f"frames across {incremental['parent_count']:,} parent "
+                    "TTS requests. The counterfactual uses each parent's own "
+                    "generated PCM and treats TTS completion as the earliest "
+                    "possible atomic publication point."
+                ),
+                "",
+                "| Interval | Count | Min | p50 | p95 | Max | Mean |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        incremental_rows = (
+            (
+                "TTS first PCM → first WebSocket frame",
+                incremental[
+                    "tts_first_response_to_first_websocket_send_seconds"
+                ],
+            ),
+            (
+                "Atomic withholding equivalent (TTS first → complete)",
+                incremental["atomic_withholding_equivalent_seconds"],
+            ),
+            (
+                "First-publish lead over TTS completion",
+                incremental[
+                    "first_publish_lead_over_tts_completion_seconds"
+                ],
+            ),
+            (
+                "TTS complete → final WebSocket frame",
+                incremental[
+                    "tts_completion_to_final_websocket_send_seconds"
+                ],
+            ),
+            (
+                "First → final WebSocket frame",
+                incremental["first_to_final_websocket_send_seconds"],
+            ),
+        )
+        for name, distribution in incremental_rows:
+            lines.append(
+                "| {name} | {count:,} | {minimum} | {p50} | {p95} | "
+                "{maximum} | {mean} |".format(
+                    name=name,
+                    count=distribution["observation_count"],
+                    minimum=_format_seconds(distribution["min"]),
+                    p50=_format_seconds(distribution["p50"]),
+                    p95=_format_seconds(distribution["p95"]),
+                    maximum=_format_seconds(distribution["max"]),
+                    mean=_format_seconds(distribution["mean"]),
+                )
+            )
 
     response_diagnostic = aggregate["tts_response_chunk_diagnostic"]
     if response_diagnostic["available"]:
@@ -1741,6 +2531,8 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             caveats["asr_final_level_source_ranges"],
             "",
             caveats["schema_v2_parent_source_ranges"],
+            "",
+            caveats["schema_v3_counterfactual"],
             "",
             caveats["batch_harness_frame_dispatch"],
             "",

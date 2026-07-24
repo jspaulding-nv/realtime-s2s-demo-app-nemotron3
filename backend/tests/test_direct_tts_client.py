@@ -1,4 +1,5 @@
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,12 +10,15 @@ import riva.client
 from direct_tts_client import (
     DirectTTSClient,
     DirectTTSCancelled,
+    DirectTTSPartialStreamError,
     DirectTTSRetryError,
     DirectTTSError,
 )
 from staged_models import (
     EmissionReason,
+    SynthesizedAudioFrame,
     SynthesizedSegment,
+    SynthesizedStreamCompletion,
     TextSegment,
     TranslatedSegment,
 )
@@ -83,6 +87,20 @@ class FailingAfterAudio:
 
     def __iter__(self):
         yield Response(b"\x01\x02")
+        raise GrpcStatusError(self.status)
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class FailingAfterResponses:
+    def __init__(self, responses, status):
+        self.responses = list(responses)
+        self.status = status
+        self.cancelled = False
+
+    def __iter__(self):
+        yield from self.responses
         raise GrpcStatusError(self.status)
 
     def cancel(self):
@@ -217,6 +235,278 @@ def test_opt_in_records_privacy_safe_response_chunk_metrics():
     ]
     assert "audio" not in payload
     assert "text" not in str(payload["response_chunks"])
+
+
+def test_incremental_reframes_variable_responses_and_preserves_exact_pcm():
+    responses = [
+        Response(b"\x01\x02" * 500),
+        Response(b"\x03\x04" * 1_300),
+        Response(b"\x05\x06" * 1_500),
+    ]
+    source_audio = b"".join(response.audio for response in responses)
+    service = RecordingService(responses)
+    clock = MagicMock(side_effect=(100, 110, 120, 130, 140))
+    client = DirectTTSClient(
+        capture_response_chunk_metrics=True,
+        clock_ms=clock,
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    completion = client.synthesize_incremental(
+        translated_segment(),
+        frames.append,
+    )
+
+    assert isinstance(completion, SynthesizedStreamCompletion)
+    assert all(isinstance(frame, SynthesizedAudioFrame) for frame in frames)
+    assert [len(frame.audio) for frame in frames] == [3_200, 3_200, 200]
+    assert [frame.audio_frame_id for frame in frames] == [0, 1, 2]
+    assert [frame.received_monotonic_ms for frame in frames] == [120, 130, 130]
+    assert [frame.retry_count for frame in frames] == [0, 0, 0]
+    assert b"".join(frame.audio for frame in frames) == source_audio
+    assert completion.audio_frame_count == 3
+    assert completion.audio_bytes == len(source_audio) == 6_600
+    assert completion.started_monotonic_ms == 100
+    assert completion.first_audio_monotonic_ms == 110
+    assert completion.completed_monotonic_ms == 140
+    assert [
+        (
+            chunk.response_index,
+            chunk.audio_bytes,
+            chunk.cumulative_audio_bytes,
+            chunk.received_monotonic_ms,
+        )
+        for chunk in completion.response_chunks
+    ] == [
+        (0, 1_000, 1_000, 110),
+        (1, 2_600, 3_600, 120),
+        (2, 3_000, 6_600, 130),
+    ]
+
+
+def test_incremental_exact_frame_multiple_does_not_publish_empty_tail():
+    service = RecordingService([Response(b"\x01\x02" * 3_200)])
+    client, _ = configured_client(service, ticks=(100, 125, 200))
+    frames = []
+
+    completion = client.synthesize_incremental(
+        translated_segment(),
+        frames.append,
+    )
+
+    assert [len(frame.audio) for frame in frames] == [3_200, 3_200]
+    assert completion.audio_frame_count == 2
+    assert completion.audio_bytes == 6_400
+
+
+def test_incremental_unknown_before_commit_discards_private_carry_and_retries():
+    first = FailingAfterResponses(
+        [Response(b"\x01\x02" * 500)],
+        grpc.StatusCode.UNKNOWN,
+    )
+    second_audio = b"\x03\x04" * 1_600
+    service = AttemptService([first, iter([Response(second_audio)])])
+    clock = MagicMock(side_effect=(100, 110, 120, 130, 140))
+    client = DirectTTSClient(
+        max_retries=1,
+        capture_response_chunk_metrics=True,
+        clock_ms=clock,
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    completion = client.synthesize_incremental(
+        translated_segment(),
+        frames.append,
+    )
+
+    assert len(service.calls) == 2
+    assert first.cancelled is True
+    assert [frame.audio for frame in frames] == [second_audio]
+    assert [frame.audio_frame_id for frame in frames] == [0]
+    assert [frame.retry_count for frame in frames] == [1]
+    assert completion.retry_count == 1
+    assert completion.started_monotonic_ms == 100
+    assert completion.first_audio_monotonic_ms == 130
+    assert completion.completed_monotonic_ms == 140
+    assert [
+        (chunk.audio_bytes, chunk.cumulative_audio_bytes, chunk.retry_count)
+        for chunk in completion.response_chunks
+    ] == [(3_200, 3_200, 1)]
+
+
+def test_incremental_unknown_after_commit_never_retries_or_replays_prefix():
+    first = FailingAfterResponses(
+        [Response(b"\x01\x02" * 1_600)],
+        grpc.StatusCode.UNKNOWN,
+    )
+    service = AttemptService(
+        [first, iter([Response(b"\x03\x04" * 1_600)])]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        clock_ms=MagicMock(side_effect=(100, 110)),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    with pytest.raises(DirectTTSPartialStreamError) as failure:
+        client.synthesize_incremental(
+            translated_segment(text="Texto privado."),
+            frames.append,
+        )
+
+    assert len(service.calls) == 1
+    assert first.cancelled is True
+    assert len(frames) == 1
+    assert frames[0].audio_frame_id == 0
+    assert failure.value.committed_frame_count == 1
+    assert failure.value.committed_audio_bytes == 3_200
+    assert failure.value.retry_count == 0
+    assert failure.value.status_code == "UNKNOWN"
+    assert "Texto privado" not in str(failure.value)
+    assert client._synthesis_active is False
+    assert client._active_call is None
+
+
+def test_incremental_publisher_rejection_is_local_and_never_retried():
+    service = AttemptService(
+        [
+            iter([Response(b"\x01\x02" * 1_600)]),
+            iter([Response(b"\x03\x04" * 1_600)]),
+        ]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        clock_ms=MagicMock(side_effect=(100, 110)),
+    )
+    client._connected = True
+    client._service = service
+
+    def reject(_frame):
+        raise GrpcStatusError(grpc.StatusCode.UNKNOWN)
+
+    with pytest.raises(DirectTTSError, match="publisher failed") as failure:
+        client.synthesize_incremental(translated_segment(), reject)
+
+    assert not isinstance(failure.value, DirectTTSPartialStreamError)
+    assert len(service.calls) == 1
+    assert client._synthesis_active is False
+    assert client._active_call is None
+
+
+def test_incremental_limit_failure_after_commit_reports_exact_prefix():
+    service = RecordingService(
+        [
+            Response(b"\x01\x02" * 1_600),
+            Response(b"\x03\x04"),
+        ]
+    )
+    client = DirectTTSClient(
+        max_audio_duration_s=0.1,
+        max_retries=1,
+        clock_ms=MagicMock(side_effect=(100, 110)),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    with pytest.raises(DirectTTSPartialStreamError) as failure:
+        client.synthesize_incremental(
+            translated_segment(),
+            frames.append,
+        )
+
+    assert [len(frame.audio) for frame in frames] == [3_200]
+    assert failure.value.committed_frame_count == 1
+    assert failure.value.committed_audio_bytes == 3_200
+    assert len(service.calls) == 1
+
+
+def test_incremental_rejects_nonintegral_frame_duration_before_rpc():
+    service = RecordingService([Response(b"\x00\x00")])
+    client = DirectTTSClient(
+        sample_rate_hz=1,
+        incremental_frame_ms=100,
+    )
+    client._connected = True
+    client._service = service
+
+    with pytest.raises(ValueError, match="whole number of PCM samples"):
+        client.synthesize_incremental(translated_segment(), lambda frame: None)
+
+    assert service.calls == []
+
+
+def test_incremental_no_audio_and_partial_pcm_fail_before_publication():
+    for responses, message in (
+        ([Response(b""), SimpleNamespace()], "no audio"),
+        ([Response(b"\x00")], "partial PCM frame"),
+    ):
+        service = RecordingService(responses)
+        client = DirectTTSClient(clock_ms=lambda: 100)
+        client._connected = True
+        client._service = service
+        frames = []
+
+        with pytest.raises(DirectTTSError, match=message):
+            client.synthesize_incremental(
+                translated_segment(),
+                frames.append,
+            )
+
+        assert frames == []
+        assert len(service.calls) == 1
+
+
+def test_incremental_exhausted_precommit_retry_is_privacy_safe():
+    service = AttemptService(
+        [
+            GrpcStatusError(grpc.StatusCode.UNKNOWN),
+            GrpcStatusError(grpc.StatusCode.UNKNOWN),
+        ]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        clock_ms=MagicMock(side_effect=(100, 110)),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    with pytest.raises(DirectTTSRetryError) as failure:
+        client.synthesize_incremental(
+            translated_segment(text="Texto privado."),
+            frames.append,
+        )
+
+    assert frames == []
+    assert len(service.calls) == 2
+    assert failure.value.retry_count == 1
+    assert failure.value.initial_status_code == "UNKNOWN"
+    assert failure.value.retry_status_code == "UNKNOWN"
+    assert "Texto privado" not in str(failure.value)
+
+
+def test_incremental_rejects_subsegmented_translation_before_rpc():
+    service = RecordingService([Response(b"\x00\x00")])
+    client = DirectTTSClient()
+    client._connected = True
+    client._service = service
+    translation = replace(
+        translated_segment(),
+        subsequence_id=0,
+        subsequence_count=2,
+    )
+
+    with pytest.raises(ValueError, match="unsplit"):
+        client.synthesize_incremental(translation, lambda frame: None)
+
+    assert service.calls == []
 
 
 def test_empty_responses_do_not_set_first_audio_time():
@@ -611,6 +901,8 @@ def test_audio_format_validation(kwargs, message):
             {"capture_response_chunk_metrics": 1},
             "capture_response_chunk_metrics",
         ),
+        ({"incremental_frame_ms": 0}, "incremental_frame_ms"),
+        ({"incremental_frame_ms": True}, "incremental_frame_ms"),
     ],
 )
 def test_audio_bound_validation(kwargs, message):

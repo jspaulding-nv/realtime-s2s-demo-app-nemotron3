@@ -26,6 +26,10 @@ def _event(
     contributing_final_ids=None,
     audio_bytes=0,
     composite=None,
+    parent_sequence_id=None,
+    audio_frame_id=None,
+    audio_frame_count=None,
+    retry_count=0,
 ):
     payload = {
         "stage": stage,
@@ -37,7 +41,7 @@ def _event(
         "asr_final_id": asr_final_id,
         "contributing_final_ids": contributing_final_ids or [],
         "audio_bytes": audio_bytes,
-        "retry_count": 0,
+        "retry_count": retry_count,
         "private": PRIVATE_MARKER,
     }
     if composite is not None:
@@ -50,6 +54,12 @@ def _event(
                 "subsequence_count": count,
             }
         )
+    if parent_sequence_id is not None:
+        payload["parent_sequence_id"] = parent_sequence_id
+    if audio_frame_id is not None:
+        payload["audio_frame_id"] = audio_frame_id
+    if audio_frame_count is not None:
+        payload["audio_frame_count"] = audio_frame_count
     return payload
 
 
@@ -229,6 +239,307 @@ def write_summary(path, *, schema_version=1):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def write_schema_v3_summary(path):
+    events = [
+        _event("pipeline", "started", 1_000),
+        _event(
+            "asr",
+            "final",
+            1_700,
+            source_start_ms=0,
+            source_end_ms=500,
+            asr_final_id=0,
+        ),
+        _event(
+            "segmenter",
+            "emitted",
+            1_750,
+            source_start_ms=0,
+            source_end_ms=500,
+            sequence_id=0,
+            contributing_final_ids=[0],
+        ),
+        _event(
+            "tts",
+            "started",
+            1_900,
+            source_start_ms=0,
+            source_end_ms=500,
+            sequence_id=0,
+        ),
+        _event(
+            "tts",
+            "first_audio",
+            2_000,
+            source_start_ms=0,
+            source_end_ms=500,
+            sequence_id=0,
+            parent_sequence_id=0,
+            audio_frame_count=2,
+        ),
+    ]
+    frame_specs = [
+        (0, 0, 3_200, 2_050, 2_060, 2_070, 2_080, 0),
+        (0, 1, 1_600, 2_150, 2_160, 2_170, 2_230, 0),
+    ]
+    for (
+        parent,
+        frame_id,
+        audio_bytes,
+        received,
+        enqueued,
+        dequeued,
+        _sent,
+        retry_count,
+    ) in frame_specs:
+        for stage, event_name, timestamp in (
+            ("tts", "frame_received", received),
+            ("output", "frame_enqueued", enqueued),
+            ("output", "frame_dequeued", dequeued),
+        ):
+            events.append(
+                _event(
+                    stage,
+                    event_name,
+                    timestamp,
+                    source_start_ms=0,
+                    source_end_ms=500,
+                    sequence_id=parent,
+                    parent_sequence_id=parent,
+                    audio_frame_id=frame_id,
+                    audio_bytes=audio_bytes,
+                    retry_count=retry_count,
+                )
+            )
+    events.extend(
+        [
+            _event(
+                "tts",
+                "completed",
+                2_300,
+                source_start_ms=0,
+                source_end_ms=500,
+                sequence_id=0,
+                parent_sequence_id=0,
+                audio_frame_count=2,
+                audio_bytes=4_800,
+            ),
+            _event(
+                "output",
+                "parent_complete_enqueued",
+                2_310,
+                source_start_ms=0,
+                source_end_ms=500,
+                sequence_id=0,
+                parent_sequence_id=0,
+                audio_frame_count=2,
+                audio_bytes=4_800,
+            ),
+            _event(
+                "output",
+                "parent_complete_dequeued",
+                2_320,
+                source_start_ms=0,
+                source_end_ms=500,
+                sequence_id=0,
+                parent_sequence_id=0,
+                audio_frame_count=2,
+                audio_bytes=4_800,
+            ),
+            _event(
+                "asr",
+                "final",
+                2_800,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                asr_final_id=1,
+            ),
+            _event(
+                "segmenter",
+                "emitted",
+                2_900,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+                contributing_final_ids=[1],
+            ),
+            _event(
+                "tts",
+                "started",
+                3_000,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+            ),
+            _event(
+                "tts",
+                "first_audio",
+                3_100,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+                parent_sequence_id=1,
+                audio_frame_count=1,
+                retry_count=1,
+            ),
+        ]
+    )
+    frame_specs.append((1, 0, 2_400, 3_200, 3_210, 3_220, 3_250, 1))
+    for stage, event_name, timestamp in (
+        ("tts", "frame_received", 3_200),
+        ("output", "frame_enqueued", 3_210),
+        ("output", "frame_dequeued", 3_220),
+    ):
+        events.append(
+            _event(
+                stage,
+                event_name,
+                timestamp,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+                parent_sequence_id=1,
+                audio_frame_id=0,
+                audio_bytes=2_400,
+                retry_count=1,
+            )
+        )
+    events.extend(
+        [
+            _event(
+                "tts",
+                "completed",
+                3_500,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+                parent_sequence_id=1,
+                audio_frame_count=1,
+                audio_bytes=2_400,
+                retry_count=1,
+            ),
+            _event(
+                "output",
+                "parent_complete_enqueued",
+                3_510,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+                parent_sequence_id=1,
+                audio_frame_count=1,
+                audio_bytes=2_400,
+                retry_count=1,
+            ),
+            _event(
+                "output",
+                "parent_complete_dequeued",
+                3_520,
+                source_start_ms=600,
+                source_end_ms=1_500,
+                sequence_id=1,
+                parent_sequence_id=1,
+                audio_frame_count=1,
+                audio_bytes=2_400,
+                retry_count=1,
+            ),
+        ]
+    )
+    frame_keys = [
+        {"parent_sequence_id": 0, "audio_frame_id": 0},
+        {"parent_sequence_id": 0, "audio_frame_id": 1},
+        {"parent_sequence_id": 1, "audio_frame_id": 0},
+    ]
+    frame_bytes = [3_200, 1_600, 2_400]
+    parent_summaries = [
+        {
+            "parent_sequence_id": 0,
+            "audio_frame_count": 2,
+            "audio_bytes": 4_800,
+            "retry_count": 0,
+        },
+        {
+            "parent_sequence_id": 1,
+            "audio_frame_count": 1,
+            "audio_bytes": 2_400,
+            "retry_count": 1,
+        },
+    ]
+    websocket_events = [
+        {
+            "sequence_id": parent,
+            "parent_sequence_id": parent,
+            "audio_frame_id": frame_id,
+            "sent_monotonic_ms": sent,
+            "audio_bytes": audio_bytes,
+            "private": PRIVATE_MARKER,
+        }
+        for (
+            parent,
+            frame_id,
+            audio_bytes,
+            _received,
+            _enqueued,
+            _dequeued,
+            sent,
+            _retry_count,
+        ) in frame_specs
+    ]
+    staged_pipeline = {
+        "telemetry_schema_version": 3,
+        "tts_incremental_publish_enabled": True,
+        "tts_incremental_frame_ms": 100,
+        "tts_incremental_frame_bytes": 3_200,
+        "tts_subsegmentation_enabled": False,
+        "state": "closed",
+        "outcome": "complete",
+        "failure": None,
+        "cleanup_errors": [],
+        "incomplete_sequence_ids": [],
+        "segments_emitted": 2,
+        "audio_segments_produced": 2,
+        "audio_frames_produced": 3,
+        "completed_sequence_ids": [0, 1],
+        "websocket_sent_sequence_ids": [0, 1],
+        "published_audio_frame_keys": frame_keys,
+        "dequeued_audio_frame_keys": [dict(item) for item in frame_keys],
+        "websocket_sent_audio_frame_keys": [
+            dict(item) for item in frame_keys
+        ],
+        "published_audio_frame_bytes": frame_bytes,
+        "dequeued_audio_frame_bytes": list(frame_bytes),
+        "websocket_sent_audio_frame_bytes": list(frame_bytes),
+        "produced_parent_summaries": parent_summaries,
+        "completed_parent_summaries": [
+            dict(item) for item in parent_summaries
+        ],
+        "websocket_completed_parent_summaries": [
+            dict(item) for item in parent_summaries
+        ],
+        "events": events,
+        "websocket_send_events": websocket_events,
+        "session_id": PRIVATE_MARKER,
+    }
+    payload = {
+        "audio_path": PRIVATE_MARKER,
+        "backend_url": PRIVATE_MARKER,
+        "backend_config": {
+            "sampleRate": 16_000,
+            "chunkSize": 4_800,
+            "channels": 1,
+            "pipelineMode": "staged",
+            "endpoint": PRIVATE_MARKER,
+        },
+        "staged_integrity": {
+            "applicable": True,
+            "passed": True,
+            "errors": [],
+        },
+        "staged_pipeline": staged_pipeline,
+        "private": PRIVATE_MARKER,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def add_response_chunk_sidecar(path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     staged = payload["staged_pipeline"]
@@ -298,6 +609,66 @@ def add_response_chunk_sidecar(path):
             "since_request_start_ms": 100,
             "since_previous_response_ms": 100,
             "retry_count": 0,
+        },
+    ]
+    staged["tts_response_chunk_telemetry"] = {
+        "schema_version": 1,
+        "segments_observed": 2,
+        "response_chunk_count": len(chunks),
+        "chunks": chunks,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def add_schema_v3_response_chunk_sidecar(path):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    staged = payload["staged_pipeline"]
+    staged["tts_response_chunk_telemetry_enabled"] = True
+    chunks = [
+        {
+            "parent_sequence_id": 0,
+            "subsequence_id": 0,
+            "subsequence_count": 1,
+            "response_index": 0,
+            "response_count": 2,
+            "audio_bytes": 3_200,
+            "cumulative_audio_bytes": 3_200,
+            "audio_duration_ms": 100,
+            "cumulative_audio_duration_ms": 100,
+            "received_monotonic_ms": 2_000,
+            "since_request_start_ms": 100,
+            "since_previous_response_ms": 100,
+            "retry_count": 0,
+        },
+        {
+            "parent_sequence_id": 0,
+            "subsequence_id": 0,
+            "subsequence_count": 1,
+            "response_index": 1,
+            "response_count": 2,
+            "audio_bytes": 1_600,
+            "cumulative_audio_bytes": 4_800,
+            "audio_duration_ms": 50,
+            "cumulative_audio_duration_ms": 150,
+            "received_monotonic_ms": 2_200,
+            "since_request_start_ms": 300,
+            "since_previous_response_ms": 200,
+            "retry_count": 0,
+        },
+        {
+            "parent_sequence_id": 1,
+            "subsequence_id": 0,
+            "subsequence_count": 1,
+            "response_index": 0,
+            "response_count": 1,
+            "audio_bytes": 2_400,
+            "cumulative_audio_bytes": 2_400,
+            "audio_duration_ms": 75,
+            "cumulative_audio_duration_ms": 75,
+            "received_monotonic_ms": 3_100,
+            "since_request_start_ms": 100,
+            "since_previous_response_ms": 100,
+            "retry_count": 1,
         },
     ]
     staged["tts_response_chunk_telemetry"] = {
@@ -430,6 +801,134 @@ def test_schema_v2_preserves_request_and_parent_units(tmp_path):
     assert aggregate["parent_level"][
         "source_boundary_to_parent_final_websocket_send_seconds"
     ]["p50"] == 1.02
+
+
+def test_schema_v3_quantifies_incremental_first_publish_benefit(tmp_path):
+    path = tmp_path / "incremental_summary.json"
+    write_schema_v3_summary(path)
+
+    sample = load_summary_latency(path, sample_index=1)
+    analysis = analyze_paths([path])
+    aggregate = analysis["aggregate"]
+    incremental = aggregate["incremental_tts_publication"]
+
+    assert sample.telemetry_schema_version == 3
+    assert [item.identity for item in sample.tts_first_responses] == [
+        (0, 0, 1),
+        (1, 0, 1),
+    ]
+    assert [item.frame_count for item in sample.incremental_publications] == [
+        2,
+        1,
+    ]
+    assert aggregate["counts"]["tts_requests"] == 2
+    assert aggregate["counts"]["websocket_audio_frames"] == 3
+    assert aggregate["request_level"][
+        "tts_first_response_to_websocket_send_seconds"
+    ] is None
+    assert incremental["available"] is True
+    assert incremental["cross_arm_audio_duration_comparison"] is False
+    assert "same generated PCM" in incremental["comparison_basis"]
+    assert incremental["parent_count"] == 2
+    assert incremental["audio_frame_count"] == 3
+    assert incremental[
+        "tts_first_response_to_first_websocket_send_seconds"
+    ]["p50"] == 0.08
+    assert incremental[
+        "tts_first_response_to_first_websocket_send_seconds"
+    ]["p95"] == 0.15
+    assert incremental["atomic_withholding_equivalent_seconds"]["p50"] == 0.3
+    assert incremental["atomic_withholding_equivalent_seconds"]["p95"] == 0.4
+    assert incremental[
+        "first_publish_lead_over_tts_completion_seconds"
+    ]["p50"] == 0.22
+    assert incremental[
+        "first_publish_lead_over_tts_completion_seconds"
+    ]["p95"] == 0.25
+    assert aggregate["parent_level"][
+        "source_boundary_to_first_websocket_send_seconds"
+    ]["p50"] == 0.58
+    assert aggregate["parent_level"][
+        "source_boundary_to_parent_final_websocket_send_seconds"
+    ]["p95"] == 0.75
+    assert analysis["samples"][0]["initial_server_path"][
+        "first_websocket_send"
+    ]["pipeline_elapsed_seconds"] == 1.08
+
+    markdown = render_markdown(analysis)
+    assert "Incremental TTS publication (schema v3)" in markdown
+    assert "Atomic withholding equivalent" in markdown
+    assert PRIVATE_MARKER not in markdown
+
+
+def test_schema_v3_preserves_response_chunk_diagnostic(tmp_path):
+    path = tmp_path / "incremental_response_chunks_summary.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_response_chunk_sidecar(path)
+
+    analysis = analyze_paths([path])
+    response = analysis["aggregate"]["tts_response_chunk_diagnostic"]
+    incremental = analysis["aggregate"]["incremental_tts_publication"]
+
+    assert response["available"] is True
+    assert response["response_chunk_count"] == 3
+    assert response["multi_response_request_percent"] == 50
+    assert incremental["available"] is True
+    assert incremental[
+        "first_publish_lead_over_tts_completion_seconds"
+    ]["p50"] == 0.22
+
+
+def test_schema_v3_rejects_frame_byte_layer_mismatch(tmp_path):
+    path = tmp_path / "incremental_summary.json"
+    write_schema_v3_summary(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["staged_pipeline"]["websocket_sent_audio_frame_bytes"][1] += 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="frame byte layers"):
+        analyze_paths([path])
+
+
+def test_schema_v3_rejects_noncontiguous_parent_frame_identity(tmp_path):
+    path = tmp_path / "incremental_summary.json"
+    write_schema_v3_summary(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    staged = payload["staged_pipeline"]
+    for field in (
+        "published_audio_frame_keys",
+        "dequeued_audio_frame_keys",
+        "websocket_sent_audio_frame_keys",
+    ):
+        staged[field][1]["audio_frame_id"] = 2
+    staged["websocket_send_events"][1]["audio_frame_id"] = 2
+    for event in staged["events"]:
+        if event.get("parent_sequence_id") == 0 and event.get(
+            "audio_frame_id"
+        ) == 1:
+            event["audio_frame_id"] = 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not contiguous by parent"):
+        analyze_paths([path])
+
+
+def test_schema_v3_rejects_tts_parent_byte_mismatch(tmp_path):
+    path = tmp_path / "incremental_summary.json"
+    write_schema_v3_summary(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    completed = next(
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if event["stage"] == "tts"
+        and event["event"] == "completed"
+        and event["sequence_id"] == 0
+    )
+    completed["audio_bytes"] += 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="TTS completion and parent summary"):
+        analyze_paths([path])
 
 
 def test_multiple_inputs_use_neutral_labels_and_copy_no_private_data(tmp_path):

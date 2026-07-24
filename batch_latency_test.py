@@ -176,7 +176,7 @@ def _positive_int(value: Any) -> bool:
 
 
 _MISSING = object()
-_SUPPORTED_STAGED_TELEMETRY_SCHEMAS = {1, 2}
+_SUPPORTED_STAGED_TELEMETRY_SCHEMAS = {1, 2, 3}
 _SUBSEGMENT_LIFECYCLE_EVENTS = (
     ("target_splitter", "emitted"),
     ("tts", "enqueued"),
@@ -227,7 +227,7 @@ def _staged_telemetry_schema_version(
         or isinstance(value, bool)
         or value not in _SUPPORTED_STAGED_TELEMETRY_SCHEMAS
     ):
-        errors.append(f"{field_name} must be 1 or 2")
+        errors.append(f"{field_name} must be 1, 2, or 3")
         return None
     return value
 
@@ -297,6 +297,142 @@ def _subsegment_keys(
         else:
             keys.append(key)
     return keys if valid else None
+
+
+def _audio_frame_key(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+    sequence_alias: Any = _MISSING,
+) -> tuple[int, int] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{field_name} must be an object")
+        return None
+    parent = value.get("parent_sequence_id")
+    frame_id = value.get("audio_frame_id")
+    if (
+        not isinstance(parent, int)
+        or isinstance(parent, bool)
+        or parent < 0
+    ):
+        errors.append(f"{field_name}.parent_sequence_id is invalid")
+        return None
+    if (
+        not isinstance(frame_id, int)
+        or isinstance(frame_id, bool)
+        or frame_id < 0
+    ):
+        errors.append(f"{field_name}.audio_frame_id is invalid")
+        return None
+    if sequence_alias is not _MISSING and sequence_alias != parent:
+        errors.append(
+            f"{field_name}.sequence_id must equal parent_sequence_id"
+        )
+        return None
+    return parent, frame_id
+
+
+def _audio_frame_keys(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> list[tuple[int, int]] | None:
+    if not isinstance(value, list):
+        errors.append(f"{field_name} must be a list")
+        return None
+    keys: list[tuple[int, int]] = []
+    valid = True
+    for index, item in enumerate(value):
+        key = _audio_frame_key(
+            item,
+            field_name=f"{field_name}[{index}]",
+            errors=errors,
+        )
+        if key is None:
+            valid = False
+        else:
+            keys.append(key)
+    return keys if valid else None
+
+
+def _positive_int_list(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> list[int] | None:
+    if not isinstance(value, list):
+        errors.append(f"{field_name} must be a list")
+        return None
+    if any(not _positive_int(item) for item in value):
+        errors.append(f"{field_name} must contain positive integers")
+        return None
+    return list(value)
+
+
+def _parent_summaries(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> list[dict[str, int]] | None:
+    if not isinstance(value, list):
+        errors.append(f"{field_name} must be a list")
+        return None
+    resolved: list[dict[str, int]] = []
+    valid = True
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            errors.append(f"{field_name}[{index}] must be an object")
+            valid = False
+            continue
+        parent = item.get("parent_sequence_id")
+        frame_count = item.get("audio_frame_count")
+        audio_bytes = item.get("audio_bytes")
+        retry_count = item.get("retry_count")
+        if (
+            not isinstance(parent, int)
+            or isinstance(parent, bool)
+            or parent < 0
+        ):
+            errors.append(
+                f"{field_name}[{index}].parent_sequence_id is invalid"
+            )
+            valid = False
+            continue
+        if not _positive_int(frame_count):
+            errors.append(
+                f"{field_name}[{index}].audio_frame_count is invalid"
+            )
+            valid = False
+            continue
+        if not _positive_int(audio_bytes):
+            errors.append(
+                f"{field_name}[{index}].audio_bytes is invalid"
+            )
+            valid = False
+            continue
+        if (
+            not isinstance(retry_count, int)
+            or isinstance(retry_count, bool)
+            or retry_count not in {0, 1}
+        ):
+            errors.append(
+                f"{field_name}[{index}].retry_count must be zero or one"
+            )
+            valid = False
+            continue
+        resolved.append(
+            {
+                "parent_sequence_id": parent,
+                "audio_frame_count": frame_count,
+                "audio_bytes": audio_bytes,
+                "retry_count": retry_count,
+            }
+        )
+    return resolved if valid else None
 
 
 def _validate_complete_subsegment_order(
@@ -924,6 +1060,549 @@ def _validate_staged_pipeline_integrity_v2(
     return errors
 
 
+def _validate_staged_pipeline_integrity_v3(
+    staged_pipeline: dict[str, Any],
+    staged_config: dict[str, Any] | None,
+    websocket_receive_events: Any,
+    input_end_timestamp_ms: Any,
+    errors: list[str],
+) -> list[str]:
+    """Validate ordered frame publication and parent-completion barriers."""
+    if staged_pipeline.get("state") != "closed":
+        errors.append(
+            "staged state must be 'closed' "
+            f"(got {staged_pipeline.get('state')!r})"
+        )
+    if staged_pipeline.get("outcome") != "complete":
+        errors.append(
+            "staged outcome must be 'complete' "
+            f"(got {staged_pipeline.get('outcome')!r})"
+        )
+    if staged_pipeline.get("failure") is not None:
+        errors.append("staged failure must be null")
+    cleanup_errors = staged_pipeline.get("cleanup_errors")
+    if not isinstance(cleanup_errors, list):
+        errors.append("cleanup_errors must be a list")
+    elif cleanup_errors:
+        errors.append("cleanup_errors must be empty")
+
+    if staged_pipeline.get("tts_incremental_publish_enabled") is not True:
+        errors.append(
+            "schema-v3 telemetry requires tts_incremental_publish_enabled=true"
+        )
+    if staged_pipeline.get("tts_subsegmentation_enabled") is not False:
+        errors.append(
+            "schema-v3 telemetry requires tts_subsegmentation_enabled=false"
+        )
+    if staged_config is None:
+        errors.append("/api/config.stagedConfig must be an object for schema v3")
+    else:
+        if staged_config.get("ttsIncrementalPublishEnabled") is not True:
+            errors.append(
+                "schema-v3 config requires ttsIncrementalPublishEnabled=true"
+            )
+        frame_ms = staged_config.get("ttsIncrementalFrameMs")
+        if not _positive_int(frame_ms):
+            errors.append(
+                "/api/config.stagedConfig.ttsIncrementalFrameMs must be "
+                "a positive integer"
+            )
+        elif staged_pipeline.get("tts_incremental_frame_ms") != frame_ms:
+            errors.append(
+                "staged tts_incremental_frame_ms must match "
+                "/api/config.stagedConfig.ttsIncrementalFrameMs"
+            )
+        cap = staged_config.get("ttsSubsegmentMaxChars")
+        if (
+            not isinstance(cap, int)
+            or isinstance(cap, bool)
+            or cap != 0
+        ):
+            errors.append(
+                "schema-v3 config requires ttsSubsegmentMaxChars=0"
+            )
+
+    received_pcm_bytes: list[int] = []
+    if not isinstance(websocket_receive_events, list):
+        errors.append("websocket_receive_events must be a list")
+    else:
+        observed_orders: list[int] = []
+        completed_orders: list[int] = []
+        completed_timestamps: list[float] = []
+        valid_orders = True
+        for index, event in enumerate(websocket_receive_events):
+            if not isinstance(event, dict):
+                errors.append(
+                    f"websocket_receive_events[{index}] must be an object"
+                )
+                valid_orders = False
+                continue
+            order = event.get("order")
+            if (
+                not isinstance(order, int)
+                or isinstance(order, bool)
+                or order < 0
+            ):
+                errors.append(
+                    f"websocket_receive_events[{index}].order is invalid"
+                )
+                valid_orders = False
+                continue
+            observed_orders.append(order)
+            if event.get("frame_type") == "pcm":
+                audio_bytes = event.get("audio_bytes")
+                if not _positive_int(audio_bytes):
+                    errors.append(
+                        f"websocket_receive_events[{index}].audio_bytes is invalid"
+                    )
+                else:
+                    received_pcm_bytes.append(audio_bytes)
+            if (
+                event.get("frame_type") == "control"
+                and event.get("message_type") == "status"
+                and event.get("status") == "completed"
+            ):
+                completed_orders.append(order)
+                timestamp_ms = event.get("timestamp_ms")
+                if (
+                    not isinstance(timestamp_ms, (int, float))
+                    or isinstance(timestamp_ms, bool)
+                    or not math.isfinite(timestamp_ms)
+                    or timestamp_ms < 0
+                ):
+                    errors.append(
+                        f"websocket_receive_events[{index}].timestamp_ms is invalid"
+                    )
+                else:
+                    completed_timestamps.append(float(timestamp_ms))
+        if valid_orders and observed_orders != list(range(len(observed_orders))):
+            errors.append(
+                "websocket_receive_events order must be contiguous from zero"
+            )
+        if len(completed_orders) != 1:
+            errors.append(
+                "exactly one completed WebSocket terminal is required "
+                f"(got {len(completed_orders)})"
+            )
+        elif any(
+            isinstance(event, dict)
+            and event.get("frame_type") == "pcm"
+            and isinstance(event.get("order"), int)
+            and event["order"] > completed_orders[0]
+            for event in websocket_receive_events
+        ):
+            errors.append("PCM was received after the completed WebSocket terminal")
+        if (
+            not isinstance(input_end_timestamp_ms, (int, float))
+            or isinstance(input_end_timestamp_ms, bool)
+            or not math.isfinite(input_end_timestamp_ms)
+            or input_end_timestamp_ms <= 0
+        ):
+            errors.append("input_end_timestamp_ms must be positive and finite")
+        elif (
+            len(completed_timestamps) == 1
+            and completed_timestamps[0] < float(input_end_timestamp_ms)
+        ):
+            errors.append("completed WebSocket terminal arrived before end_input")
+
+    incomplete = _sequence_ids(
+        staged_pipeline.get("incomplete_sequence_ids"),
+        field_name="incomplete_sequence_ids",
+        errors=errors,
+    )
+    if incomplete:
+        errors.append(f"incomplete sequence IDs remain: {incomplete}")
+    completed = _sequence_ids(
+        staged_pipeline.get("completed_sequence_ids"),
+        field_name="completed_sequence_ids",
+        errors=errors,
+    )
+    websocket_sent = _sequence_ids(
+        staged_pipeline.get("websocket_sent_sequence_ids"),
+        field_name="websocket_sent_sequence_ids",
+        errors=errors,
+    )
+    if completed is not None:
+        expected = list(range(len(completed)))
+        if completed != expected:
+            errors.append(
+                "completed_sequence_ids must be contiguous and ordered from zero "
+                f"(got {completed})"
+            )
+    if (
+        completed is not None
+        and websocket_sent is not None
+        and websocket_sent != completed
+    ):
+        errors.append(
+            "websocket_sent_sequence_ids must exactly match completed_sequence_ids"
+        )
+    for count_name in ("segments_emitted", "audio_segments_produced"):
+        count = staged_pipeline.get(count_name)
+        if (
+            completed is not None
+            and (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count != len(completed)
+            )
+        ):
+            errors.append(
+                f"{count_name} must equal the completed sequence count "
+                f"({len(completed)})"
+            )
+
+    frame_key_fields = (
+        "published_audio_frame_keys",
+        "dequeued_audio_frame_keys",
+        "websocket_sent_audio_frame_keys",
+    )
+    frame_keys = {
+        field: _audio_frame_keys(
+            staged_pipeline.get(field),
+            field_name=field,
+            errors=errors,
+        )
+        for field in frame_key_fields
+    }
+    canonical_keys = frame_keys["published_audio_frame_keys"]
+    for field in frame_key_fields[1:]:
+        observed = frame_keys[field]
+        if (
+            canonical_keys is not None
+            and observed is not None
+            and observed != canonical_keys
+        ):
+            errors.append(
+                f"{field} must exactly match published_audio_frame_keys"
+            )
+
+    frame_byte_fields = (
+        "published_audio_frame_bytes",
+        "dequeued_audio_frame_bytes",
+        "websocket_sent_audio_frame_bytes",
+    )
+    frame_bytes = {
+        field: _positive_int_list(
+            staged_pipeline.get(field),
+            field_name=field,
+            errors=errors,
+        )
+        for field in frame_byte_fields
+    }
+    canonical_bytes = frame_bytes["published_audio_frame_bytes"]
+    for field in frame_byte_fields[1:]:
+        observed = frame_bytes[field]
+        if (
+            canonical_bytes is not None
+            and observed is not None
+            and observed != canonical_bytes
+        ):
+            errors.append(
+                f"{field} must exactly match published_audio_frame_bytes"
+            )
+    if (
+        canonical_keys is not None
+        and canonical_bytes is not None
+        and len(canonical_keys) != len(canonical_bytes)
+    ):
+        errors.append(
+            "published frame identity and byte lists must have equal length"
+        )
+    frame_count = staged_pipeline.get("audio_frames_produced")
+    if (
+        canonical_keys is not None
+        and (
+            not isinstance(frame_count, int)
+            or isinstance(frame_count, bool)
+            or frame_count != len(canonical_keys)
+        )
+    ):
+        errors.append(
+            "audio_frames_produced must equal published frame count"
+        )
+
+    parent_fields = (
+        "produced_parent_summaries",
+        "completed_parent_summaries",
+        "websocket_completed_parent_summaries",
+    )
+    parent_summaries = {
+        field: _parent_summaries(
+            staged_pipeline.get(field),
+            field_name=field,
+            errors=errors,
+        )
+        for field in parent_fields
+    }
+    canonical_parents = parent_summaries["produced_parent_summaries"]
+    for field in parent_fields[1:]:
+        observed = parent_summaries[field]
+        if (
+            canonical_parents is not None
+            and observed is not None
+            and observed != canonical_parents
+        ):
+            errors.append(
+                f"{field} must exactly match produced_parent_summaries"
+            )
+    if canonical_parents is not None and completed is not None:
+        parent_ids = [
+            item["parent_sequence_id"] for item in canonical_parents
+        ]
+        if parent_ids != completed:
+            errors.append(
+                "parent completion summaries must exactly match "
+                "completed_sequence_ids"
+            )
+
+    if (
+        canonical_keys is not None
+        and canonical_bytes is not None
+        and canonical_parents is not None
+    ):
+        offset = 0
+        expected_keys: list[tuple[int, int]] = []
+        for summary in canonical_parents:
+            parent = summary["parent_sequence_id"]
+            count = summary["audio_frame_count"]
+            sizes = canonical_bytes[offset : offset + count]
+            expected_keys.extend((parent, frame_id) for frame_id in range(count))
+            if len(sizes) != count or sum(sizes) != summary["audio_bytes"]:
+                errors.append(
+                    f"parent {parent} frame bytes do not match its completion"
+                )
+            offset += count
+        if canonical_keys != expected_keys:
+            errors.append(
+                "published audio frame keys must be contiguous within every parent"
+            )
+        if offset != len(canonical_bytes):
+            errors.append(
+                "published frame lists contain bytes outside parent completions"
+            )
+
+    websocket_events = staged_pipeline.get("websocket_send_events")
+    websocket_event_keys: list[tuple[int, int]] | None = []
+    websocket_event_bytes: list[int] = []
+    if not isinstance(websocket_events, list):
+        errors.append("websocket_send_events must be a list")
+        websocket_event_keys = None
+    else:
+        valid = True
+        for index, event in enumerate(websocket_events):
+            key = _audio_frame_key(
+                event,
+                field_name=f"websocket_send_events[{index}]",
+                errors=errors,
+                sequence_alias=(
+                    event.get("sequence_id")
+                    if isinstance(event, dict)
+                    else _MISSING
+                ),
+            )
+            if key is None:
+                valid = False
+            else:
+                websocket_event_keys.append(key)
+            audio_bytes = event.get("audio_bytes") if isinstance(event, dict) else None
+            if not _positive_int(audio_bytes):
+                errors.append(
+                    f"websocket_send_events[{index}].audio_bytes is invalid"
+                )
+                valid = False
+            else:
+                websocket_event_bytes.append(audio_bytes)
+            sent_ms = (
+                event.get("sent_monotonic_ms")
+                if isinstance(event, dict)
+                else None
+            )
+            if (
+                not isinstance(sent_ms, (int, float))
+                or isinstance(sent_ms, bool)
+                or not math.isfinite(sent_ms)
+                or sent_ms < 0
+            ):
+                errors.append(
+                    f"websocket_send_events[{index}].sent_monotonic_ms is invalid"
+                )
+                valid = False
+        if not valid:
+            websocket_event_keys = None
+    if (
+        websocket_event_keys is not None
+        and canonical_keys is not None
+        and websocket_event_keys != canonical_keys
+    ):
+        errors.append(
+            "websocket_send_events frame order must exactly match "
+            "published_audio_frame_keys"
+        )
+    if (
+        canonical_bytes is not None
+        and websocket_event_bytes != canonical_bytes
+    ):
+        errors.append(
+            "websocket_send_events audio bytes must exactly match "
+            "published_audio_frame_bytes"
+        )
+    if isinstance(websocket_receive_events, list):
+        if received_pcm_bytes != websocket_event_bytes:
+            errors.append(
+                "WebSocket PCM received bytes must exactly match successful "
+                "send bytes frame-by-frame"
+            )
+
+    events = staged_pipeline.get("events")
+    if not isinstance(events, list):
+        errors.append("staged events must be a list")
+        events = []
+    parent_event_sequences = {
+        ("segmenter", "emitted"): [],
+        ("nmt", "completed"): [],
+        ("tts", "completed"): [],
+        ("output", "parent_complete_enqueued"): [],
+        ("output", "parent_complete_dequeued"): [],
+    }
+    frame_event_records = {
+        ("tts", "frame_received"): ([], []),
+        ("output", "frame_enqueued"): ([], []),
+        ("output", "frame_dequeued"): ([], []),
+    }
+    nmt_retry_total = 0
+    tts_retry_total = 0
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            errors.append(f"events[{index}] must be an object")
+            continue
+        event_name = (event.get("stage"), event.get("event"))
+        sequence_id = event.get("sequence_id")
+        if event_name in parent_event_sequences:
+            if (
+                not isinstance(sequence_id, int)
+                or isinstance(sequence_id, bool)
+                or sequence_id < 0
+            ):
+                errors.append(f"events[{index}].sequence_id is invalid")
+            else:
+                parent_event_sequences[event_name].append(sequence_id)
+        if event_name in frame_event_records:
+            key = _audio_frame_key(
+                event,
+                field_name=f"events[{index}]",
+                errors=errors,
+                sequence_alias=sequence_id,
+            )
+            audio_bytes = event.get("audio_bytes")
+            if key is not None:
+                frame_event_records[event_name][0].append(key)
+            if not _positive_int(audio_bytes):
+                errors.append(f"events[{index}].audio_bytes is invalid")
+            else:
+                frame_event_records[event_name][1].append(audio_bytes)
+        if event_name in {
+            ("nmt", "completed"),
+            ("nmt", "error"),
+            ("tts", "completed"),
+            ("tts", "error"),
+        }:
+            retry_count = event.get("retry_count")
+            if (
+                not isinstance(retry_count, int)
+                or isinstance(retry_count, bool)
+                or retry_count not in {0, 1}
+            ):
+                errors.append(
+                    f"events[{index}].retry_count must be zero or one"
+                )
+            elif event_name == ("nmt", "completed"):
+                nmt_retry_total += retry_count
+            elif event_name == ("tts", "completed"):
+                tts_retry_total += retry_count
+        queue_depth = event.get("queue_depth")
+        queue_capacity = event.get("queue_capacity")
+        if queue_depth is None and queue_capacity is None:
+            continue
+        if (
+            not isinstance(queue_depth, int)
+            or isinstance(queue_depth, bool)
+            or queue_depth < 0
+        ):
+            errors.append(f"events[{index}].queue_depth is invalid")
+            continue
+        if not _positive_int(queue_capacity):
+            errors.append(f"events[{index}].queue_capacity is invalid")
+            continue
+        if queue_depth > queue_capacity:
+            errors.append(
+                f"events[{index}] queue depth {queue_depth} exceeds "
+                f"capacity {queue_capacity}"
+            )
+    if completed is not None:
+        for (stage, event_name), observed in parent_event_sequences.items():
+            if observed != completed:
+                errors.append(
+                    f"{stage}/{event_name} parent sequence order must exactly "
+                    "match completed_sequence_ids"
+                )
+    if canonical_keys is not None and canonical_bytes is not None:
+        for (stage, event_name), (keys, sizes) in frame_event_records.items():
+            if keys != canonical_keys:
+                errors.append(
+                    f"{stage}/{event_name} frame order must exactly match "
+                    "published_audio_frame_keys"
+                )
+            if sizes != canonical_bytes:
+                errors.append(
+                    f"{stage}/{event_name} frame bytes must exactly match "
+                    "published_audio_frame_bytes"
+                )
+
+    for summary_name, event_total in (
+        ("nmt_retry_count", nmt_retry_total),
+        ("tts_retry_count", tts_retry_total),
+    ):
+        value = staged_pipeline.get(summary_name)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            errors.append(f"{summary_name} must be a non-negative integer")
+        elif value != event_total:
+            errors.append(
+                f"{summary_name} must equal completed event retry total"
+            )
+
+    max_depths = staged_pipeline.get("max_queue_depths")
+    if not isinstance(max_depths, dict):
+        errors.append("max_queue_depths must be an object")
+    elif staged_config is not None:
+        for queue_name, config_key in {
+            "nmt": "nmtQueueMaxSize",
+            "tts": "ttsQueueMaxSize",
+            "output": "outputQueueMaxSize",
+        }.items():
+            capacity = staged_config.get(config_key)
+            depth = max_depths.get(queue_name)
+            if not _positive_int(capacity):
+                errors.append(
+                    f"/api/config.stagedConfig.{config_key} must be "
+                    "a positive integer"
+                )
+            elif (
+                not isinstance(depth, int)
+                or isinstance(depth, bool)
+                or depth < 0
+                or depth > capacity
+            ):
+                errors.append(
+                    f"max_queue_depths.{queue_name} is outside configured capacity"
+                )
+    return errors
+
+
 def validate_staged_pipeline_integrity(
     staged_pipeline: Any,
     backend_config: dict,
@@ -974,6 +1653,14 @@ def validate_staged_pipeline_integrity(
         )
     if summary_schema == 2:
         return _validate_staged_pipeline_integrity_v2(
+            staged_pipeline,
+            staged_config,
+            websocket_receive_events,
+            input_end_timestamp_ms,
+            errors,
+        )
+    if summary_schema == 3:
+        return _validate_staged_pipeline_integrity_v3(
             staged_pipeline,
             staged_config,
             websocket_receive_events,

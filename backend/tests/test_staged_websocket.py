@@ -194,6 +194,369 @@ def composite_audio(
     )
 
 
+def incremental_audio_frame(parent_sequence_id, audio_frame_id, audio):
+    return SimpleNamespace(
+        kind=StagedOutputEventKind.AUDIO_FRAME,
+        frame=SimpleNamespace(
+            audio=audio,
+            parent_sequence_id=parent_sequence_id,
+            audio_frame_id=audio_frame_id,
+        ),
+    )
+
+
+def incremental_parent_complete(
+    parent_sequence_id,
+    audio_frame_count,
+    audio_bytes,
+    *,
+    retry_count=0,
+):
+    return SimpleNamespace(
+        kind=StagedOutputEventKind.PARENT_COMPLETE,
+        completion=SimpleNamespace(
+            parent_sequence_id=parent_sequence_id,
+            audio_frame_count=audio_frame_count,
+            audio_bytes=audio_bytes,
+            retry_count=retry_count,
+        ),
+    )
+
+
+class FakeIncrementalStagedPipeline(FakeStagedPipeline):
+    """Schema-v3 output fake with independent frame/parent accounting."""
+
+    def __init__(self):
+        super().__init__()
+        self.config.tts_incremental_publish_enabled = True
+        self.published_audio_frame_keys = []
+        self.published_audio_frame_bytes = []
+        self.dequeued_audio_frame_keys = []
+        self.dequeued_audio_frame_bytes = []
+        self.produced_parent_summaries = []
+        self.completed_parent_summaries = []
+
+    async def next_output(self):
+        output = await self.outputs.get()
+        if output.kind is StagedOutputEventKind.AUDIO_FRAME:
+            frame = output.frame
+            key = (frame.parent_sequence_id, frame.audio_frame_id)
+            self.published_audio_frame_keys.append(key)
+            self.published_audio_frame_bytes.append(len(frame.audio))
+            self.dequeued_audio_frame_keys.append(key)
+            self.dequeued_audio_frame_bytes.append(len(frame.audio))
+        elif output.kind is StagedOutputEventKind.PARENT_COMPLETE:
+            completion = output.completion
+            summary = {
+                "parent_sequence_id": completion.parent_sequence_id,
+                "audio_frame_count": completion.audio_frame_count,
+                "audio_bytes": completion.audio_bytes,
+                "retry_count": completion.retry_count,
+            }
+            self.produced_parent_summaries.append(summary)
+            self.completed_parent_summaries.append(dict(summary))
+            self.dequeued_audio_sequence_ids.append(
+                completion.parent_sequence_id
+            )
+        return output
+
+    def summary(self, include_events=False):
+        def frame_keys(keys):
+            return [
+                {
+                    "parent_sequence_id": parent_sequence_id,
+                    "audio_frame_id": audio_frame_id,
+                }
+                for parent_sequence_id, audio_frame_id in keys
+            ]
+
+        return {
+            "telemetry_schema_version": 3,
+            "tts_incremental_publish_enabled": True,
+            "state": "closed" if self.closed else "running",
+            "outcome": "complete",
+            "cleanup_errors": [],
+            "completed_sequence_ids": list(
+                self.dequeued_audio_sequence_ids
+            ),
+            "incomplete_sequence_ids": [],
+            "published_audio_frame_keys": frame_keys(
+                self.published_audio_frame_keys
+            ),
+            "published_audio_frame_bytes": list(
+                self.published_audio_frame_bytes
+            ),
+            "dequeued_audio_frame_keys": frame_keys(
+                self.dequeued_audio_frame_keys
+            ),
+            "dequeued_audio_frame_bytes": list(
+                self.dequeued_audio_frame_bytes
+            ),
+            "produced_parent_summaries": [
+                dict(item) for item in self.produced_parent_summaries
+            ],
+            "completed_parent_summaries": [
+                dict(item) for item in self.completed_parent_summaries
+            ],
+            "events": (
+                [{"stage": "fake", "event": "captured"}]
+                if include_events
+                else None
+            ),
+        }
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_frames_are_sent_fifo_and_parent_complete_has_no_wire_bytes(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    outbound = []
+
+    async def record_audio(payload):
+        outbound.append(("audio", payload))
+
+    async def record_json(payload):
+        outbound.append(("json", payload))
+
+    mock_websocket.send_bytes.side_effect = record_audio
+    mock_websocket.send_json.side_effect = record_json
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_audio_frame(0, 1, b"bbbb"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 2, 6))
+    await pipeline.outputs.put(incremental_audio_frame(1, 0, b"cc"))
+    await pipeline.outputs.put(incremental_parent_complete(1, 1, 2))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+
+    assert [
+        payload for kind, payload in outbound if kind == "audio"
+    ] == [b"aa", b"bbbb", b"cc"]
+    assert session._staged_audio_sequence_ids_sent == [0, 1]
+    assert session._staged_parent_completions_sent == [
+        {
+            "parent_sequence_id": 0,
+            "audio_frame_count": 2,
+            "audio_bytes": 6,
+            "retry_count": 0,
+        },
+        {
+            "parent_sequence_id": 1,
+            "audio_frame_count": 1,
+            "audio_bytes": 2,
+            "retry_count": 0,
+        },
+    ]
+    completed = {
+        "type": "status",
+        "status": "completed",
+        "message": "Riva translated-audio stream complete",
+    }
+    assert outbound.index(("audio", b"cc")) < outbound.index(
+        ("json", completed)
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_summary_reconciles_frames_bytes_and_parents(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_audio_frame(0, 1, b"bbbb"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 2, 6))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+    snapshot = session.staged_telemetry_snapshot()
+
+    expected_keys = [
+        {"parent_sequence_id": 0, "audio_frame_id": 0},
+        {"parent_sequence_id": 0, "audio_frame_id": 1},
+    ]
+    expected_parent = [
+        {
+            "parent_sequence_id": 0,
+            "audio_frame_count": 2,
+            "audio_bytes": 6,
+            "retry_count": 0,
+        }
+    ]
+    assert snapshot["published_audio_frame_keys"] == expected_keys
+    assert snapshot["dequeued_audio_frame_keys"] == expected_keys
+    assert snapshot["websocket_sent_audio_frame_keys"] == expected_keys
+    assert snapshot["published_audio_frame_bytes"] == [2, 4]
+    assert snapshot["dequeued_audio_frame_bytes"] == [2, 4]
+    assert snapshot["websocket_sent_audio_frame_bytes"] == [2, 4]
+    assert snapshot["produced_parent_summaries"] == expected_parent
+    assert snapshot["completed_parent_summaries"] == expected_parent
+    assert snapshot["websocket_completed_parent_summaries"] == expected_parent
+    assert snapshot["websocket_sent_sequence_ids"] == [0]
+    assert [
+        (
+            event["parent_sequence_id"],
+            event["audio_frame_id"],
+            event["audio_bytes"],
+        )
+        for event in snapshot["websocket_send_events"]
+    ] == [(0, 0, 2), (0, 1, 4)]
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_summary_mismatch_replaces_completion_with_error(
+    mock_websocket,
+):
+    class MismatchedIncrementalPipeline(FakeIncrementalStagedPipeline):
+        def summary(self, include_events=False):
+            result = super().summary(include_events=include_events)
+            result["published_audio_frame_bytes"] = [8]
+            return result
+
+    pipeline = MismatchedIncrementalPipeline()
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 1, 2))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+
+    assert mock_websocket.send_json.await_args_list[-1].args[0] == {
+        "type": "error",
+        "message": (
+            "Staged cleanup failed: schema-3 audio-frame byte counts "
+            "did not reconcile across pipeline and WebSocket"
+        ),
+    }
+    assert not any(
+        call.args[0].get("status") == "completed"
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "status"
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_send_failure_preserves_prefix_and_emits_one_error(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    mock_websocket.send_bytes.side_effect = [
+        None,
+        RuntimeError("socket write failed"),
+    ]
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_audio_frame(0, 1, b"bbbb"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 2, 6))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+    await _wait_until(lambda: pipeline.closed)
+
+    assert [call.args[0] for call in mock_websocket.send_bytes.await_args_list] == [
+        b"aa",
+        b"bbbb",
+    ]
+    errors = [
+        call.args[0]
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "error"
+    ]
+    assert errors == [
+        {
+            "type": "error",
+            "message": "translated audio could not be sent to the client",
+        }
+    ]
+    assert session._staged_audio_frame_keys_sent == [(0, 0)]
+    assert session._staged_audio_frame_bytes_sent == [2]
+    assert session._staged_parent_completions_sent == []
+    assert session._staged_audio_sequence_ids_sent == []
+    assert session._staged_pending_frame_parent == 0
+    assert session._staged_pending_frame_count == 1
+    assert session._staged_pending_frame_bytes == 2
+    assert not any(
+        call.args[0].get("status") == "completed"
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "status"
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_new_generation_resets_partial_frame_evidence(
+    mock_websocket,
+):
+    first = FakeIncrementalStagedPipeline()
+    second = FakeIncrementalStagedPipeline()
+    pipelines = iter((first, second))
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: next(pipelines),
+    )
+
+    await session.start_stream("es-US")
+    await first.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await _wait_until(
+        lambda: session._staged_audio_frame_keys_sent == [(0, 0)]
+    )
+    assert session._staged_pending_frame_parent == 0
+
+    await session.start_stream("es-US")
+
+    assert first.closed
+    assert second.started
+    assert session.status is SessionStatus.LISTENING
+    assert session._staged_audio_sequence_ids_sent == []
+    assert session._staged_audio_frame_keys_sent == []
+    assert session._staged_audio_frame_bytes_sent == []
+    assert session._staged_parent_completions_sent == []
+    assert session._staged_pending_frame_parent is None
+    assert session._staged_pending_frame_count == 0
+    assert session._staged_pending_frame_bytes == 0
+    active_snapshot = session.staged_telemetry_snapshot()
+    assert active_snapshot["websocket_sent_sequence_ids"] == []
+    assert active_snapshot["websocket_sent_audio_frame_keys"] == []
+    assert active_snapshot["websocket_sent_audio_frame_bytes"] == []
+    assert active_snapshot["websocket_completed_parent_summaries"] == []
+    assert active_snapshot["websocket_send_events"] == []
+    await session.stop_stream()
+
+
 @pytest.mark.asyncio
 async def test_staged_stream_preserves_audio_and_terminal_websocket_contract(
     mock_websocket,

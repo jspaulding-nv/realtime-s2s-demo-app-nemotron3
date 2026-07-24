@@ -15,7 +15,9 @@ from staged_models import (
     EmissionReason,
     StagedOutputEvent,
     StagedOutputEventKind,
+    SynthesizedAudioFrame,
     SynthesizedSegment,
+    SynthesizedStreamCompletion,
     TTSResponseChunkMetric,
     TextSegment,
     TranslatedSegment,
@@ -1619,3 +1621,492 @@ def test_staged_config_allows_minimum_packing_preference_above_cap():
 
     assert resolved.tts_subsegment_max_chars == 5
     assert resolved.tts_subsegment_min_chars == 12
+
+
+class IncrementalFakeTTS(FakeTTSClient):
+    """Publish deterministic schema-v3 frames from the blocking TTS worker."""
+
+    def __init__(
+        self,
+        frame_sizes=(3_200, 800),
+        *,
+        fail_after_frames=None,
+        completion_frame_delta=0,
+        completion_byte_delta=0,
+    ):
+        super().__init__()
+        self.frame_sizes = tuple(frame_sizes)
+        self.fail_after_frames = fail_after_frames
+        self.completion_frame_delta = completion_frame_delta
+        self.completion_byte_delta = completion_byte_delta
+        self.publish_attempted = [
+            threading.Event() for _ in self.frame_sizes
+        ]
+        self.publish_committed = [
+            threading.Event() for _ in self.frame_sizes
+        ]
+        self.incremental_calls = 0
+
+    def synthesize_incremental(self, translation, publish_frame):
+        self.incremental_calls += 1
+        self.order_keys.append(translation.order_key)
+        self.translations.append(translation)
+        self.starts[translation.sequence_id] = time.monotonic()
+        started_ms = now_ms()
+        first_audio_ms = None
+        committed_bytes = 0
+
+        for audio_frame_id, audio_bytes in enumerate(self.frame_sizes):
+            received_ms = now_ms()
+            if first_audio_ms is None:
+                first_audio_ms = received_ms
+            audio = bytes(
+                (translation.sequence_id + 1, audio_frame_id + 1)
+            ) * (audio_bytes // 2)
+            frame = SynthesizedAudioFrame(
+                translation=translation,
+                audio_frame_id=audio_frame_id,
+                audio=audio,
+                sample_rate_hz=16_000,
+                channels=1,
+                bytes_per_sample=2,
+                received_monotonic_ms=received_ms,
+            )
+            self.publish_attempted[audio_frame_id].set()
+            publish_frame(frame)
+            self.publish_committed[audio_frame_id].set()
+            committed_bytes += len(audio)
+            if self.fail_after_frames == audio_frame_id + 1:
+                raise RuntimeError(
+                    "synthetic incremental failure after committed audio"
+                )
+
+        completed_ms = now_ms()
+        self.sequences.append(translation.sequence_id)
+        self.ends[translation.sequence_id] = time.monotonic()
+        return SynthesizedStreamCompletion(
+            translation=translation,
+            audio_frame_count=(
+                len(self.frame_sizes) + self.completion_frame_delta
+            ),
+            audio_bytes=committed_bytes + self.completion_byte_delta,
+            sample_rate_hz=16_000,
+            channels=1,
+            bytes_per_sample=2,
+            started_monotonic_ms=started_ms,
+            first_audio_monotonic_ms=first_audio_ms,
+            completed_monotonic_ms=completed_ms,
+        )
+
+
+async def wait_for_thread_event(event, timeout_s=1):
+    deadline = time.monotonic() + timeout_s
+    while not event.is_set():
+        if time.monotonic() >= deadline:
+            raise AssertionError("timed out waiting for worker-thread event")
+        await asyncio.sleep(0.01)
+
+
+async def drain_incremental(session):
+    outputs = []
+    while True:
+        output = await session.next_output(timeout_s=3)
+        outputs.append(output)
+        if output.kind in {
+            StagedOutputEventKind.COMPLETE,
+            StagedOutputEventKind.ERROR,
+        }:
+            return outputs
+
+
+def streaming_translation(sequence_id=0):
+    captured_ms = now_ms()
+    source = TextSegment(
+        sequence_id=sequence_id,
+        text="A compact source.",
+        reason=EmissionReason.PUNCTUATION,
+        emitted_monotonic_ms=captured_ms,
+        buffered_since_monotonic_ms=captured_ms - 1,
+        source_start_ms=0,
+        source_end_ms=1_000,
+        contributing_final_ids=(sequence_id,),
+    )
+    return TranslatedSegment(
+        segment=source,
+        text="Una fuente compacta.",
+        language="es-US",
+        started_monotonic_ms=captured_ms,
+        completed_monotonic_ms=captured_ms,
+    )
+
+
+def streaming_frame(translation, audio_frame_id=0, audio_bytes=1_600):
+    return SynthesizedAudioFrame(
+        translation=translation,
+        audio_frame_id=audio_frame_id,
+        audio=b"\x01\x00" * (audio_bytes // 2),
+        sample_rate_hz=16_000,
+        channels=1,
+        bytes_per_sample=2,
+        received_monotonic_ms=now_ms(),
+    )
+
+
+def streaming_completion(
+    translation,
+    *,
+    audio_frame_count=1,
+    audio_bytes=1_600,
+):
+    captured_ms = now_ms()
+    return SynthesizedStreamCompletion(
+        translation=translation,
+        audio_frame_count=audio_frame_count,
+        audio_bytes=audio_bytes,
+        sample_rate_hz=16_000,
+        channels=1,
+        bytes_per_sample=2,
+        started_monotonic_ms=captured_ms,
+        first_audio_monotonic_ms=captured_ms,
+        completed_monotonic_ms=captured_ms,
+    )
+
+
+@pytest.mark.asyncio
+async def test_incremental_clean_order_is_frames_parent_marker_then_complete():
+    tts = IncrementalFakeTTS()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            output_queue_maxsize=4,
+            tts_incremental_publish_enabled=True,
+        ),
+        session_id="incremental-clean-order",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain_incremental(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO_FRAME,
+        StagedOutputEventKind.AUDIO_FRAME,
+        StagedOutputEventKind.PARENT_COMPLETE,
+        StagedOutputEventKind.COMPLETE,
+    ]
+    assert [output.frame.frame_key for output in outputs[:2]] == [
+        (0, 0),
+        (0, 1),
+    ]
+    assert outputs[2].completion.parent_sequence_id == 0
+    assert outputs[2].completion.audio_frame_count == 2
+    assert outputs[2].completion.audio_bytes == 4_000
+    assert tts.incremental_calls == 1
+
+    summary = session.summary(include_events=True)
+    expected_keys = [
+        {"parent_sequence_id": 0, "audio_frame_id": 0},
+        {"parent_sequence_id": 0, "audio_frame_id": 1},
+    ]
+    assert summary["telemetry_schema_version"] == 3
+    assert summary["tts_incremental_publish_enabled"] is True
+    assert summary["audio_frames_produced"] == 2
+    assert summary["published_audio_frame_keys"] == expected_keys
+    assert summary["dequeued_audio_frame_keys"] == expected_keys
+    assert summary["published_audio_frame_bytes"] == [3_200, 800]
+    assert summary["dequeued_audio_frame_bytes"] == [3_200, 800]
+    assert summary["completed_sequence_ids"] == [0]
+    assert summary["incomplete_sequence_ids"] == []
+    assert summary["produced_parent_summaries"] == [
+        {
+            "parent_sequence_id": 0,
+            "audio_frame_count": 2,
+            "audio_bytes": 4_000,
+            "retry_count": 0,
+        }
+    ]
+    assert (
+        summary["completed_parent_summaries"]
+        == summary["produced_parent_summaries"]
+    )
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_parent_completes_only_when_marker_is_dequeued():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=IncrementalFakeTTS(frame_sizes=(1_600,)),
+        config=config(
+            output_queue_maxsize=2,
+            tts_incremental_publish_enabled=True,
+        ),
+        session_id="incremental-marker-completion",
+    )
+
+    await session.start()
+    session.finish_input()
+    frame = await session.next_output(timeout_s=2)
+
+    assert frame.kind is StagedOutputEventKind.AUDIO_FRAME
+    assert session.summary()["completed_sequence_ids"] == []
+    assert session.summary()["incomplete_sequence_ids"] == [0]
+
+    marker = await session.next_output(timeout_s=2)
+
+    assert marker.kind is StagedOutputEventKind.PARENT_COMPLETE
+    assert session.summary()["completed_sequence_ids"] == [0]
+    assert session.summary()["incomplete_sequence_ids"] == []
+    assert (
+        await session.next_output(timeout_s=2)
+    ).kind is StagedOutputEventKind.COMPLETE
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_output_capacity_one_backpressures_worker():
+    tts = IncrementalFakeTTS(frame_sizes=(3_200, 3_200))
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            output_queue_maxsize=1,
+            tts_incremental_publish_enabled=True,
+        ),
+        session_id="incremental-backpressure",
+    )
+
+    await session.start()
+    session.finish_input()
+    await wait_for_thread_event(tts.publish_attempted[1])
+
+    assert tts.publish_committed[0].is_set()
+    assert not tts.publish_committed[1].is_set()
+    assert session._output_queue.qsize() == 1
+    assert session.summary()["audio_frames_produced"] == 1
+    assert session.summary()["max_queue_depths"]["output"] == 1
+
+    first = await session.next_output(timeout_s=2)
+    assert first.frame.frame_key == (0, 0)
+    await wait_for_thread_event(tts.publish_committed[1])
+    assert session.summary()["audio_frames_produced"] == 2
+
+    second = await session.next_output(timeout_s=2)
+    marker = await session.next_output(timeout_s=2)
+    terminal = await session.next_output(timeout_s=2)
+
+    assert second.frame.frame_key == (0, 1)
+    assert marker.kind is StagedOutputEventKind.PARENT_COMPLETE
+    assert terminal.kind is StagedOutputEventKind.COMPLETE
+    assert session.summary()["max_queue_depths"]["output"] == 1
+    assert session.summary()["blocked_put_counts"]["output"] >= 1
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_abort_wins_simultaneous_output_capacity_race():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(),
+        nmt_client=FakeNMTClient(),
+        tts_client=IncrementalFakeTTS(frame_sizes=(1_600,)),
+        config=config(
+            output_queue_maxsize=1,
+            tts_incremental_publish_enabled=True,
+        ),
+        session_id="incremental-abort-capacity-race",
+    )
+    session._state = StagedPipelineState.RUNNING
+    translation = streaming_translation()
+    frame = streaming_frame(translation)
+    abort_event = asyncio.Event()
+    output_slots = session._queue_slots["output"]
+
+    await output_slots.acquire()
+    publish = asyncio.create_task(
+        session._enqueue_incremental_frame(
+            frame,
+            abort_event=abort_event,
+        )
+    )
+    await asyncio.sleep(0)
+
+    # Make capacity and abort ready in the same event-loop turn. Queue insertion
+    # is the commit boundary, so this uncommitted frame must lose the race.
+    output_slots.release()
+    abort_event.set()
+
+    assert await publish is False
+    assert session._output_queue.empty()
+    assert output_slots._value == 1
+    assert session.summary()["audio_frames_produced"] == 0
+    assert session.summary()["published_audio_frame_keys"] == []
+
+    await session._enqueue(
+        session._output_queue,
+        StagedOutputEvent(
+            kind=StagedOutputEventKind.ERROR,
+            stage="nmt",
+            error="synthetic sibling failure",
+        ),
+        "output",
+        "error",
+    )
+    terminal = await session.next_output(timeout_s=1)
+    assert terminal.kind is StagedOutputEventKind.ERROR
+    assert session._output_queue.empty()
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_partial_prefix_precedes_single_error_without_marker():
+    tts = IncrementalFakeTTS(
+        frame_sizes=(3_200, 3_200),
+        fail_after_frames=1,
+    )
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            output_queue_maxsize=1,
+            tts_incremental_publish_enabled=True,
+        ),
+        session_id="incremental-partial-prefix",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain_incremental(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO_FRAME,
+        StagedOutputEventKind.ERROR,
+    ]
+    assert outputs[0].frame.frame_key == (0, 0)
+    assert outputs[1].stage == "tts"
+    assert "synthetic incremental failure" in outputs[1].error
+    summary = session.summary()
+    assert summary["outcome"] == "failed"
+    assert summary["audio_frames_produced"] == 1
+    assert summary["published_audio_frame_keys"] == [
+        {"parent_sequence_id": 0, "audio_frame_id": 0}
+    ]
+    assert summary["dequeued_audio_frame_keys"] == [
+        {"parent_sequence_id": 0, "audio_frame_id": 0}
+    ]
+    assert summary["produced_parent_summaries"] == []
+    assert summary["completed_parent_summaries"] == []
+    assert summary["completed_sequence_ids"] == []
+    assert summary["incomplete_sequence_ids"] == [0]
+    assert tts.incremental_calls == 1
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_output_rejects_parent_marker_total_mismatch():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(),
+        nmt_client=FakeNMTClient(),
+        tts_client=IncrementalFakeTTS(frame_sizes=(1_600,)),
+        config=config(
+            output_queue_maxsize=2,
+            tts_incremental_publish_enabled=True,
+        ),
+        session_id="incremental-marker-mismatch",
+    )
+    session._state = StagedPipelineState.RUNNING
+    translation = streaming_translation()
+    frame = streaming_frame(translation)
+    mismatched = streaming_completion(
+        translation,
+        audio_frame_count=2,
+        audio_bytes=len(frame.audio),
+    )
+
+    await session._enqueue(
+        session._output_queue,
+        StagedOutputEvent(
+            kind=StagedOutputEventKind.AUDIO_FRAME,
+            frame=frame,
+        ),
+        "output",
+        "frame_enqueued",
+    )
+    await session._enqueue(
+        session._output_queue,
+        StagedOutputEvent(
+            kind=StagedOutputEventKind.PARENT_COMPLETE,
+            completion=mismatched,
+        ),
+        "output",
+        "parent_complete_enqueued",
+    )
+
+    assert (
+        await session.next_output(timeout_s=1)
+    ).kind is StagedOutputEventKind.AUDIO_FRAME
+    with pytest.raises(
+        StagedPipelineError,
+        match="parent completion frame count mismatch",
+    ):
+        await session.next_output(timeout_s=1)
+    assert session.summary()["completed_sequence_ids"] == []
+    await session.aclose()
+
+
+def test_incremental_config_selects_schema_three_and_rejects_subsegments():
+    assert config().telemetry_schema_version == 1
+    assert config(tts_subsegment_max_chars=20).telemetry_schema_version == 2
+    assert config(
+        tts_incremental_publish_enabled=True
+    ).telemetry_schema_version == 3
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        config(
+            tts_incremental_publish_enabled=True,
+            tts_subsegment_max_chars=20,
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_subsegments_remain_schema_two_and_atomic():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [final(0, "Alpha beta gamma delta epsilon."), COMPLETE]
+        ),
+        nmt_client=FakeNMTClient(),
+        tts_client=FakeTTSClient(),
+        config=config(
+            tts_incremental_publish_enabled=False,
+            tts_subsegment_max_chars=10,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id="legacy-subsegments-after-schema-three",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+    audio_outputs = outputs[:-1]
+
+    assert len(audio_outputs) > 1
+    assert all(
+        output.kind is StagedOutputEventKind.AUDIO
+        for output in audio_outputs
+    )
+    assert outputs[-1].kind is StagedOutputEventKind.COMPLETE
+    summary = session.summary(include_events=True)
+    assert summary["telemetry_schema_version"] == 2
+    assert summary["tts_subsegmentation_enabled"] is True
+    assert "tts_incremental_publish_enabled" not in summary
+    assert "published_audio_frame_keys" not in summary
+    assert all(
+        "audio_frame_id" not in event
+        and "audio_frame_count" not in event
+        for event in summary["events"]
+    )
+    await session.aclose()

@@ -120,9 +120,7 @@ async def get_config():
         },
         "stagedConfig": {
             "telemetrySchemaVersion": (
-                2
-                if staged_pipeline_config.tts_subsegment_max_chars > 0
-                else 1
+                staged_pipeline_config.telemetry_schema_version
             ),
             "segmentMaxChars": staged_pipeline_config.segment_max_chars,
             "segmentMaxAgeMs": staged_pipeline_config.segment_max_age_ms,
@@ -148,6 +146,16 @@ async def get_config():
                 staged_pipeline_config.tts_subsegment_min_chars
             ),
             "closeTimeoutSeconds": staged_pipeline_config.close_timeout_s,
+            **(
+                {
+                    "ttsIncrementalPublishEnabled": True,
+                    "ttsIncrementalFrameMs": (
+                        staged_pipeline_config.tts_incremental_frame_ms
+                    ),
+                }
+                if staged_pipeline_config.tts_incremental_publish_enabled
+                else {}
+            ),
         },
     }
 

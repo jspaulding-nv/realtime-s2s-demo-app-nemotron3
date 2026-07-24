@@ -47,6 +47,9 @@ def create_staged_pipeline(target_language: str):
             capture_response_chunk_metrics=(
                 staged_pipeline_config.tts_response_chunk_telemetry_enabled
             ),
+            incremental_frame_ms=(
+                staged_pipeline_config.tts_incremental_frame_ms
+            ),
         ),
         target_language=target_language,
         config=staged_pipeline_config,
@@ -88,6 +91,14 @@ class TranslationSession:
     _staged_audio_subsegment_keys_sent: list[tuple[int, int, int]] = field(
         default_factory=list
     )
+    _staged_audio_frame_keys_sent: list[tuple[int, int]] = field(
+        default_factory=list
+    )
+    _staged_audio_frame_bytes_sent: list[int] = field(default_factory=list)
+    _staged_parent_completions_sent: list[dict] = field(default_factory=list)
+    _staged_pending_frame_parent: Optional[int] = None
+    _staged_pending_frame_count: int = 0
+    _staged_pending_frame_bytes: int = 0
     _staged_websocket_send_events: list[dict] = field(default_factory=list)
     _last_staged_summary: Optional[dict] = None
 
@@ -320,6 +331,12 @@ class TranslationSession:
         generation = self._staged_generation
         self._staged_audio_sequence_ids_sent = []
         self._staged_audio_subsegment_keys_sent = []
+        self._staged_audio_frame_keys_sent = []
+        self._staged_audio_frame_bytes_sent = []
+        self._staged_parent_completions_sent = []
+        self._staged_pending_frame_parent = None
+        self._staged_pending_frame_count = 0
+        self._staged_pending_frame_bytes = 0
         self._staged_websocket_send_events = []
         try:
             pipeline = factory(target_language)
@@ -369,6 +386,41 @@ class TranslationSession:
                         await self._send_staged_error(
                             generation,
                             "translated audio could not be sent to the client",
+                        )
+                        return
+                    continue
+                if output.kind is StagedOutputEventKind.AUDIO_FRAME:
+                    frame = output.frame
+                    audio = frame.audio
+                    timing_logger.log_audio_from_riva(len(audio))
+                    sent = await self._send_staged_audio(
+                        generation,
+                        audio,
+                        frame.parent_sequence_id,
+                        audio_frame_id=frame.audio_frame_id,
+                        include_frame=True,
+                    )
+                    if sent is None:
+                        return
+                    if not sent:
+                        await self._send_staged_error(
+                            generation,
+                            "translated audio could not be sent to the client",
+                        )
+                        return
+                    continue
+                if output.kind is StagedOutputEventKind.PARENT_COMPLETE:
+                    completed = await self._complete_staged_parent(
+                        generation,
+                        output.completion,
+                    )
+                    if completed is None:
+                        return
+                    if not completed:
+                        await self._send_staged_error(
+                            generation,
+                            "incremental TTS parent completion did not "
+                            "reconcile WebSocket frames",
                         )
                         return
                     continue
@@ -455,7 +507,8 @@ class TranslationSession:
                 ),
                 True,
             )
-        if snapshot.get("telemetry_schema_version") == 2:
+        schema_version = snapshot.get("telemetry_schema_version")
+        if schema_version == 2:
             completed_subsegments = snapshot.get(
                 "completed_subsegment_keys"
             )
@@ -471,6 +524,46 @@ class TranslationSession:
                         "WebSocket-sent subsegment keys did not match "
                         "dequeued pipeline output"
                     ),
+                    True,
+                )
+        elif schema_version == 3:
+            frame_key_fields = (
+                "published_audio_frame_keys",
+                "dequeued_audio_frame_keys",
+                "websocket_sent_audio_frame_keys",
+            )
+            frame_byte_fields = (
+                "published_audio_frame_bytes",
+                "dequeued_audio_frame_bytes",
+                "websocket_sent_audio_frame_bytes",
+            )
+            parent_fields = (
+                "produced_parent_summaries",
+                "completed_parent_summaries",
+                "websocket_completed_parent_summaries",
+            )
+            for fields, label in (
+                (frame_key_fields, "audio-frame identities"),
+                (frame_byte_fields, "audio-frame byte counts"),
+                (parent_fields, "parent completion summaries"),
+            ):
+                values = [snapshot.get(field) for field in fields]
+                if (
+                    any(not isinstance(value, list) for value in values)
+                    or values[1:] != values[:-1]
+                ):
+                    return (
+                        f"schema-3 {label} did not reconcile across pipeline "
+                        "and WebSocket",
+                        True,
+                    )
+            if (
+                self._staged_pending_frame_parent is not None
+                or self._staged_pending_frame_count != 0
+                or self._staged_pending_frame_bytes != 0
+            ):
+                return (
+                    "schema-3 WebSocket retained an incomplete parent",
                     True,
                 )
         return "", True
@@ -508,6 +601,8 @@ class TranslationSession:
         subsequence_count: int = 1,
         *,
         include_composite: bool = False,
+        audio_frame_id: Optional[int] = None,
+        include_frame: bool = False,
     ) -> Optional[bool]:
         """Send current-generation PCM before any terminal message.
 
@@ -521,6 +616,16 @@ class TranslationSession:
             subsequence_id,
             subsequence_count,
         )
+        if include_frame:
+            _validate_audio_frame_key(sequence_id, audio_frame_id)
+            if include_composite:
+                raise ValueError(
+                    "audio frame and subsegment identities are mutually exclusive"
+                )
+        elif audio_frame_id is not None:
+            raise ValueError(
+                "audio_frame_id requires include_frame=true"
+            )
         async with self._send_lock:
             async with self._lock:
                 if (
@@ -529,19 +634,47 @@ class TranslationSession:
                     or self._closed
                 ):
                     return None
+            if include_frame:
+                expected_parent = (
+                    sequence_id
+                    if self._staged_pending_frame_parent is None
+                    else self._staged_pending_frame_parent
+                )
+                if (
+                    sequence_id != expected_parent
+                    or audio_frame_id != self._staged_pending_frame_count
+                ):
+                    return False
             if not await self._send_audio_unlocked(audio):
                 return False
             timing_logger.log_audio_sent_to_client(len(audio))
-            key = (sequence_id, subsequence_id, subsequence_count)
-            self._staged_audio_subsegment_keys_sent.append(key)
-            if subsequence_id == subsequence_count - 1:
-                self._staged_audio_sequence_ids_sent.append(sequence_id)
+            if include_frame:
+                if self._staged_pending_frame_parent is None:
+                    self._staged_pending_frame_parent = sequence_id
+                self._staged_audio_frame_keys_sent.append(
+                    (sequence_id, audio_frame_id)
+                )
+                self._staged_audio_frame_bytes_sent.append(len(audio))
+                self._staged_pending_frame_count += 1
+                self._staged_pending_frame_bytes += len(audio)
+            else:
+                key = (sequence_id, subsequence_id, subsequence_count)
+                self._staged_audio_subsegment_keys_sent.append(key)
+                if subsequence_id == subsequence_count - 1:
+                    self._staged_audio_sequence_ids_sent.append(sequence_id)
             event = {
                 "sequence_id": sequence_id,
                 "sent_monotonic_ms": time.monotonic_ns() / 1_000_000,
                 "audio_bytes": len(audio),
             }
-            if include_composite:
+            if include_frame:
+                event.update(
+                    {
+                        "parent_sequence_id": sequence_id,
+                        "audio_frame_id": audio_frame_id,
+                    }
+                )
+            elif include_composite:
                 event.update(
                     {
                         "parent_sequence_id": sequence_id,
@@ -550,6 +683,60 @@ class TranslationSession:
                     }
                 )
             self._staged_websocket_send_events.append(event)
+            return True
+
+    async def _complete_staged_parent(
+        self,
+        generation: int,
+        completion: Any,
+    ) -> Optional[bool]:
+        """Record an internal parent marker after all its frames were sent."""
+        parent_sequence_id = getattr(
+            completion,
+            "parent_sequence_id",
+            None,
+        )
+        audio_frame_count = getattr(completion, "audio_frame_count", None)
+        audio_bytes = getattr(completion, "audio_bytes", None)
+        retry_count = getattr(completion, "retry_count", None)
+        if (
+            not isinstance(parent_sequence_id, int)
+            or isinstance(parent_sequence_id, bool)
+            or parent_sequence_id < 0
+            or not isinstance(audio_frame_count, int)
+            or isinstance(audio_frame_count, bool)
+            or audio_frame_count <= 0
+            or not isinstance(audio_bytes, int)
+            or isinstance(audio_bytes, bool)
+            or audio_bytes <= 0
+            or retry_count not in {0, 1}
+        ):
+            return False
+        async with self._send_lock:
+            async with self._lock:
+                if (
+                    generation != self._staged_generation
+                    or self._staged_terminal_generation == generation
+                    or self._closed
+                ):
+                    return None
+            if (
+                self._staged_pending_frame_parent != parent_sequence_id
+                or self._staged_pending_frame_count != audio_frame_count
+                or self._staged_pending_frame_bytes != audio_bytes
+            ):
+                return False
+            summary = {
+                "parent_sequence_id": parent_sequence_id,
+                "audio_frame_count": audio_frame_count,
+                "audio_bytes": audio_bytes,
+                "retry_count": retry_count,
+            }
+            self._staged_parent_completions_sent.append(summary)
+            self._staged_audio_sequence_ids_sent.append(parent_sequence_id)
+            self._staged_pending_frame_parent = None
+            self._staged_pending_frame_count = 0
+            self._staged_pending_frame_bytes = 0
             return True
 
     async def _send_staged_json(
@@ -726,12 +913,25 @@ class TranslationSession:
         snapshot["websocket_sent_sequence_ids"] = list(
             self._staged_audio_sequence_ids_sent
         )
-        if snapshot.get("telemetry_schema_version") == 2:
+        schema_version = snapshot.get("telemetry_schema_version")
+        if schema_version == 2:
             snapshot["websocket_sent_subsegment_keys"] = (
                 _subsegment_key_payloads(
                     self._staged_audio_subsegment_keys_sent
                 )
             )
+        elif schema_version == 3:
+            snapshot["websocket_sent_audio_frame_keys"] = (
+                _audio_frame_key_payloads(
+                    self._staged_audio_frame_keys_sent
+                )
+            )
+            snapshot["websocket_sent_audio_frame_bytes"] = list(
+                self._staged_audio_frame_bytes_sent
+            )
+            snapshot["websocket_completed_parent_summaries"] = [
+                dict(item) for item in self._staged_parent_completions_sent
+            ]
         snapshot["websocket_send_events"] = copy.deepcopy(
             self._staged_websocket_send_events
         )
@@ -761,6 +961,12 @@ class TranslationSession:
         self._last_staged_summary = None
         self._staged_audio_sequence_ids_sent = []
         self._staged_audio_subsegment_keys_sent = []
+        self._staged_audio_frame_keys_sent = []
+        self._staged_audio_frame_bytes_sent = []
+        self._staged_parent_completions_sent = []
+        self._staged_pending_frame_parent = None
+        self._staged_pending_frame_count = 0
+        self._staged_pending_frame_bytes = 0
         self._staged_websocket_send_events = []
         return True
 
@@ -1008,6 +1214,18 @@ def _subsegment_key_payloads(
     ]
 
 
+def _audio_frame_key_payloads(
+    keys: list[tuple[int, int]],
+) -> list[dict]:
+    return [
+        {
+            "parent_sequence_id": parent_sequence_id,
+            "audio_frame_id": audio_frame_id,
+        }
+        for parent_sequence_id, audio_frame_id in keys
+    ]
+
+
 def _validate_subsegment_key(
     parent_sequence_id: int,
     subsequence_id: int,
@@ -1026,6 +1244,22 @@ def _validate_subsegment_key(
         raise ValueError("subsequence_count must be positive")
     if subsequence_id < 0 or subsequence_id >= subsequence_count:
         raise ValueError("subsequence_id is outside subsequence_count")
+
+
+def _validate_audio_frame_key(
+    parent_sequence_id: int,
+    audio_frame_id: Optional[int],
+) -> None:
+    for name, value in (
+        ("parent_sequence_id", parent_sequence_id),
+        ("audio_frame_id", audio_frame_id),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be a non-negative integer")
 
 
 class SessionManager:

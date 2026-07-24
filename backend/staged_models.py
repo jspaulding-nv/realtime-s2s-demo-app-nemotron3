@@ -28,6 +28,8 @@ class StagedOutputEventKind(str, Enum):
     """Terminal-safe events exposed to a staged-pipeline consumer."""
 
     AUDIO = "audio"
+    AUDIO_FRAME = "audio_frame"
+    PARENT_COMPLETE = "parent_complete"
     COMPLETE = "complete"
     ERROR = "error"
 
@@ -401,6 +403,252 @@ class SynthesizedSegment:
 
 
 @dataclass(frozen=True)
+class SynthesizedAudioFrame:
+    """One committed schema-v3 PCM frame from an active TTS request."""
+
+    translation: TranslatedSegment
+    audio_frame_id: int
+    audio: bytes
+    sample_rate_hz: int
+    channels: int
+    bytes_per_sample: int
+    received_monotonic_ms: float
+    retry_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.translation, TranslatedSegment):
+            raise ValueError("translation must be a TranslatedSegment")
+        if (
+            self.translation.subsequence_id != 0
+            or self.translation.subsequence_count != 1
+        ):
+            raise ValueError(
+                "incremental audio frames require an unsplit translation"
+            )
+        if (
+            not isinstance(self.audio_frame_id, int)
+            or isinstance(self.audio_frame_id, bool)
+            or self.audio_frame_id < 0
+        ):
+            raise ValueError("audio_frame_id must be a non-negative integer")
+        if not isinstance(self.audio, bytes) or not self.audio:
+            raise ValueError("synthesized frame audio must be non-empty bytes")
+        for name, value in (
+            ("sample_rate_hz", self.sample_rate_hz),
+            ("channels", self.channels),
+            ("bytes_per_sample", self.bytes_per_sample),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        pcm_sample_bytes = self.channels * self.bytes_per_sample
+        if len(self.audio) % pcm_sample_bytes:
+            raise ValueError("synthesized frame must align to a PCM sample")
+        _validate_nonnegative_finite(
+            "received_monotonic_ms", self.received_monotonic_ms
+        )
+        if (
+            not isinstance(self.retry_count, int)
+            or isinstance(self.retry_count, bool)
+            or self.retry_count not in {0, 1}
+        ):
+            raise ValueError("retry_count must be zero or one")
+
+    @property
+    def sequence_id(self) -> int:
+        return self.translation.sequence_id
+
+    @property
+    def parent_sequence_id(self) -> int:
+        return self.translation.parent_sequence_id
+
+    @property
+    def frame_key(self) -> Tuple[int, int]:
+        return (self.parent_sequence_id, self.audio_frame_id)
+
+    @property
+    def order_key(self) -> Tuple[int, int]:
+        return self.frame_key
+
+    @property
+    def audio_duration_ms(self) -> float:
+        bytes_per_second = (
+            self.sample_rate_hz * self.channels * self.bytes_per_sample
+        )
+        return len(self.audio) / bytes_per_second * 1_000
+
+    def to_dict(self, *, include_audio: bool = False) -> Dict[str, Any]:
+        payload = {
+            "parent_sequence_id": self.parent_sequence_id,
+            "audio_frame_id": self.audio_frame_id,
+            "audio_bytes": len(self.audio),
+            "sample_rate_hz": self.sample_rate_hz,
+            "channels": self.channels,
+            "bytes_per_sample": self.bytes_per_sample,
+            "audio_duration_ms": self.audio_duration_ms,
+            "received_monotonic_ms": self.received_monotonic_ms,
+            "retry_count": self.retry_count,
+        }
+        if include_audio:
+            payload["audio"] = self.audio
+        return payload
+
+
+@dataclass(frozen=True)
+class SynthesizedStreamCompletion:
+    """Authoritative completion for one schema-v3 incremental TTS request."""
+
+    translation: TranslatedSegment
+    audio_frame_count: int
+    audio_bytes: int
+    sample_rate_hz: int
+    channels: int
+    bytes_per_sample: int
+    started_monotonic_ms: float
+    first_audio_monotonic_ms: float
+    completed_monotonic_ms: float
+    retry_count: int = 0
+    response_chunks: Tuple[TTSResponseChunkMetric, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.translation, TranslatedSegment):
+            raise ValueError("translation must be a TranslatedSegment")
+        if (
+            self.translation.subsequence_id != 0
+            or self.translation.subsequence_count != 1
+        ):
+            raise ValueError(
+                "stream completion requires an unsplit translation"
+            )
+        for name, value in (
+            ("audio_frame_count", self.audio_frame_count),
+            ("audio_bytes", self.audio_bytes),
+            ("sample_rate_hz", self.sample_rate_hz),
+            ("channels", self.channels),
+            ("bytes_per_sample", self.bytes_per_sample),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        pcm_sample_bytes = self.channels * self.bytes_per_sample
+        if self.audio_bytes % pcm_sample_bytes:
+            raise ValueError("stream completion bytes must align to a PCM sample")
+        for name, value in (
+            ("started_monotonic_ms", self.started_monotonic_ms),
+            ("first_audio_monotonic_ms", self.first_audio_monotonic_ms),
+            ("completed_monotonic_ms", self.completed_monotonic_ms),
+        ):
+            _validate_nonnegative_finite(name, value)
+        if self.first_audio_monotonic_ms < self.started_monotonic_ms:
+            raise ValueError("first TTS audio cannot precede its start")
+        if self.completed_monotonic_ms < self.first_audio_monotonic_ms:
+            raise ValueError("TTS completion cannot precede first audio")
+        if (
+            not isinstance(self.retry_count, int)
+            or isinstance(self.retry_count, bool)
+            or self.retry_count not in {0, 1}
+        ):
+            raise ValueError("retry_count must be zero or one")
+        if not isinstance(self.response_chunks, tuple):
+            raise ValueError("response_chunks must be a tuple")
+        cumulative_audio_bytes = 0
+        previous_received_ms = self.started_monotonic_ms
+        for expected_index, chunk in enumerate(self.response_chunks):
+            if not isinstance(chunk, TTSResponseChunkMetric):
+                raise ValueError(
+                    "response_chunks must contain TTSResponseChunkMetric records"
+                )
+            if chunk.response_index != expected_index:
+                raise ValueError(
+                    "response chunk indices must be contiguous from zero"
+                )
+            cumulative_audio_bytes += chunk.audio_bytes
+            if chunk.cumulative_audio_bytes != cumulative_audio_bytes:
+                raise ValueError(
+                    "response chunk cumulative byte counts must reconcile"
+                )
+            if chunk.received_monotonic_ms < previous_received_ms:
+                raise ValueError(
+                    "response chunk timestamps must be nondecreasing"
+                )
+            if chunk.received_monotonic_ms > self.completed_monotonic_ms:
+                raise ValueError(
+                    "response chunk timestamp cannot follow TTS completion"
+                )
+            if chunk.retry_count != self.retry_count:
+                raise ValueError(
+                    "response chunk retry count must match its completion"
+                )
+            previous_received_ms = chunk.received_monotonic_ms
+        if self.response_chunks:
+            if self.response_chunks[0].received_monotonic_ms != (
+                self.first_audio_monotonic_ms
+            ):
+                raise ValueError(
+                    "first response chunk timestamp must match first TTS audio"
+                )
+            if cumulative_audio_bytes != self.audio_bytes:
+                raise ValueError(
+                    "response chunk byte counts must match stream completion"
+                )
+
+    @property
+    def sequence_id(self) -> int:
+        return self.translation.sequence_id
+
+    @property
+    def parent_sequence_id(self) -> int:
+        return self.translation.parent_sequence_id
+
+    @property
+    def subsequence_id(self) -> int:
+        return self.translation.subsequence_id
+
+    @property
+    def subsequence_count(self) -> int:
+        return self.translation.subsequence_count
+
+    @property
+    def order_key(self) -> Tuple[int, int, int]:
+        return self.translation.order_key
+
+    @property
+    def processing_duration_ms(self) -> float:
+        return self.completed_monotonic_ms - self.started_monotonic_ms
+
+    @property
+    def first_audio_latency_ms(self) -> float:
+        return self.first_audio_monotonic_ms - self.started_monotonic_ms
+
+    @property
+    def audio_duration_ms(self) -> float:
+        bytes_per_second = (
+            self.sample_rate_hz * self.channels * self.bytes_per_sample
+        )
+        return self.audio_bytes / bytes_per_second * 1_000
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "parent_sequence_id": self.parent_sequence_id,
+            "audio_frame_count": self.audio_frame_count,
+            "audio_bytes": self.audio_bytes,
+            "sample_rate_hz": self.sample_rate_hz,
+            "channels": self.channels,
+            "bytes_per_sample": self.bytes_per_sample,
+            "audio_duration_ms": self.audio_duration_ms,
+            "started_monotonic_ms": self.started_monotonic_ms,
+            "first_audio_monotonic_ms": self.first_audio_monotonic_ms,
+            "completed_monotonic_ms": self.completed_monotonic_ms,
+            "processing_duration_ms": self.processing_duration_ms,
+            "first_audio_latency_ms": self.first_audio_latency_ms,
+            "retry_count": self.retry_count,
+        }
+        if self.response_chunks:
+            payload["response_chunks"] = [
+                chunk.to_dict() for chunk in self.response_chunks
+            ]
+        return payload
+
+
+@dataclass(frozen=True)
 class StagedOutputEvent:
     """One ordered audio result or the single terminal pipeline event."""
 
@@ -408,6 +656,9 @@ class StagedOutputEvent:
     segment: Optional[SynthesizedSegment] = None
     stage: str = ""
     error: str = ""
+    # Appended after the legacy fields to preserve positional construction.
+    frame: Optional[SynthesizedAudioFrame] = None
+    completion: Optional[SynthesizedStreamCompletion] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, StagedOutputEventKind):
@@ -415,12 +666,50 @@ class StagedOutputEvent:
         if self.kind is StagedOutputEventKind.AUDIO:
             if not isinstance(self.segment, SynthesizedSegment):
                 raise ValueError("audio output requires a synthesized segment")
+            if self.frame is not None or self.completion is not None:
+                raise ValueError("audio output cannot carry streaming payloads")
             if self.stage or self.error:
                 raise ValueError("audio output cannot carry terminal error fields")
+        elif self.kind is StagedOutputEventKind.AUDIO_FRAME:
+            if not isinstance(self.frame, SynthesizedAudioFrame):
+                raise ValueError("audio-frame output requires a synthesized frame")
+            if (
+                self.segment is not None
+                or self.completion is not None
+                or self.stage
+                or self.error
+            ):
+                raise ValueError("audio-frame output requires only a frame")
+        elif self.kind is StagedOutputEventKind.PARENT_COMPLETE:
+            if not isinstance(self.completion, SynthesizedStreamCompletion):
+                raise ValueError(
+                    "parent-complete output requires a stream completion"
+                )
+            if (
+                self.segment is not None
+                or self.frame is not None
+                or self.stage
+                or self.error
+            ):
+                raise ValueError(
+                    "parent-complete output requires only a completion"
+                )
         elif self.kind is StagedOutputEventKind.ERROR:
-            if self.segment is not None or not self.stage.strip() or not self.error.strip():
+            if (
+                self.segment is not None
+                or self.frame is not None
+                or self.completion is not None
+                or not self.stage.strip()
+                or not self.error.strip()
+            ):
                 raise ValueError("error output requires only stage and error text")
-        elif self.segment is not None or self.stage or self.error:
+        elif (
+            self.segment is not None
+            or self.frame is not None
+            or self.completion is not None
+            or self.stage
+            or self.error
+        ):
             raise ValueError("complete output cannot carry a payload")
 
 
@@ -480,6 +769,9 @@ class PipelineEvent:
     audio_duration_ms: float = 0.0
     retry_count: int = 0
     error_code: str = ""
+    # Appended after the legacy fields to preserve positional construction.
+    audio_frame_id: Optional[int] = None
+    audio_frame_count: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -525,6 +817,29 @@ class PipelineEvent:
             raise ValueError("queue_depth cannot exceed queue_capacity")
         if min(self.text_chars, self.audio_bytes, self.retry_count) < 0:
             raise ValueError("event counters must be non-negative")
+        if self.audio_frame_id is not None and (
+            not isinstance(self.audio_frame_id, int)
+            or isinstance(self.audio_frame_id, bool)
+            or self.audio_frame_id < 0
+        ):
+            raise ValueError("audio_frame_id must be a non-negative integer")
+        if self.audio_frame_count is not None and (
+            not isinstance(self.audio_frame_count, int)
+            or isinstance(self.audio_frame_count, bool)
+            or self.audio_frame_count <= 0
+        ):
+            raise ValueError("audio_frame_count must be a positive integer")
+        if (
+            self.audio_frame_id is not None
+            and self.audio_frame_count is not None
+            and self.audio_frame_id >= self.audio_frame_count
+        ):
+            raise ValueError("audio_frame_id must be less than audio_frame_count")
+        if (
+            (self.audio_frame_id is not None or self.audio_frame_count is not None)
+            and self.sequence_id is None
+        ):
+            raise ValueError("audio frame identity requires a sequence_id")
         if self.parent_text_chars is not None and (
             not isinstance(self.parent_text_chars, int)
             or isinstance(self.parent_text_chars, bool)
@@ -543,8 +858,16 @@ class PipelineEvent:
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
-        if self.subsequence_id is not None:
+        if (
+            self.subsequence_id is not None
+            or self.audio_frame_id is not None
+            or self.audio_frame_count is not None
+        ):
             payload["parent_sequence_id"] = self.sequence_id
+        if self.audio_frame_id is None:
+            payload.pop("audio_frame_id")
+        if self.audio_frame_count is None:
+            payload.pop("audio_frame_count")
         if self.emission_reason is not None:
             payload["emission_reason"] = self.emission_reason.value
         return payload

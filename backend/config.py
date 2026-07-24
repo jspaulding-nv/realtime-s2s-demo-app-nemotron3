@@ -99,6 +99,15 @@ class StagedPipelineConfig:
     close_timeout_s: float = float(
         os.getenv("STAGED_CLOSE_TIMEOUT_SECONDS", "10")
     )
+    # Default-off schema-v3 experiment: forward bounded, frame-aligned PCM
+    # while one TTS response iterator is still active. These fields remain at
+    # the end to preserve the legacy positional constructor order.
+    tts_incremental_publish_enabled: bool = (
+        os.getenv("STAGED_TTS_INCREMENTAL_PUBLISH", "0") == "1"
+    )
+    tts_incremental_frame_ms: int = int(
+        os.getenv("STAGED_TTS_INCREMENTAL_FRAME_MS", "100")
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipeline_mode, str):
@@ -129,6 +138,18 @@ class StagedPipelineConfig:
             raise ValueError(
                 "tts_response_chunk_telemetry_enabled must be a boolean"
             )
+        if not isinstance(self.tts_incremental_publish_enabled, bool):
+            raise ValueError(
+                "tts_incremental_publish_enabled must be a boolean"
+            )
+        if (
+            not isinstance(self.tts_incremental_frame_ms, int)
+            or isinstance(self.tts_incremental_frame_ms, bool)
+            or self.tts_incremental_frame_ms <= 0
+        ):
+            raise ValueError(
+                "tts_incremental_frame_ms must be a positive integer"
+            )
         if (
             not isinstance(self.tts_subsegment_max_chars, int)
             or isinstance(self.tts_subsegment_max_chars, bool)
@@ -145,6 +166,14 @@ class StagedPipelineConfig:
             raise ValueError(
                 "tts_subsegment_min_chars must be a positive integer"
             )
+        if (
+            self.tts_incremental_publish_enabled
+            and self.tts_subsegment_max_chars > 0
+        ):
+            raise ValueError(
+                "incremental TTS publication and TTS subsegmentation are "
+                "mutually exclusive"
+            )
         for name in (
             "nmt_rpc_timeout_s",
             "tts_rpc_timeout_s",
@@ -159,6 +188,14 @@ class StagedPipelineConfig:
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive finite number")
+
+    @property
+    def telemetry_schema_version(self) -> int:
+        if self.tts_incremental_publish_enabled:
+            return 3
+        if self.tts_subsegment_max_chars > 0:
+            return 2
+        return 1
 
 
 # Supported target languages with their TTS voice names

@@ -29,6 +29,8 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
+- Default-off schema-v3 incremental TTS publication with 100 ms PCM framing, bounded backpressure, and pre-commit-only retry
+- A matched atomic-versus-incremental canary with same-audio publication timing and explicit stochastic-output confounding checks
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -109,7 +111,7 @@ realtime-s2s-demo-app/
 │   ├── riva_client.py       # Riva S2S wrapper
 │   ├── direct_asr_client.py # Direct staged Nemotron adapter
 │   ├── direct_nmt_client.py # Validated one-segment NMT adapter
-│   ├── direct_tts_client.py # Atomic Magpie PCM adapter
+│   ├── direct_tts_client.py # Atomic/incremental Magpie PCM adapter
 │   ├── punctuation_segmenter.py # Ordered final-text segmentation
 │   ├── staged_pipeline.py   # Bounded ordered stage orchestration
 │   ├── staged_models.py     # Staged records and telemetry contract
@@ -144,6 +146,8 @@ realtime-s2s-demo-app/
 ├── diagnose_short_segment.py # Privacy-safe isolated/context replay
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
+├── run_streaming_tts_canary.sh # Matched atomic/schema-v3 live canary
+├── summarize_streaming_tts_canary.py # Privacy-safe matched comparison
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
@@ -336,6 +340,8 @@ STAGED_TTS_RPC_TIMEOUT_SECONDS=60
 STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
 STAGED_TTS_MAX_RETRIES=1
 STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=0
+STAGED_TTS_INCREMENTAL_PUBLISH=0
+STAGED_TTS_INCREMENTAL_FRAME_MS=100
 STAGED_TTS_SUBSEGMENT_MAX_CHARS=0
 STAGED_TTS_SUBSEGMENT_MIN_CHARS=12
 STAGED_CLOSE_TIMEOUT_SECONDS=10
@@ -616,11 +622,33 @@ response-cadence data in the staged sidecar, and writes a privacy-safe
 forward partial PCM. The formal five-minute gate found 2,123 incremental PCM
 responses across 74/74 multi-response requests. Current atomic buffering held
 the first available PCM for another 0.430 seconds at p50 and 1.633 seconds at
-p95, so the next experiment will publish frame-aligned PCM under a default-off
-schema 3. This improves local responsiveness but does not by itself bound the
-listener queue. See the
+p95. The default-off schema-v3 experiment now publishes frame-aligned PCM
+without waiting for full TTS completion. This improves local responsiveness
+but does not by itself bound the listener queue. See the
 [atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md)
 and [five-minute canary](docs/TTS_RESPONSE_CHUNK_5MIN_CANARY_2026-07-24.md).
+
+To compare the atomic path with schema-v3 incremental publication on one
+SHA-verified source prefix, run from a clean commit:
+
+```bash
+CANARY_DURATION_SECONDS=60 ./run_streaming_tts_canary.sh
+```
+
+The runner leaves the Riva containers unchanged, starts one local FastAPI
+process per arm, requires response-cadence telemetry, and keeps post-NMT TTS
+splitting disabled. It verifies pinned running-image digests, readiness,
+backend flags, source structure, parent order, frame/byte integrity, and
+terminal completion. Raw evidence stays under the ignored
+`experiment_results/` directory.
+
+Magpie can synthesize different audio durations across otherwise matched
+calls. The comparator therefore does not require cross-arm byte equality and
+does not automatically attribute queue or listener-tail differences to
+publication mode. Its primary causal measurement is within the schema-v3 arm:
+how much earlier each parent's first frame was sent than that same parent's
+TTS completion. See the
+[incremental publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md).
 
 Detailed guides:
 
@@ -640,6 +668,7 @@ Detailed guides:
 - [Post-NMT TTS subsegmentation five-minute matched canary](docs/TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md)
 - [Atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md)
 - [Atomic TTS response-cadence five-minute canary](docs/TTS_RESPONSE_CHUNK_5MIN_CANARY_2026-07-24.md)
+- [Default-off incremental TTS publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

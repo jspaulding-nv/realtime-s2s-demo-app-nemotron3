@@ -112,6 +112,12 @@ def _resolved_config() -> StagedPipelineConfig:
         tts_response_chunk_telemetry_enabled=(
             staged_pipeline_config.tts_response_chunk_telemetry_enabled
         ),
+        tts_incremental_publish_enabled=(
+            staged_pipeline_config.tts_incremental_publish_enabled
+        ),
+        tts_incremental_frame_ms=(
+            staged_pipeline_config.tts_incremental_frame_ms
+        ),
         tts_subsegment_max_chars=(
             staged_pipeline_config.tts_subsegment_max_chars
         ),
@@ -172,6 +178,9 @@ async def run(args: argparse.Namespace) -> int:
             capture_response_chunk_metrics=(
                 staged_pipeline_config.tts_response_chunk_telemetry_enabled
             ),
+            incremental_frame_ms=(
+                staged_pipeline_config.tts_incremental_frame_ms
+            ),
         ),
         target_language=args.target_language,
         config=_resolved_config(),
@@ -185,6 +194,7 @@ async def run(args: argparse.Namespace) -> int:
     terminal_at = None
     pcm = bytearray()
     segment_reports = []
+    parent_reason_by_sequence = {}
     failure = None
 
     async def feed_audio() -> None:
@@ -201,13 +211,35 @@ async def run(args: argparse.Namespace) -> int:
             if output.kind is StagedOutputEventKind.COMPLETE:
                 terminal_at = time.monotonic()
                 return
-            synthesized = output.segment
+            if output.kind is StagedOutputEventKind.PARENT_COMPLETE:
+                completion = output.completion
+                source = completion.translation.segment
+                parent_reason_by_sequence[source.sequence_id] = (
+                    source.reason.value
+                )
+                report = completion.to_dict()
+                report["source"] = {
+                    "sequence_id": source.sequence_id,
+                    "reason": source.reason.value,
+                }
+                segment_reports.append(report)
+                continue
+            synthesized = (
+                output.frame
+                if output.kind is StagedOutputEventKind.AUDIO_FRAME
+                else output.segment
+            )
             if first_audio_at is None:
                 first_audio_at = time.monotonic()
             pcm.extend(synthesized.audio)
+            if output.kind is StagedOutputEventKind.AUDIO_FRAME:
+                continue
             segment_reports.append(synthesized.to_dict())
             if not args.quiet:
                 source = synthesized.translation.segment
+                parent_reason_by_sequence[source.sequence_id] = (
+                    source.reason.value
+                )
                 print(
                     f"SEGMENT {source.sequence_id}."
                     f"{synthesized.subsequence_id + 1}/"
@@ -263,12 +295,14 @@ async def run(args: argparse.Namespace) -> int:
         * audio_config.bytes_per_sample
     )
     telemetry = session.telemetry
-    parent_reason_by_sequence = {
-        report["translation"]["segment"]["sequence_id"]: (
-            report["translation"]["segment"]["reason"]
-        )
-        for report in segment_reports
-    }
+    if not parent_reason_by_sequence:
+        parent_reason_by_sequence = {
+            report["translation"]["segment"]["sequence_id"]: (
+                report["translation"]["segment"]["reason"]
+            )
+            for report in segment_reports
+            if "translation" in report
+        }
     segment_reason_counts = {
         reason: sum(
             parent_reason == reason
@@ -304,11 +338,7 @@ async def run(args: argparse.Namespace) -> int:
         ),
     }
     summary = {
-        "schema_version": (
-            2
-            if staged_pipeline_config.tts_subsegment_max_chars > 0
-            else 1
-        ),
+        "schema_version": staged_pipeline_config.telemetry_schema_version,
         "success": failure is None,
         "error": str(failure) if failure is not None else None,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),

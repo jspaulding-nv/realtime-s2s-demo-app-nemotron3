@@ -884,6 +884,40 @@ p95 by 12.0% and tail by 8.1%. Splitting also left first audio effectively
 unchanged at about 15.5 seconds. The feature therefore stays disabled. See
 [Post-NMT TTS subsegmentation: five-minute matched canary](TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md).
 
+## July 24, 2026: default-off incremental TTS publication
+
+The staged pipeline can now publish frame-aligned Magpie PCM while one TTS RPC
+is still active. The feature is disabled unless
+`STAGED_TTS_INCREMENTAL_PUBLISH=1`; the framing default is 100 ms. Incremental
+publication and post-NMT TTS subsegmentation are mutually exclusive for the
+first experiment, so schema-v3 identity is exactly
+`(parent_sequence_id, audio_frame_id)`.
+
+The blocking adapter privately reframes variable Riva responses, commits a
+frame only after bounded output-queue insertion is acknowledged, and returns
+an authoritative parent completion with frame and byte totals. A genuine
+gRPC `UNKNOWN` can retry once only before the first committed frame. After a
+committed prefix, any failure sends that prefix once and then one terminal
+error without replay. Abort wins an acquire/abort race until queue insertion
+has linearized the commit, preventing a reserved terminal from overtaking
+uncommitted PCM.
+
+The pipeline, WebSocket relay, batch gate, smoke tool, and latency analyzer
+now reconcile production, dequeue, server-send, and client-receive frame
+identities and bytes. The schema-v3 analyzer measures the first-frame lead
+against the same parent's TTS completion, avoiding a causal comparison across
+stochastic synthesis runs. `run_streaming_tts_canary.sh` automates a
+provenance-checked atomic/schema-v3 pair, and its comparator marks cross-arm
+queue and tail differences inconclusive whenever generated audio differs
+materially.
+
+The complete Python backend and analysis suite passed 575 tests with one
+optional local-trace test skipped. Python compilation, shell syntax, and
+whitespace checks passed. Frontend tests were not rerun on this VM because its
+Node.js 12 runtime is below the repository's declared Node.js 20.19 minimum;
+the schema-v3 wire contract remains ordinary ordered binary PCM and required
+no frontend source change.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch

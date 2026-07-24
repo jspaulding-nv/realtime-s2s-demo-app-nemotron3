@@ -10,6 +10,7 @@ allowing NMT for segment ``n + 1`` to overlap TTS for segment ``n``.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -17,14 +18,21 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from config import SUPPORTED_LANGUAGES, StagedPipelineConfig, staged_pipeline_config
+from config import (
+    SUPPORTED_LANGUAGES,
+    StagedPipelineConfig,
+    audio_config,
+    staged_pipeline_config,
+)
 from punctuation_segmenter import FillerDiscard, PunctuationSegmenter
 from staged_models import (
     ASRStreamEventKind,
     PipelineEvent,
     StagedOutputEvent,
     StagedOutputEventKind,
+    SynthesizedAudioFrame,
     SynthesizedSegment,
+    SynthesizedStreamCompletion,
     TextSegment,
     TranslatedSegment,
 )
@@ -152,13 +160,65 @@ class _QueuedItem:
 _DRAIN = object()
 
 
+class _FramePublisherAborted(StagedPipelineError):
+    """Raised in the TTS worker when a frame bridge is explicitly aborted."""
+
+
+class _ThreadsafeFramePublisher:
+    """Acknowledge one bounded async enqueue from the blocking TTS thread."""
+
+    def __init__(
+        self,
+        session: "StagedPipelineSession",
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._session = session
+        self._loop = loop
+        self._thread_aborted = threading.Event()
+        self._async_aborted = asyncio.Event()
+        self._lock = threading.Lock()
+        self._pending: Optional[Future] = None
+
+    def publish(self, frame: SynthesizedAudioFrame) -> None:
+        """Return only after ``frame`` is committed to the output queue."""
+        if self._thread_aborted.is_set():
+            raise _FramePublisherAborted("incremental frame publisher aborted")
+        pending = asyncio.run_coroutine_threadsafe(
+            self._session._enqueue_incremental_frame(
+                frame,
+                abort_event=self._async_aborted,
+            ),
+            self._loop,
+        )
+        with self._lock:
+            self._pending = pending
+        try:
+            committed = pending.result()
+        except Exception as exc:
+            raise _FramePublisherAborted(
+                "incremental frame publisher failed"
+            ) from exc
+        finally:
+            with self._lock:
+                if self._pending is pending:
+                    self._pending = None
+        if not committed:
+            raise _FramePublisherAborted("incremental frame publisher aborted")
+
+    def abort(self) -> None:
+        """Wake a worker blocked on output capacity without an ambiguous commit."""
+        self._thread_aborted.set()
+        self._async_aborted.set()
+
+
 class StagedPipelineSession:
     """One bounded, FIFO speech-translation session.
 
     The ASR adapter is asynchronous.  Blocking NMT and TTS calls run on two
     separate single-worker executors, which provides stage overlap without a
-    reorder buffer.  A model result is published only after the full stage
-    succeeds; in particular, partial TTS chunks never reach the output queue.
+    reorder buffer. Schemas 1 and 2 publish TTS atomically. The default-off
+    schema-3 experiment instead commits bounded PCM frames while one TTS RPC
+    remains active.
     """
 
     def __init__(
@@ -182,6 +242,17 @@ class StagedPipelineSession:
         self.tts_client = tts_client
         self.target_language = target_language
         self.config = config or staged_pipeline_config
+        frame_bytes_numerator = (
+            audio_config.sample_rate
+            * audio_config.channels
+            * audio_config.bytes_per_sample
+            * self.config.tts_incremental_frame_ms
+        )
+        if frame_bytes_numerator % 1_000:
+            raise ValueError(
+                "incremental TTS frame duration must produce whole PCM bytes"
+            )
+        self._incremental_frame_bytes = frame_bytes_numerator // 1_000
         self.session_id = session_id or uuid.uuid4().hex
         if not self.session_id.strip():
             raise ValueError("session_id is required")
@@ -213,6 +284,7 @@ class StagedPipelineSession:
             max_workers=1, thread_name_prefix="staged-tts"
         )
         self._blocking_futures: set[Future] = set()
+        self._active_tts_publisher: Optional[_ThreadsafeFramePublisher] = None
         self._tasks: Tuple[asyncio.Task, ...] = ()
         self._asr_stream = None
         self._failure_lock = asyncio.Lock()
@@ -233,12 +305,19 @@ class StagedPipelineSession:
             "output": 0,
         }
         self._audio_segments_produced = 0
+        self._audio_frames_produced = 0
         self._fillers_discarded = 0
         self._emitted_sequence_ids: list[int] = []
         self._planned_subsegment_keys: list[Tuple[int, int, int]] = []
         self._synthesized_subsegment_keys: list[Tuple[int, int, int]] = []
         self._consumed_subsegment_keys: list[Tuple[int, int, int]] = []
         self._consumed_sequence_ids: list[int] = []
+        self._published_audio_frame_keys: list[Tuple[int, int]] = []
+        self._published_audio_frame_bytes: list[int] = []
+        self._dequeued_audio_frame_keys: list[Tuple[int, int]] = []
+        self._dequeued_audio_frame_bytes: list[int] = []
+        self._produced_parent_summaries: list[Dict[str, int]] = []
+        self._completed_parent_summaries: list[Dict[str, int]] = []
         self._parent_translation_char_counts: Dict[int, int] = {}
         self._tts_response_chunk_metrics: list[Dict[str, Any]] = []
         self._tts_response_segments_observed = 0
@@ -249,6 +328,12 @@ class StagedPipelineSession:
         self._expected_output_sequence = 0
         self._expected_output_subsequence = 0
         self._expected_output_subsequence_count: Optional[int] = None
+        self._published_frame_count = 0
+        self._published_frame_bytes = 0
+        self._published_frame_retry_count: Optional[int] = None
+        self._expected_output_frame_id = 0
+        self._expected_output_frame_bytes = 0
+        self._expected_output_frame_retry_count: Optional[int] = None
         self._last_asr_observation_ms: Optional[float] = None
 
     @property
@@ -338,28 +423,102 @@ class StagedPipelineSession:
         output = item.payload
         if not isinstance(output, StagedOutputEvent):
             raise StagedPipelineError("output queue contained an invalid item")
+        if (
+            output.kind is StagedOutputEventKind.COMPLETE
+            and self.config.tts_incremental_publish_enabled
+            and (
+                self._expected_output_frame_id != 0
+                or self._expected_output_frame_bytes != 0
+            )
+        ):
+            raise StagedPipelineError(
+                "pipeline completed with an unfinished incremental parent"
+            )
         if output.kind is StagedOutputEventKind.AUDIO:
             self._queue_slots["output"].release()
             self._advance_output_cursor(output.segment)
             self._consumed_subsegment_keys.append(output.segment.order_key)
             if output.segment.is_final_subsequence:
                 self._consumed_sequence_ids.append(output.segment.sequence_id)
-        segment = output.segment
+        elif output.kind is StagedOutputEventKind.AUDIO_FRAME:
+            self._queue_slots["output"].release()
+            frame = output.frame
+            self._validate_output_frame(frame)
+            self._dequeued_audio_frame_keys.append(frame.frame_key)
+            self._dequeued_audio_frame_bytes.append(len(frame.audio))
+            self._expected_output_frame_id += 1
+            self._expected_output_frame_bytes += len(frame.audio)
+        elif output.kind is StagedOutputEventKind.PARENT_COMPLETE:
+            self._queue_slots["output"].release()
+            completion = output.completion
+            self._validate_output_parent_completion(completion)
+            self._completed_parent_summaries.append(
+                _parent_completion_payload(completion)
+            )
+            self._consumed_sequence_ids.append(completion.sequence_id)
+            self._expected_output_sequence += 1
+            self._expected_output_frame_id = 0
+            self._expected_output_frame_bytes = 0
+            self._expected_output_frame_retry_count = None
+        payload = output.segment or output.frame or output.completion
+        event_name = (
+            "dequeued"
+            if output.kind
+            in {
+                StagedOutputEventKind.AUDIO,
+                StagedOutputEventKind.COMPLETE,
+                StagedOutputEventKind.ERROR,
+            }
+            else (
+                "frame_dequeued"
+                if output.kind is StagedOutputEventKind.AUDIO_FRAME
+                else "parent_complete_dequeued"
+            )
+        )
         self._record(
             stage="output",
-            event="dequeued",
-            segment=segment,
+            event=event_name,
+            segment=payload,
             queue_depth=self._output_queue.qsize(),
             queue_capacity=(
                 self.config.output_queue_maxsize
-                if output.kind is StagedOutputEventKind.AUDIO
+                if output.kind
+                in {
+                    StagedOutputEventKind.AUDIO,
+                    StagedOutputEventKind.AUDIO_FRAME,
+                    StagedOutputEventKind.PARENT_COMPLETE,
+                }
                 else self._output_queue.maxsize
             ),
             queue_residence_ms=max(0.0, self._clock_ms() - item.enqueued_monotonic_ms),
-            audio_bytes=len(segment.audio) if segment is not None else 0,
-            audio_duration_ms=(segment.audio_duration_ms if segment is not None else 0.0),
+            audio_bytes=(
+                len(payload.audio)
+                if isinstance(payload, (SynthesizedSegment, SynthesizedAudioFrame))
+                else (
+                    payload.audio_bytes
+                    if isinstance(payload, SynthesizedStreamCompletion)
+                    else 0
+                )
+            ),
+            audio_duration_ms=(
+                payload.audio_duration_ms if payload is not None else 0.0
+            ),
+            retry_count=(
+                payload.retry_count
+                if isinstance(
+                    payload,
+                    (
+                        SynthesizedAudioFrame,
+                        SynthesizedStreamCompletion,
+                    ),
+                )
+                else 0
+            ),
         )
-        if output.kind is not StagedOutputEventKind.AUDIO:
+        if output.kind in {
+            StagedOutputEventKind.COMPLETE,
+            StagedOutputEventKind.ERROR,
+        }:
             self._terminal_consumed = True
         return output
 
@@ -380,9 +539,7 @@ class StagedPipelineSession:
     def summary(self, *, include_events: bool = False) -> Dict[str, Any]:
         consumed_subsegment_keys = set(self._consumed_subsegment_keys)
         result: Dict[str, Any] = {
-            "telemetry_schema_version": (
-                2 if self.config.tts_subsegment_max_chars > 0 else 1
-            ),
+            "telemetry_schema_version": self.config.telemetry_schema_version,
             "tts_subsegmentation_enabled": (
                 self.config.tts_subsegment_max_chars > 0
             ),
@@ -437,6 +594,37 @@ class StagedPipelineSession:
                     for metric in self._tts_response_chunk_metrics
                 ],
             }
+        if self.config.tts_incremental_publish_enabled:
+            result.update(
+                {
+                    "tts_incremental_publish_enabled": True,
+                    "tts_incremental_frame_ms": (
+                        self.config.tts_incremental_frame_ms
+                    ),
+                    "tts_incremental_frame_bytes": (
+                        self._incremental_frame_bytes
+                    ),
+                    "audio_frames_produced": self._audio_frames_produced,
+                    "published_audio_frame_keys": _frame_key_payloads(
+                        self._published_audio_frame_keys
+                    ),
+                    "published_audio_frame_bytes": list(
+                        self._published_audio_frame_bytes
+                    ),
+                    "dequeued_audio_frame_keys": _frame_key_payloads(
+                        self._dequeued_audio_frame_keys
+                    ),
+                    "dequeued_audio_frame_bytes": list(
+                        self._dequeued_audio_frame_bytes
+                    ),
+                    "produced_parent_summaries": [
+                        dict(item) for item in self._produced_parent_summaries
+                    ],
+                    "completed_parent_summaries": [
+                        dict(item) for item in self._completed_parent_summaries
+                    ],
+                }
+            )
         if self.config.tts_subsegment_max_chars > 0:
             result.update(
                 {
@@ -705,7 +893,9 @@ class StagedPipelineSession:
                     segment,
                     self.target_language,
                     timeout_s=self.config.nmt_rpc_timeout_s,
-                    abort=self.nmt_client.disconnect,
+                    abort=lambda: _disconnect_if_connected(
+                        self.nmt_client
+                    ),
                 )
                 if not isinstance(translation, TranslatedSegment):
                     raise StagedPipelineError("NMT returned an invalid segment type")
@@ -769,6 +959,8 @@ class StagedPipelineSession:
                         self._expected_tts_sequence
                         != self._expected_nmt_sequence
                         or self._expected_tts_subsequence != 0
+                        or self._published_frame_count != 0
+                        or self._published_frame_bytes != 0
                     ):
                         raise StagedPipelineError(
                             "TTS drain arrived before every translated "
@@ -807,6 +999,13 @@ class StagedPipelineSession:
                     ),
                 )
                 timeout_retry_count = 0
+                publisher = None
+                if self.config.tts_incremental_publish_enabled:
+                    publisher = _ThreadsafeFramePublisher(
+                        self,
+                        asyncio.get_running_loop(),
+                    )
+                    self._active_tts_publisher = publisher
 
                 def abort_tts() -> None:
                     nonlocal timeout_retry_count
@@ -818,16 +1017,28 @@ class StagedPipelineSession:
                         and value in {0, 1}
                         else 0
                     )
-                    self.tts_client.disconnect()
+                    if publisher is not None:
+                        publisher.abort()
+                    _disconnect_if_connected(self.tts_client)
 
                 try:
-                    synthesized = await self._call_blocking(
-                        self._tts_executor,
-                        self.tts_client.synthesize,
-                        translation,
-                        timeout_s=self.config.tts_rpc_timeout_s,
-                        abort=abort_tts,
-                    )
+                    if publisher is None:
+                        synthesized = await self._call_blocking(
+                            self._tts_executor,
+                            self.tts_client.synthesize,
+                            translation,
+                            timeout_s=self.config.tts_rpc_timeout_s,
+                            abort=abort_tts,
+                        )
+                    else:
+                        synthesized = await self._call_blocking(
+                            self._tts_executor,
+                            self.tts_client.synthesize_incremental,
+                            translation,
+                            publisher.publish,
+                            timeout_s=self.config.tts_rpc_timeout_s,
+                            abort=abort_tts,
+                        )
                 except asyncio.TimeoutError as exc:
                     raise StagedModelTimeoutError(
                         stage="tts",
@@ -843,9 +1054,17 @@ class StagedPipelineSession:
                     if attributed is exc:
                         raise
                     raise attributed from exc
-                if not isinstance(synthesized, SynthesizedSegment):
+                finally:
+                    if self._active_tts_publisher is publisher:
+                        self._active_tts_publisher = None
+                expected_type = (
+                    SynthesizedStreamCompletion
+                    if self.config.tts_incremental_publish_enabled
+                    else SynthesizedSegment
+                )
+                if not isinstance(synthesized, expected_type):
                     contract_error = StagedPipelineError(
-                        "TTS returned an invalid segment type"
+                        "TTS returned an invalid output type"
                     )
                     _retain_translation_identity(
                         contract_error,
@@ -861,6 +1080,45 @@ class StagedPipelineSession:
                         translation,
                     )
                     raise contract_error
+                if isinstance(synthesized, SynthesizedStreamCompletion):
+                    if (
+                        synthesized.audio_frame_count
+                        != self._published_frame_count
+                        or synthesized.audio_bytes
+                        != self._published_frame_bytes
+                        or self._published_frame_retry_count is None
+                        or synthesized.retry_count
+                        != self._published_frame_retry_count
+                    ):
+                        contract_error = StagedPipelineError(
+                            "incremental TTS completion did not reconcile "
+                            "committed frame totals"
+                        )
+                        _retain_translation_identity(
+                            contract_error,
+                            translation,
+                        )
+                        raise contract_error
+                    current_frame_sizes = self._published_audio_frame_bytes[
+                        -self._published_frame_count :
+                    ]
+                    if (
+                        any(
+                            size != self._incremental_frame_bytes
+                            for size in current_frame_sizes[:-1]
+                        )
+                        or current_frame_sizes[-1]
+                        > self._incremental_frame_bytes
+                    ):
+                        contract_error = StagedPipelineError(
+                            "incremental TTS frame sizes did not reconcile "
+                            "with the configured framing policy"
+                        )
+                        _retain_translation_identity(
+                            contract_error,
+                            translation,
+                        )
+                        raise contract_error
                 if self.config.tts_response_chunk_telemetry_enabled:
                     if not synthesized.response_chunks:
                         contract_error = StagedPipelineError(
@@ -873,7 +1131,6 @@ class StagedPipelineSession:
                         )
                         raise contract_error
                     self._capture_tts_response_chunks(synthesized)
-                self._advance_tts_cursor(translation)
                 self._record(
                     stage="tts",
                     event="first_audio",
@@ -886,7 +1143,11 @@ class StagedPipelineSession:
                     event="completed",
                     segment=synthesized,
                     monotonic_ms=synthesized.completed_monotonic_ms,
-                    audio_bytes=len(synthesized.audio),
+                    audio_bytes=(
+                        len(synthesized.audio)
+                        if isinstance(synthesized, SynthesizedSegment)
+                        else synthesized.audio_bytes
+                    ),
                     audio_duration_ms=synthesized.audio_duration_ms,
                     processing_duration_ms=synthesized.processing_duration_ms,
                     retry_count=synthesized.retry_count,
@@ -894,14 +1155,33 @@ class StagedPipelineSession:
                 self._synthesized_subsegment_keys.append(
                     synthesized.order_key
                 )
-                await self._enqueue(
-                    self._output_queue,
-                    StagedOutputEvent(
-                        kind=StagedOutputEventKind.AUDIO, segment=synthesized
-                    ),
-                    "output",
-                    "enqueued",
-                )
+                if isinstance(synthesized, SynthesizedStreamCompletion):
+                    await self._enqueue(
+                        self._output_queue,
+                        StagedOutputEvent(
+                            kind=StagedOutputEventKind.PARENT_COMPLETE,
+                            completion=synthesized,
+                        ),
+                        "output",
+                        "parent_complete_enqueued",
+                    )
+                    self._produced_parent_summaries.append(
+                        _parent_completion_payload(synthesized)
+                    )
+                    self._published_frame_count = 0
+                    self._published_frame_bytes = 0
+                    self._published_frame_retry_count = None
+                else:
+                    await self._enqueue(
+                        self._output_queue,
+                        StagedOutputEvent(
+                            kind=StagedOutputEventKind.AUDIO,
+                            segment=synthesized,
+                        ),
+                        "output",
+                        "enqueued",
+                    )
+                self._advance_tts_cursor(translation)
                 self._audio_segments_produced += 1
             finally:
                 self._tts_queue.task_done()
@@ -948,7 +1228,7 @@ class StagedPipelineSession:
 
     def _capture_tts_response_chunks(
         self,
-        synthesized: SynthesizedSegment,
+        synthesized: Any,
     ) -> None:
         """Retain timing/size evidence without retaining PCM or text."""
         bytes_per_second = (
@@ -994,6 +1274,245 @@ class StagedPipelineSession:
             )
             previous_received_ms = chunk.received_monotonic_ms
         self._tts_response_segments_observed += 1
+
+    async def _enqueue_incremental_frame(
+        self,
+        frame: SynthesizedAudioFrame,
+        *,
+        abort_event: asyncio.Event,
+    ) -> bool:
+        """Commit one frame or return ``False`` before consuming capacity."""
+        if not self.config.tts_incremental_publish_enabled:
+            raise StagedPipelineError(
+                "incremental frame received while schema 3 is disabled"
+            )
+        if not isinstance(frame, SynthesizedAudioFrame):
+            raise StagedPipelineError(
+                "incremental publisher received an invalid frame type"
+            )
+        self._validate_published_frame(frame)
+        if abort_event.is_set():
+            return False
+
+        slots = self._queue_slots["output"]
+        requested_ms = self._clock_ms()
+        was_full = slots.locked()
+        acquire_task = asyncio.create_task(slots.acquire())
+        abort_task = asyncio.create_task(abort_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {acquire_task, abort_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            acquire_task.cancel()
+            abort_task.cancel()
+            await asyncio.gather(
+                acquire_task,
+                abort_task,
+                return_exceptions=True,
+            )
+            raise
+
+        # Queue insertion, not semaphore acquisition, is the commit boundary.
+        # If abort and capacity become ready in the same event-loop turn, abort
+        # must win so a reserved ERROR can never overtake an uncommitted frame.
+        if abort_event.is_set() or abort_task in done:
+            if not acquire_task.done():
+                acquire_task.cancel()
+            acquire_result = (
+                await asyncio.gather(
+                    acquire_task,
+                    return_exceptions=True,
+                )
+            )[0]
+            if acquire_result is True:
+                slots.release()
+            if not abort_task.done():
+                abort_task.cancel()
+                await asyncio.gather(
+                    abort_task,
+                    return_exceptions=True,
+                )
+            return False
+
+        # From here through put_nowait no await is allowed: callback success is
+        # the commit linearization point.
+        if acquire_task not in done or acquire_task.cancelled():
+            acquire_task.cancel()
+            await asyncio.gather(acquire_task, return_exceptions=True)
+            return False
+        abort_task.cancel()
+        accepted_ms = self._clock_ms()
+        blocked_ms = max(0.0, accepted_ms - requested_ms) if was_full else 0.0
+        output = StagedOutputEvent(
+            kind=StagedOutputEventKind.AUDIO_FRAME,
+            frame=frame,
+        )
+        depth = self._output_queue.qsize() + 1
+        try:
+            self._record(
+                stage="tts",
+                event="frame_received",
+                segment=frame,
+                monotonic_ms=frame.received_monotonic_ms,
+                audio_bytes=len(frame.audio),
+                audio_duration_ms=frame.audio_duration_ms,
+                retry_count=frame.retry_count,
+            )
+            self._record(
+                stage="output",
+                event="frame_enqueued",
+                segment=frame,
+                queue_depth=depth,
+                queue_capacity=self.config.output_queue_maxsize,
+                blocked_put_ms=blocked_ms,
+                audio_bytes=len(frame.audio),
+                audio_duration_ms=frame.audio_duration_ms,
+                retry_count=frame.retry_count,
+            )
+            self._output_queue.put_nowait(_QueuedItem(output, accepted_ms))
+        except Exception:
+            slots.release()
+            raise
+
+        if was_full:
+            self._blocked_put_counts["output"] += 1
+        self._max_queue_depths["output"] = max(
+            self._max_queue_depths["output"],
+            depth,
+        )
+        self._published_audio_frame_keys.append(frame.frame_key)
+        self._published_audio_frame_bytes.append(len(frame.audio))
+        self._published_frame_count += 1
+        self._published_frame_bytes += len(frame.audio)
+        if self._published_frame_retry_count is None:
+            self._published_frame_retry_count = frame.retry_count
+        self._audio_frames_produced += 1
+        return True
+
+    def _validate_published_frame(self, frame: SynthesizedAudioFrame) -> None:
+        if frame.parent_sequence_id != self._expected_tts_sequence:
+            raise StagedPipelineError(
+                "incremental TTS frame parent mismatch: expected "
+                f"{self._expected_tts_sequence}, received "
+                f"{frame.parent_sequence_id}"
+            )
+        if frame.audio_frame_id != self._published_frame_count:
+            raise StagedPipelineError(
+                "incremental TTS frame identity mismatch: expected "
+                f"{self._published_frame_count}, received "
+                f"{frame.audio_frame_id}"
+            )
+        if (
+            frame.sample_rate_hz != audio_config.sample_rate
+            or frame.channels != audio_config.channels
+            or frame.bytes_per_sample != audio_config.bytes_per_sample
+        ):
+            raise StagedPipelineError(
+                "incremental TTS frame audio format changed"
+            )
+        if len(frame.audio) > self._incremental_frame_bytes:
+            raise StagedPipelineError(
+                "incremental TTS frame exceeded configured frame bytes"
+            )
+        if (
+            self._published_frame_count > 0
+            and self._published_audio_frame_bytes[-1]
+            < self._incremental_frame_bytes
+        ):
+            raise StagedPipelineError(
+                "incremental TTS published audio after a short final frame"
+            )
+        if (
+            self._published_frame_retry_count is not None
+            and frame.retry_count != self._published_frame_retry_count
+        ):
+            raise StagedPipelineError(
+                "incremental TTS retry count changed within a parent"
+            )
+
+    def _validate_output_frame(self, frame: SynthesizedAudioFrame) -> None:
+        if not isinstance(frame, SynthesizedAudioFrame):
+            raise StagedPipelineError(
+                "output queue contained an invalid incremental frame"
+            )
+        if frame.parent_sequence_id != self._expected_output_sequence:
+            raise StagedPipelineError(
+                "output frame parent mismatch: expected "
+                f"{self._expected_output_sequence}, received "
+                f"{frame.parent_sequence_id}"
+            )
+        if frame.audio_frame_id != self._expected_output_frame_id:
+            raise StagedPipelineError(
+                "output frame identity mismatch: expected "
+                f"{self._expected_output_frame_id}, received "
+                f"{frame.audio_frame_id}"
+            )
+        if (
+            frame.sample_rate_hz != audio_config.sample_rate
+            or frame.channels != audio_config.channels
+            or frame.bytes_per_sample != audio_config.bytes_per_sample
+        ):
+            raise StagedPipelineError("output frame audio format changed")
+        if len(frame.audio) > self._incremental_frame_bytes:
+            raise StagedPipelineError(
+                "output frame exceeded configured frame bytes"
+            )
+        if (
+            self._expected_output_frame_id > 0
+            and self._dequeued_audio_frame_bytes[-1]
+            < self._incremental_frame_bytes
+        ):
+            raise StagedPipelineError(
+                "output audio followed a short final frame"
+            )
+        if (
+            self._expected_output_frame_retry_count is not None
+            and frame.retry_count != self._expected_output_frame_retry_count
+        ):
+            raise StagedPipelineError(
+                "output frame retry count changed within a parent"
+            )
+        if self._expected_output_frame_retry_count is None:
+            self._expected_output_frame_retry_count = frame.retry_count
+
+    def _validate_output_parent_completion(
+        self,
+        completion: SynthesizedStreamCompletion,
+    ) -> None:
+        if not isinstance(completion, SynthesizedStreamCompletion):
+            raise StagedPipelineError(
+                "output queue contained an invalid parent completion"
+            )
+        if completion.parent_sequence_id != self._expected_output_sequence:
+            raise StagedPipelineError(
+                "output parent completion sequence mismatch"
+            )
+        if completion.audio_frame_count != self._expected_output_frame_id:
+            raise StagedPipelineError(
+                "output parent completion frame count mismatch"
+            )
+        if completion.audio_bytes != self._expected_output_frame_bytes:
+            raise StagedPipelineError(
+                "output parent completion byte count mismatch"
+            )
+        if (
+            completion.sample_rate_hz != audio_config.sample_rate
+            or completion.channels != audio_config.channels
+            or completion.bytes_per_sample != audio_config.bytes_per_sample
+        ):
+            raise StagedPipelineError(
+                "output parent completion audio format changed"
+            )
+        if (
+            self._expected_output_frame_retry_count is None
+            or completion.retry_count
+            != self._expected_output_frame_retry_count
+        ):
+            raise StagedPipelineError(
+                "output parent completion retry count mismatch"
+            )
 
     def _validate_tts_cursor(self, translation: TranslatedSegment) -> None:
         if not isinstance(translation, TranslatedSegment):
@@ -1094,6 +1613,7 @@ class StagedPipelineSession:
                 await asyncio.sleep(0.01)
             return future.result()
         except asyncio.CancelledError:
+            abort()
             future.cancel()
             raise
         finally:
@@ -1112,7 +1632,11 @@ class StagedPipelineSession:
         is_reserved_terminal = (
             queue_name == "output"
             and isinstance(payload, StagedOutputEvent)
-            and payload.kind is not StagedOutputEventKind.AUDIO
+            and payload.kind
+            in {
+                StagedOutputEventKind.COMPLETE,
+                StagedOutputEventKind.ERROR,
+            }
         )
         was_full = slots.locked() if not is_reserved_terminal else False
         if not is_reserved_terminal:
@@ -1127,11 +1651,23 @@ class StagedPipelineSession:
             self._max_queue_depths[queue_name] = max(
                 self._max_queue_depths[queue_name], depth
             )
-        audio = payload.segment if isinstance(payload, StagedOutputEvent) else None
+        output_payload = (
+            payload.segment or payload.frame or payload.completion
+            if isinstance(payload, StagedOutputEvent)
+            else None
+        )
+        audio = (
+            output_payload
+            if isinstance(
+                output_payload,
+                (SynthesizedSegment, SynthesizedAudioFrame),
+            )
+            else None
+        )
         self._record(
             stage=queue_name,
             event=event,
-            segment=payload,
+            segment=output_payload if output_payload is not None else payload,
             queue_depth=depth,
             queue_capacity=(
                 self.config.output_queue_maxsize
@@ -1140,8 +1676,34 @@ class StagedPipelineSession:
             ),
             blocked_put_ms=blocked_ms,
             text_chars=_text_chars(payload),
-            audio_bytes=len(audio.audio) if audio is not None else 0,
-            audio_duration_ms=audio.audio_duration_ms if audio is not None else 0.0,
+            audio_bytes=(
+                len(audio.audio)
+                if audio is not None
+                else (
+                    output_payload.audio_bytes
+                    if isinstance(
+                        output_payload,
+                        SynthesizedStreamCompletion,
+                    )
+                    else 0
+                )
+            ),
+            audio_duration_ms=(
+                output_payload.audio_duration_ms
+                if output_payload is not None
+                else 0.0
+            ),
+            retry_count=(
+                output_payload.retry_count
+                if isinstance(
+                    output_payload,
+                    (
+                        SynthesizedAudioFrame,
+                        SynthesizedStreamCompletion,
+                    ),
+                )
+                else 0
+            ),
         )
 
     async def _emit_terminal(self, output: StagedOutputEvent) -> None:
@@ -1239,6 +1801,9 @@ class StagedPipelineSession:
             await asyncio.sleep(0.01)
 
     def _disconnect_model_clients(self) -> None:
+        publisher = self._active_tts_publisher
+        if publisher is not None:
+            publisher.abort()
         for stage, client in (
             ("nmt", self.nmt_client),
             ("tts", self.tts_client),
@@ -1302,6 +1867,16 @@ class StagedPipelineSession:
             if self.config.tts_subsegment_max_chars > 0
             else None
         )
+        audio_frame_id = (
+            segment.audio_frame_id
+            if isinstance(segment, SynthesizedAudioFrame)
+            else None
+        )
+        audio_frame_count = (
+            segment.audio_frame_count
+            if isinstance(segment, SynthesizedStreamCompletion)
+            else None
+        )
         record = PipelineEvent(
             session_id=self.session_id,
             stage=stage,
@@ -1336,6 +1911,8 @@ class StagedPipelineSession:
             parent_text_chars=parent_text_chars,
             audio_bytes=audio_bytes,
             audio_duration_ms=audio_duration_ms,
+            audio_frame_id=audio_frame_id,
+            audio_frame_count=audio_frame_count,
             retry_count=retry_count,
             error_code=error_code,
         )
@@ -1350,6 +1927,12 @@ def _is_connected(client: Any) -> bool:
     return bool(check()) if callable(check) else False
 
 
+def _disconnect_if_connected(client: Any) -> None:
+    """Disconnect once when concurrent cancellation paths converge."""
+    if _is_connected(client):
+        client.disconnect()
+
+
 def _source_segment(value: Any) -> Optional[TextSegment]:
     if isinstance(value, TextSegment):
         return value
@@ -1357,8 +1940,12 @@ def _source_segment(value: Any) -> Optional[TextSegment]:
         return value.segment
     if isinstance(value, SynthesizedSegment):
         return value.translation.segment
-    if isinstance(value, StagedOutputEvent) and value.segment is not None:
-        return value.segment.translation.segment
+    if isinstance(value, (SynthesizedAudioFrame, SynthesizedStreamCompletion)):
+        return value.translation.segment
+    if isinstance(value, StagedOutputEvent):
+        payload = value.segment or value.frame or value.completion
+        if payload is not None:
+            return payload.translation.segment
     return None
 
 
@@ -1399,6 +1986,29 @@ def _subsequence_key_payloads(
     ]
 
 
+def _frame_key_payloads(
+    keys: list[Tuple[int, int]],
+) -> list[Dict[str, int]]:
+    return [
+        {
+            "parent_sequence_id": parent_sequence_id,
+            "audio_frame_id": audio_frame_id,
+        }
+        for parent_sequence_id, audio_frame_id in keys
+    ]
+
+
+def _parent_completion_payload(
+    completion: SynthesizedStreamCompletion,
+) -> Dict[str, int]:
+    return {
+        "parent_sequence_id": completion.parent_sequence_id,
+        "audio_frame_count": completion.audio_frame_count,
+        "audio_bytes": completion.audio_bytes,
+        "retry_count": completion.retry_count,
+    }
+
+
 def _retain_translation_identity(
     exc: Exception,
     translation: TranslatedSegment,
@@ -1426,6 +2036,10 @@ def _text_chars(value: Any) -> int:
         return len(value.text)
     if isinstance(value, SynthesizedSegment):
         return len(value.translation.text)
-    if isinstance(value, StagedOutputEvent) and value.segment is not None:
-        return len(value.segment.translation.text)
+    if isinstance(value, (SynthesizedAudioFrame, SynthesizedStreamCompletion)):
+        return len(value.translation.text)
+    if isinstance(value, StagedOutputEvent):
+        payload = value.segment or value.frame or value.completion
+        if payload is not None:
+            return len(payload.translation.text)
     return 0
