@@ -194,6 +194,7 @@ class DirectTTSClient:
         max_retries: int = 0,
         capture_response_chunk_metrics: bool = False,
         incremental_frame_ms: int = 100,
+        incremental_atomic_fallback_max_chars: int = 4,
         language_configs: Optional[Dict[str, dict]] = None,
         clock_ms: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -261,6 +262,18 @@ class DirectTTSClient:
         ):
             raise ValueError("incremental_frame_ms must be a positive integer")
         self.incremental_frame_ms = incremental_frame_ms
+        if (
+            not isinstance(incremental_atomic_fallback_max_chars, int)
+            or isinstance(incremental_atomic_fallback_max_chars, bool)
+            or incremental_atomic_fallback_max_chars < 0
+        ):
+            raise ValueError(
+                "incremental_atomic_fallback_max_chars must be a "
+                "non-negative integer"
+            )
+        self.incremental_atomic_fallback_max_chars = (
+            incremental_atomic_fallback_max_chars
+        )
         self.max_audio_bytes = int(
             self.sample_rate_hz
             * self.channels
@@ -397,6 +410,10 @@ class DirectTTSClient:
             exc.subsequence_count = translation.subsequence_count
             raise
         voice_name = self._voice_for_language(translation.language)
+        atomic_fallback_applied = (
+            self.incremental_atomic_fallback_max_chars > 0
+            and len(text) <= self.incremental_atomic_fallback_max_chars
+        )
 
         with self._lifecycle_lock:
             if self._closing:
@@ -446,6 +463,21 @@ class DirectTTSClient:
                 if overall_started_ms is None:
                     overall_started_ms = attempt_started_ms
                 try:
+                    if atomic_fallback_applied:
+                        buffered = self._synthesize_once(
+                            service=service,
+                            translation=translation,
+                            text=text,
+                            voice_name=voice_name,
+                            overall_started_ms=overall_started_ms,
+                            retry_count=retry_count,
+                        )
+                        return self._publish_atomic_incremental_fallback(
+                            synthesized=buffered,
+                            incremental_frame_bytes=incremental_frame_bytes,
+                            publish_frame=publish_frame,
+                            commit_state=commit_state,
+                        )
                     return self._synthesize_incremental_once(
                         service=service,
                         translation=translation,
@@ -743,6 +775,55 @@ class DirectTTSClient:
             with self._lifecycle_lock:
                 if self._active_call is call:
                     self._active_call = None
+
+    def _publish_atomic_incremental_fallback(
+        self,
+        *,
+        synthesized: SynthesizedSegment,
+        incremental_frame_bytes: int,
+        publish_frame: Callable[[SynthesizedAudioFrame], None],
+        commit_state: _IncrementalCommitState,
+    ) -> SynthesizedStreamCompletion:
+        """Reframe one complete private attempt through schema-3 callbacks."""
+        for offset in range(0, len(synthesized.audio), incremental_frame_bytes):
+            self._publish_incremental_frame(
+                translation=synthesized.translation,
+                audio=synthesized.audio[
+                    offset : offset + incremental_frame_bytes
+                ],
+                # Atomic fallback PCM becomes publishable only after clean
+                # iterator exhaustion, never at the original response times.
+                received_monotonic_ms=synthesized.completed_monotonic_ms,
+                retry_count=synthesized.retry_count,
+                publish_frame=publish_frame,
+                commit_state=commit_state,
+            )
+        try:
+            return SynthesizedStreamCompletion(
+                translation=synthesized.translation,
+                audio_frame_count=commit_state.frame_count,
+                audio_bytes=commit_state.audio_bytes,
+                sample_rate_hz=synthesized.sample_rate_hz,
+                channels=synthesized.channels,
+                bytes_per_sample=synthesized.bytes_per_sample,
+                started_monotonic_ms=synthesized.started_monotonic_ms,
+                first_audio_monotonic_ms=synthesized.first_audio_monotonic_ms,
+                # This is the authoritative atomic RPC completion boundary.
+                # Frame publication starts at or after this timestamp.
+                completed_monotonic_ms=synthesized.completed_monotonic_ms,
+                retry_count=synthesized.retry_count,
+                atomic_fallback_applied=True,
+                response_chunks=synthesized.response_chunks,
+            )
+        except DirectTTSError:
+            raise
+        except Exception as exc:
+            raise DirectTTSError(
+                "Direct TTS atomic fallback publication failed for segment "
+                f"{_translation_label(synthesized.translation)}: "
+                f"{type(exc).__name__}",
+                translation=synthesized.translation,
+            ) from exc
 
     def _synthesize_incremental_once(
         self,

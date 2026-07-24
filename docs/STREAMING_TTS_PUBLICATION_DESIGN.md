@@ -12,6 +12,7 @@ The experiment is disabled by default:
 ```dotenv
 STAGED_TTS_INCREMENTAL_PUBLISH=0
 STAGED_TTS_INCREMENTAL_FRAME_MS=100
+STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS=4
 ```
 
 When disabled, telemetry schemas 1 and 2, atomic TTS retry behavior, and the
@@ -68,6 +69,29 @@ After a committed prefix, the system preserves and sends that prefix once,
 then emits one terminal error. It never retries or replays already committed
 audio.
 
+### Tiny-target atomic fallback
+
+Magpie has an observed intermittent failure on a validated two-character
+target. Atomic synthesis safely recovered that exact shape because failed
+attempt PCM remained private, but true incremental publication had already
+committed two frames when the same failure recurred in the first clean
+schema-3 canary. Retrying at that point would risk replaying stochastic audio.
+
+Schema 3 therefore uses a narrow, configurable reliability envelope. A target
+of at most four characters after the existing normalization and validation
+step is synthesized atomically. A genuine `UNKNOWN` can be retried once while
+all PCM remains private. Only a complete successful attempt is then reframed
+into the ordinary configured frame size and published through the same
+acknowledged callback. The value four covers the proven two-character shape
+and similarly tiny outputs such as short affirmations; the extra atomic hold is
+limited to tiny utterances. Set the threshold to zero to disable this fallback.
+
+Fallback frames remain ordinary schema-3 frames. Their parent summary carries
+`atomic_fallback_applied=true`, and publication timestamps must not precede the
+parent's TTS completion. Direct first-frame lead measurements exclude fallback
+parents because they intentionally do not publish from an active RPC. Audience
+queue and end-to-end measurements continue to include every parent.
+
 ## Bounded thread-to-async bridge
 
 The Riva iterator remains synchronous in the dedicated TTS executor thread.
@@ -96,6 +120,9 @@ A successful schema-3 capture must prove:
   client receive;
 - per-frame send/receive byte equality;
 - per-parent frame counts and byte sums equal `tts/completed`;
+- fallback identity agrees at production, dequeue, WebSocket completion, and
+  the session-level fallback parent list;
+- fallback frames are published only after successful TTS completion;
 - exactly one `PARENT_COMPLETE` after all frames for each parent;
 - completed parent IDs equal WebSocket-completed parent IDs;
 - no PCM after the single terminal event;

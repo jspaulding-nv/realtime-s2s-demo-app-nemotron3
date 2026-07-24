@@ -377,7 +377,7 @@ def _parent_summaries(
     *,
     field_name: str,
     errors: list[str],
-) -> list[dict[str, int]] | None:
+) -> list[dict[str, int | bool]] | None:
     if not isinstance(value, list):
         errors.append(f"{field_name} must be a list")
         return None
@@ -392,6 +392,10 @@ def _parent_summaries(
         frame_count = item.get("audio_frame_count")
         audio_bytes = item.get("audio_bytes")
         retry_count = item.get("retry_count")
+        atomic_fallback_applied = item.get(
+            "atomic_fallback_applied",
+            False,
+        )
         if (
             not isinstance(parent, int)
             or isinstance(parent, bool)
@@ -424,12 +428,20 @@ def _parent_summaries(
             )
             valid = False
             continue
+        if not isinstance(atomic_fallback_applied, bool):
+            errors.append(
+                f"{field_name}[{index}].atomic_fallback_applied must be "
+                "a boolean"
+            )
+            valid = False
+            continue
         resolved.append(
             {
                 "parent_sequence_id": parent,
                 "audio_frame_count": frame_count,
                 "audio_bytes": audio_bytes,
                 "retry_count": retry_count,
+                "atomic_fallback_applied": atomic_fallback_applied,
             }
         )
     return resolved if valid else None
@@ -1068,6 +1080,7 @@ def _validate_staged_pipeline_integrity_v3(
     errors: list[str],
 ) -> list[str]:
     """Validate ordered frame publication and parent-completion barriers."""
+    configured_fallback_max_chars = 0
     if staged_pipeline.get("state") != "closed":
         errors.append(
             "staged state must be 'closed' "
@@ -1121,6 +1134,74 @@ def _validate_staged_pipeline_integrity_v3(
             errors.append(
                 "schema-v3 config requires ttsSubsegmentMaxChars=0"
             )
+        configured_fallback_max_chars = staged_config.get(
+            "ttsIncrementalAtomicFallbackMaxChars",
+            0,
+        )
+        if (
+            not isinstance(configured_fallback_max_chars, int)
+            or isinstance(configured_fallback_max_chars, bool)
+            or configured_fallback_max_chars < 0
+        ):
+            errors.append(
+                "/api/config.stagedConfig."
+                "ttsIncrementalAtomicFallbackMaxChars must be a "
+                "non-negative integer"
+            )
+            configured_fallback_max_chars = 0
+
+    fallback_max_chars = staged_pipeline.get(
+        "tts_incremental_atomic_fallback_max_chars",
+        0,
+    )
+    if (
+        not isinstance(fallback_max_chars, int)
+        or isinstance(fallback_max_chars, bool)
+        or fallback_max_chars < 0
+    ):
+        errors.append(
+            "tts_incremental_atomic_fallback_max_chars must be a "
+            "non-negative integer"
+        )
+        fallback_max_chars = 0
+    elif fallback_max_chars != configured_fallback_max_chars:
+        errors.append(
+            "staged tts_incremental_atomic_fallback_max_chars must match "
+            "/api/config.stagedConfig."
+            "ttsIncrementalAtomicFallbackMaxChars"
+        )
+    fallback_parent_count = staged_pipeline.get(
+        "tts_incremental_atomic_fallback_parent_count",
+        0,
+    )
+    if (
+        not isinstance(fallback_parent_count, int)
+        or isinstance(fallback_parent_count, bool)
+        or fallback_parent_count < 0
+    ):
+        errors.append(
+            "tts_incremental_atomic_fallback_parent_count must be a "
+            "non-negative integer"
+        )
+        fallback_parent_count = 0
+    fallback_parent_ids = _sequence_ids(
+        staged_pipeline.get(
+            "tts_incremental_atomic_fallback_parent_sequence_ids",
+            [],
+        ),
+        field_name=(
+            "tts_incremental_atomic_fallback_parent_sequence_ids"
+        ),
+        errors=errors,
+    )
+    if (
+        fallback_parent_ids is not None
+        and fallback_parent_count != len(fallback_parent_ids)
+    ):
+        errors.append(
+            "tts_incremental_atomic_fallback_parent_count must equal "
+            "the fallback parent sequence ID count"
+        )
 
     received_pcm_bytes: list[int] = []
     if not isinstance(websocket_receive_events, list):
@@ -1228,6 +1309,20 @@ def _validate_staged_pipeline_integrity_v3(
             errors.append(
                 "completed_sequence_ids must be contiguous and ordered from zero "
                 f"(got {completed})"
+            )
+        if (
+            fallback_parent_ids is not None
+            and (
+                fallback_parent_ids != sorted(set(fallback_parent_ids))
+                or any(
+                    parent_id not in completed
+                    for parent_id in fallback_parent_ids
+                )
+            )
+        ):
+            errors.append(
+                "tts_incremental_atomic_fallback_parent_sequence_ids "
+                "must be unique, ordered, and completed"
             )
     if (
         completed is not None
@@ -1355,6 +1450,19 @@ def _validate_staged_pipeline_integrity_v3(
                 "parent completion summaries must exactly match "
                 "completed_sequence_ids"
             )
+        flagged_parent_ids = [
+            item["parent_sequence_id"]
+            for item in canonical_parents
+            if item["atomic_fallback_applied"]
+        ]
+        if (
+            fallback_parent_ids is not None
+            and flagged_parent_ids != fallback_parent_ids
+        ):
+            errors.append(
+                "parent atomic_fallback_applied flags must exactly match "
+                "tts_incremental_atomic_fallback_parent_sequence_ids"
+            )
 
     if (
         canonical_keys is not None
@@ -1385,6 +1493,7 @@ def _validate_staged_pipeline_integrity_v3(
     websocket_events = staged_pipeline.get("websocket_send_events")
     websocket_event_keys: list[tuple[int, int]] | None = []
     websocket_event_bytes: list[int] = []
+    websocket_event_times: list[float] = []
     if not isinstance(websocket_events, list):
         errors.append("websocket_send_events must be a list")
         websocket_event_keys = None
@@ -1428,6 +1537,8 @@ def _validate_staged_pipeline_integrity_v3(
                     f"websocket_send_events[{index}].sent_monotonic_ms is invalid"
                 )
                 valid = False
+            else:
+                websocket_event_times.append(float(sent_ms))
         if not valid:
             websocket_event_keys = None
     if (
@@ -1470,6 +1581,16 @@ def _validate_staged_pipeline_integrity_v3(
         ("output", "frame_enqueued"): ([], []),
         ("output", "frame_dequeued"): ([], []),
     }
+    frame_event_times = {
+        event_name: [] for event_name in frame_event_records
+    }
+    fallback_parent_event_records = {
+        ("tts", "completed"): [],
+        ("output", "parent_complete_enqueued"): [],
+        ("output", "parent_complete_dequeued"): [],
+    }
+    tts_completion_times: dict[int, float] = {}
+    tts_started_text_chars: dict[int, int] = {}
     nmt_retry_total = 0
     tts_retry_total = 0
     for index, event in enumerate(events):
@@ -1478,6 +1599,24 @@ def _validate_staged_pipeline_integrity_v3(
             continue
         event_name = (event.get("stage"), event.get("event"))
         sequence_id = event.get("sequence_id")
+        if (
+            event_name == ("tts", "started")
+            and fallback_max_chars > 0
+        ):
+            text_chars = event.get("text_chars")
+            if (
+                not isinstance(sequence_id, int)
+                or isinstance(sequence_id, bool)
+                or sequence_id < 0
+                or not _positive_int(text_chars)
+                or sequence_id in tts_started_text_chars
+            ):
+                errors.append(
+                    f"events[{index}] fallback policy requires one valid "
+                    "tts/started text_chars record per parent"
+                )
+            else:
+                tts_started_text_chars[sequence_id] = text_chars
         if event_name in parent_event_sequences:
             if (
                 not isinstance(sequence_id, int)
@@ -1487,6 +1626,37 @@ def _validate_staged_pipeline_integrity_v3(
                 errors.append(f"events[{index}].sequence_id is invalid")
             else:
                 parent_event_sequences[event_name].append(sequence_id)
+                if event_name in fallback_parent_event_records:
+                    fallback_applied = event.get(
+                        "atomic_fallback_applied",
+                        False,
+                    )
+                    if not isinstance(fallback_applied, bool):
+                        errors.append(
+                            f"events[{index}].atomic_fallback_applied "
+                            "must be a boolean"
+                        )
+                    else:
+                        fallback_parent_event_records[event_name].append(
+                            (sequence_id, fallback_applied)
+                        )
+                    if event_name == ("tts", "completed"):
+                        completed_ms = event.get("monotonic_ms")
+                        if (
+                            not isinstance(completed_ms, (int, float))
+                            or isinstance(completed_ms, bool)
+                            or not math.isfinite(completed_ms)
+                            or completed_ms < 0
+                        ):
+                            if fallback_applied is True:
+                                errors.append(
+                                    f"events[{index}].monotonic_ms must be "
+                                    "non-negative and finite for atomic fallback"
+                                )
+                        else:
+                            tts_completion_times[sequence_id] = float(
+                                completed_ms
+                            )
         if event_name in frame_event_records:
             key = _audio_frame_key(
                 event,
@@ -1501,6 +1671,16 @@ def _validate_staged_pipeline_integrity_v3(
                 errors.append(f"events[{index}].audio_bytes is invalid")
             else:
                 frame_event_records[event_name][1].append(audio_bytes)
+            frame_ms = event.get("monotonic_ms")
+            if (
+                not isinstance(frame_ms, (int, float))
+                or isinstance(frame_ms, bool)
+                or not math.isfinite(frame_ms)
+                or frame_ms < 0
+            ):
+                frame_event_times[event_name].append(None)
+            else:
+                frame_event_times[event_name].append(float(frame_ms))
         if event_name in {
             ("nmt", "completed"),
             ("nmt", "error"),
@@ -1558,6 +1738,73 @@ def _validate_staged_pipeline_integrity_v3(
                     f"{stage}/{event_name} frame bytes must exactly match "
                     "published_audio_frame_bytes"
                 )
+    if canonical_parents is not None:
+        expected_fallback_records = [
+            (
+                item["parent_sequence_id"],
+                item["atomic_fallback_applied"],
+            )
+            for item in canonical_parents
+        ]
+        for (stage, event_name), records in (
+            fallback_parent_event_records.items()
+        ):
+            if records != expected_fallback_records:
+                errors.append(
+                    f"{stage}/{event_name} atomic fallback flags must "
+                    "match parent completion summaries"
+                )
+    fallback_parent_id_set = set(fallback_parent_ids or [])
+    if fallback_max_chars > 0 and completed is not None:
+        if sorted(tts_started_text_chars) != completed:
+            errors.append(
+                "atomic fallback policy requires tts/started text_chars "
+                "for every completed parent"
+            )
+        else:
+            policy_fallback_ids = [
+                parent_id
+                for parent_id in completed
+                if tts_started_text_chars[parent_id]
+                <= fallback_max_chars
+            ]
+            if policy_fallback_ids != (fallback_parent_ids or []):
+                errors.append(
+                    "atomic fallback parent IDs must exactly match the "
+                    "configured tts/started text_chars threshold"
+                )
+    if (
+        fallback_parent_id_set
+        and canonical_keys is not None
+        and websocket_event_keys == canonical_keys
+        and len(websocket_event_times) == len(canonical_keys)
+    ):
+        for index, (parent_id, _frame_id) in enumerate(canonical_keys):
+            if parent_id not in fallback_parent_id_set:
+                continue
+            completed_ms = tts_completion_times.get(parent_id)
+            if completed_ms is None:
+                continue
+            if websocket_event_times[index] < completed_ms:
+                errors.append(
+                    f"atomic fallback parent {parent_id} WebSocket frame "
+                    "was published before TTS completion"
+                )
+            for (stage, event_name), times in frame_event_times.items():
+                if len(times) != len(canonical_keys):
+                    continue
+                frame_ms = times[index]
+                if frame_ms is None:
+                    errors.append(
+                        f"{stage}/{event_name} fallback frame timestamp "
+                        "must be non-negative and finite"
+                    )
+                elif frame_ms < completed_ms:
+                    errors.append(
+                        f"atomic fallback parent {parent_id} "
+                        f"{stage}/{event_name} frame was published before "
+                        "TTS completion"
+                    )
 
     for summary_name, event_total in (
         ("nmt_retry_count", nmt_retry_total),

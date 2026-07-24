@@ -108,6 +108,15 @@ class StagedPipelineConfig:
     tts_incremental_frame_ms: int = int(
         os.getenv("STAGED_TTS_INCREMENTAL_FRAME_MS", "100")
     )
+    # Tiny validated targets retain atomic retry safety even under schema 3,
+    # then publish the successful private PCM through normal output frames.
+    # Zero disables this narrowly bounded fallback.
+    tts_incremental_atomic_fallback_max_chars: int = int(
+        os.getenv(
+            "STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS",
+            "4",
+        )
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipeline_mode, str):
@@ -149,6 +158,21 @@ class StagedPipelineConfig:
         ):
             raise ValueError(
                 "tts_incremental_frame_ms must be a positive integer"
+            )
+        if (
+            not isinstance(
+                self.tts_incremental_atomic_fallback_max_chars,
+                int,
+            )
+            or isinstance(
+                self.tts_incremental_atomic_fallback_max_chars,
+                bool,
+            )
+            or self.tts_incremental_atomic_fallback_max_chars < 0
+        ):
+            raise ValueError(
+                "tts_incremental_atomic_fallback_max_chars must be a "
+                "non-negative integer"
             )
         if (
             not isinstance(self.tts_subsegment_max_chars, int)

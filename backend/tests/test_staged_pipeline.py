@@ -1633,12 +1633,14 @@ class IncrementalFakeTTS(FakeTTSClient):
         fail_after_frames=None,
         completion_frame_delta=0,
         completion_byte_delta=0,
+        atomic_fallback_applied=False,
     ):
         super().__init__()
         self.frame_sizes = tuple(frame_sizes)
         self.fail_after_frames = fail_after_frames
         self.completion_frame_delta = completion_frame_delta
         self.completion_byte_delta = completion_byte_delta
+        self.atomic_fallback_applied = atomic_fallback_applied
         self.publish_attempted = [
             threading.Event() for _ in self.frame_sizes
         ]
@@ -1655,9 +1657,16 @@ class IncrementalFakeTTS(FakeTTSClient):
         started_ms = now_ms()
         first_audio_ms = None
         committed_bytes = 0
+        atomic_completed_ms = (
+            now_ms() if self.atomic_fallback_applied else None
+        )
 
         for audio_frame_id, audio_bytes in enumerate(self.frame_sizes):
-            received_ms = now_ms()
+            received_ms = (
+                atomic_completed_ms
+                if atomic_completed_ms is not None
+                else now_ms()
+            )
             if first_audio_ms is None:
                 first_audio_ms = received_ms
             audio = bytes(
@@ -1681,7 +1690,11 @@ class IncrementalFakeTTS(FakeTTSClient):
                     "synthetic incremental failure after committed audio"
                 )
 
-        completed_ms = now_ms()
+        completed_ms = (
+            atomic_completed_ms
+            if atomic_completed_ms is not None
+            else now_ms()
+        )
         self.sequences.append(translation.sequence_id)
         self.ends[translation.sequence_id] = time.monotonic()
         return SynthesizedStreamCompletion(
@@ -1696,6 +1709,21 @@ class IncrementalFakeTTS(FakeTTSClient):
             started_monotonic_ms=started_ms,
             first_audio_monotonic_ms=first_audio_ms,
             completed_monotonic_ms=completed_ms,
+            atomic_fallback_applied=self.atomic_fallback_applied,
+        )
+
+
+class FixedTranslationNMT(FakeNMTClient):
+    """Return one deterministic target while preserving source attribution."""
+
+    def __init__(self, target_text):
+        super().__init__()
+        self.target_text = target_text
+
+    def translate_segment(self, segment, target_language):
+        return replace(
+            super().translate_segment(segment, target_language),
+            text=self.target_text,
         )
 
 
@@ -1757,6 +1785,7 @@ def streaming_completion(
     *,
     audio_frame_count=1,
     audio_bytes=1_600,
+    atomic_fallback_applied=False,
 ):
     captured_ms = now_ms()
     return SynthesizedStreamCompletion(
@@ -1769,6 +1798,7 @@ def streaming_completion(
         started_monotonic_ms=captured_ms,
         first_audio_monotonic_ms=captured_ms,
         completed_monotonic_ms=captured_ms,
+        atomic_fallback_applied=atomic_fallback_applied,
     )
 
 
@@ -1812,6 +1842,12 @@ async def test_incremental_clean_order_is_frames_parent_marker_then_complete():
     ]
     assert summary["telemetry_schema_version"] == 3
     assert summary["tts_incremental_publish_enabled"] is True
+    assert summary["tts_incremental_atomic_fallback_max_chars"] == 4
+    assert summary["tts_incremental_atomic_fallback_parent_count"] == 0
+    assert (
+        summary["tts_incremental_atomic_fallback_parent_sequence_ids"]
+        == []
+    )
     assert summary["audio_frames_produced"] == 2
     assert summary["published_audio_frame_keys"] == expected_keys
     assert summary["dequeued_audio_frame_keys"] == expected_keys
@@ -1825,12 +1861,132 @@ async def test_incremental_clean_order_is_frames_parent_marker_then_complete():
             "audio_frame_count": 2,
             "audio_bytes": 4_000,
             "retry_count": 0,
+            "atomic_fallback_applied": False,
         }
     ]
     assert (
         summary["completed_parent_summaries"]
         == summary["produced_parent_summaries"]
     )
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_short_target_records_atomic_fallback_at_every_barrier():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FixedTranslationNMT("Sí"),
+        tts_client=IncrementalFakeTTS(
+            frame_sizes=(3_200, 800),
+            atomic_fallback_applied=True,
+        ),
+        config=config(
+            output_queue_maxsize=4,
+            tts_incremental_publish_enabled=True,
+            tts_incremental_atomic_fallback_max_chars=4,
+        ),
+        session_id="incremental-atomic-fallback",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain_incremental(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO_FRAME,
+        StagedOutputEventKind.AUDIO_FRAME,
+        StagedOutputEventKind.PARENT_COMPLETE,
+        StagedOutputEventKind.COMPLETE,
+    ]
+    assert [len(output.frame.audio) for output in outputs[:2]] == [3_200, 800]
+    assert outputs[2].completion.atomic_fallback_applied is True
+
+    summary = session.summary(include_events=True)
+    assert summary["tts_incremental_atomic_fallback_max_chars"] == 4
+    assert summary["tts_incremental_atomic_fallback_parent_count"] == 1
+    assert (
+        summary["tts_incremental_atomic_fallback_parent_sequence_ids"]
+        == [0]
+    )
+    expected_parent = {
+        "parent_sequence_id": 0,
+        "audio_frame_count": 2,
+        "audio_bytes": 4_000,
+        "retry_count": 0,
+        "atomic_fallback_applied": True,
+    }
+    assert summary["produced_parent_summaries"] == [expected_parent]
+    assert summary["completed_parent_summaries"] == [expected_parent]
+    completion_events = [
+        event
+        for event in summary["events"]
+        if (
+            event["stage"] == "tts"
+            and event["event"] in {"first_audio", "completed"}
+        )
+        or (
+            event["stage"] == "output"
+            and event["event"]
+            in {"parent_complete_enqueued", "parent_complete_dequeued"}
+        )
+    ]
+    assert completion_events
+    assert all(
+        event["atomic_fallback_applied"] is True
+        for event in completion_events
+    )
+    assert all(
+        "atomic_fallback_applied" not in event
+        for event in summary["events"]
+        if event["event"]
+        in {"frame_received", "frame_enqueued", "frame_dequeued"}
+    )
+    tts_completed_ms = next(
+        event["monotonic_ms"]
+        for event in summary["events"]
+        if (event["stage"], event["event"]) == ("tts", "completed")
+    )
+    assert all(
+        event["monotonic_ms"] >= tts_completed_ms
+        for event in summary["events"]
+        if (event["stage"], event["event"]) == ("tts", "frame_received")
+    )
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_rejects_fallback_attribution_outside_length_policy():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FixedTranslationNMT("Una traducción larga."),
+        tts_client=IncrementalFakeTTS(
+            frame_sizes=(1_600,),
+            atomic_fallback_applied=True,
+        ),
+        config=config(
+            output_queue_maxsize=2,
+            tts_incremental_publish_enabled=True,
+            tts_incremental_atomic_fallback_max_chars=4,
+        ),
+        session_id="incremental-invalid-atomic-fallback",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain_incremental(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO_FRAME,
+        StagedOutputEventKind.ERROR,
+    ]
+    assert "fallback attribution" in outputs[-1].error
+    summary = session.summary()
+    assert summary["tts_incremental_atomic_fallback_parent_count"] == 0
+    assert (
+        summary["tts_incremental_atomic_fallback_parent_sequence_ids"]
+        == []
+    )
+    assert summary["produced_parent_summaries"] == []
     await session.aclose()
 
 

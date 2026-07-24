@@ -36,6 +36,7 @@ from staged_models import (
     TextSegment,
     TranslatedSegment,
 )
+from target_text_validation import validate_target_text
 from target_text_splitter import split_target_text
 
 
@@ -316,8 +317,8 @@ class StagedPipelineSession:
         self._published_audio_frame_bytes: list[int] = []
         self._dequeued_audio_frame_keys: list[Tuple[int, int]] = []
         self._dequeued_audio_frame_bytes: list[int] = []
-        self._produced_parent_summaries: list[Dict[str, int]] = []
-        self._completed_parent_summaries: list[Dict[str, int]] = []
+        self._produced_parent_summaries: list[Dict[str, Any]] = []
+        self._completed_parent_summaries: list[Dict[str, Any]] = []
         self._parent_translation_char_counts: Dict[int, int] = {}
         self._tts_response_chunk_metrics: list[Dict[str, Any]] = []
         self._tts_response_segments_observed = 0
@@ -595,6 +596,11 @@ class StagedPipelineSession:
                 ],
             }
         if self.config.tts_incremental_publish_enabled:
+            atomic_fallback_parent_ids = [
+                item["parent_sequence_id"]
+                for item in self._produced_parent_summaries
+                if item["atomic_fallback_applied"]
+            ]
             result.update(
                 {
                     "tts_incremental_publish_enabled": True,
@@ -603,6 +609,15 @@ class StagedPipelineSession:
                     ),
                     "tts_incremental_frame_bytes": (
                         self._incremental_frame_bytes
+                    ),
+                    "tts_incremental_atomic_fallback_max_chars": (
+                        self.config.tts_incremental_atomic_fallback_max_chars
+                    ),
+                    "tts_incremental_atomic_fallback_parent_count": len(
+                        atomic_fallback_parent_ids
+                    ),
+                    "tts_incremental_atomic_fallback_parent_sequence_ids": (
+                        list(atomic_fallback_parent_ids)
                     ),
                     "audio_frames_produced": self._audio_frames_produced,
                     "published_audio_frame_keys": _frame_key_payloads(
@@ -1081,6 +1096,31 @@ class StagedPipelineSession:
                     )
                     raise contract_error
                 if isinstance(synthesized, SynthesizedStreamCompletion):
+                    normalized_target = validate_target_text(
+                        translation.text,
+                        language=translation.language,
+                        sequence_id=translation.sequence_id,
+                    )
+                    fallback_threshold = (
+                        self.config.tts_incremental_atomic_fallback_max_chars
+                    )
+                    expected_atomic_fallback = (
+                        fallback_threshold > 0
+                        and len(normalized_target) <= fallback_threshold
+                    )
+                    if (
+                        synthesized.atomic_fallback_applied
+                        is not expected_atomic_fallback
+                    ):
+                        contract_error = StagedPipelineError(
+                            "incremental TTS atomic fallback attribution did "
+                            "not match the configured target-length policy"
+                        )
+                        _retain_translation_identity(
+                            contract_error,
+                            translation,
+                        )
+                        raise contract_error
                     if (
                         synthesized.audio_frame_count
                         != self._published_frame_count
@@ -1877,6 +1917,11 @@ class StagedPipelineSession:
             if isinstance(segment, SynthesizedStreamCompletion)
             else None
         )
+        atomic_fallback_applied = (
+            segment.atomic_fallback_applied
+            if isinstance(segment, SynthesizedStreamCompletion)
+            else None
+        )
         record = PipelineEvent(
             session_id=self.session_id,
             stage=stage,
@@ -1913,6 +1958,7 @@ class StagedPipelineSession:
             audio_duration_ms=audio_duration_ms,
             audio_frame_id=audio_frame_id,
             audio_frame_count=audio_frame_count,
+            atomic_fallback_applied=atomic_fallback_applied,
             retry_count=retry_count,
             error_code=error_code,
         )
@@ -2000,12 +2046,13 @@ def _frame_key_payloads(
 
 def _parent_completion_payload(
     completion: SynthesizedStreamCompletion,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     return {
         "parent_sequence_id": completion.parent_sequence_id,
         "audio_frame_count": completion.audio_frame_count,
         "audio_bytes": completion.audio_bytes,
         "retry_count": completion.retry_count,
+        "atomic_fallback_applied": completion.atomic_fallback_applied,
     }
 
 

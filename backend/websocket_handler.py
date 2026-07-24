@@ -50,6 +50,9 @@ def create_staged_pipeline(target_language: str):
             incremental_frame_ms=(
                 staged_pipeline_config.tts_incremental_frame_ms
             ),
+            incremental_atomic_fallback_max_chars=(
+                staged_pipeline_config.tts_incremental_atomic_fallback_max_chars
+            ),
         ),
         target_language=target_language,
         config=staged_pipeline_config,
@@ -557,6 +560,50 @@ class TranslationSession:
                         "and WebSocket",
                         True,
                     )
+            produced_parent_summaries = snapshot[
+                "produced_parent_summaries"
+            ]
+            fallback_parent_ids = []
+            for parent_summary in produced_parent_summaries:
+                if (
+                    not isinstance(parent_summary, dict)
+                    or not isinstance(
+                        parent_summary.get("atomic_fallback_applied"),
+                        bool,
+                    )
+                ):
+                    return (
+                        "schema-3 atomic fallback attribution was invalid",
+                        True,
+                    )
+                if parent_summary["atomic_fallback_applied"]:
+                    fallback_parent_ids.append(
+                        parent_summary.get("parent_sequence_id")
+                    )
+            fallback_count = snapshot.get(
+                "tts_incremental_atomic_fallback_parent_count"
+            )
+            configured_threshold = snapshot.get(
+                "tts_incremental_atomic_fallback_max_chars"
+            )
+            if (
+                not isinstance(configured_threshold, int)
+                or isinstance(configured_threshold, bool)
+                or configured_threshold < 0
+                or not isinstance(fallback_count, int)
+                or isinstance(fallback_count, bool)
+                or fallback_count != len(fallback_parent_ids)
+                or snapshot.get(
+                    "tts_incremental_atomic_fallback_parent_sequence_ids"
+                )
+                != fallback_parent_ids
+                or (configured_threshold == 0 and fallback_parent_ids)
+            ):
+                return (
+                    "schema-3 atomic fallback summary did not reconcile "
+                    "across pipeline and WebSocket",
+                    True,
+                )
             if (
                 self._staged_pending_frame_parent is not None
                 or self._staged_pending_frame_count != 0
@@ -699,6 +746,11 @@ class TranslationSession:
         audio_frame_count = getattr(completion, "audio_frame_count", None)
         audio_bytes = getattr(completion, "audio_bytes", None)
         retry_count = getattr(completion, "retry_count", None)
+        atomic_fallback_applied = getattr(
+            completion,
+            "atomic_fallback_applied",
+            None,
+        )
         if (
             not isinstance(parent_sequence_id, int)
             or isinstance(parent_sequence_id, bool)
@@ -710,6 +762,7 @@ class TranslationSession:
             or isinstance(audio_bytes, bool)
             or audio_bytes <= 0
             or retry_count not in {0, 1}
+            or not isinstance(atomic_fallback_applied, bool)
         ):
             return False
         async with self._send_lock:
@@ -731,6 +784,7 @@ class TranslationSession:
                 "audio_frame_count": audio_frame_count,
                 "audio_bytes": audio_bytes,
                 "retry_count": retry_count,
+                "atomic_fallback_applied": atomic_fallback_applied,
             }
             self._staged_parent_completions_sent.append(summary)
             self._staged_audio_sequence_ids_sent.append(parent_sequence_id)

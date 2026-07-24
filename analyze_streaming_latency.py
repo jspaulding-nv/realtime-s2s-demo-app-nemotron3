@@ -79,6 +79,7 @@ class IncrementalPublicationSeries:
     frame_send_elapsed_ms: tuple[float, ...]
     tts_first_elapsed_ms: float
     tts_completed_elapsed_ms: float
+    atomic_fallback_applied: bool = False
 
     @property
     def frame_count(self) -> int:
@@ -412,9 +413,9 @@ def _parent_summaries(
     *,
     field: str,
     label: str,
-) -> tuple[tuple[int, int, int, int], ...]:
+) -> tuple[tuple[int, int, int, int, bool], ...]:
     raw = _require_list(value, field=field, label=label)
-    summaries: list[tuple[int, int, int, int]] = []
+    summaries: list[tuple[int, int, int, int, bool]] = []
     for index, item in enumerate(raw):
         item_field = f"{field}[{index}]"
         summary = _require_object(item, field=item_field, label=label)
@@ -442,15 +443,102 @@ def _parent_summaries(
             raise ValueError(
                 f"{label}: {item_field}.retry_count must be zero or one"
             )
+        atomic_fallback_applied = summary.get(
+            "atomic_fallback_applied",
+            False,
+        )
+        if not isinstance(atomic_fallback_applied, bool):
+            raise ValueError(
+                f"{label}: {item_field}.atomic_fallback_applied must be "
+                "a boolean"
+            )
         summaries.append(
             (
                 parent_sequence_id,
                 audio_frame_count,
                 audio_bytes,
                 retry_count,
+                atomic_fallback_applied,
             )
         )
     return tuple(summaries)
+
+
+def _incremental_atomic_fallback_metadata(
+    staged: dict[str, Any],
+    *,
+    parent_summaries: tuple[tuple[int, int, int, int, bool], ...],
+    parent_ids: tuple[int, ...],
+    label: str,
+) -> tuple[int, tuple[int, ...]]:
+    """Normalize legacy schema-v3 captures and reconcile fallback evidence."""
+
+    max_chars = _require_nonnegative_int(
+        staged.get("tts_incremental_atomic_fallback_max_chars", 0),
+        field=(
+            "staged_pipeline."
+            "tts_incremental_atomic_fallback_max_chars"
+        ),
+        label=label,
+    )
+    count = _require_nonnegative_int(
+        staged.get(
+            "tts_incremental_atomic_fallback_parent_count",
+            0,
+        ),
+        field=(
+            "staged_pipeline."
+            "tts_incremental_atomic_fallback_parent_count"
+        ),
+        label=label,
+    )
+    raw_ids = _require_list(
+        staged.get(
+            "tts_incremental_atomic_fallback_parent_sequence_ids",
+            [],
+        ),
+        field=(
+            "staged_pipeline."
+            "tts_incremental_atomic_fallback_parent_sequence_ids"
+        ),
+        label=label,
+    )
+    fallback_ids = tuple(
+        _require_nonnegative_int(
+            parent_id,
+            field=(
+                "staged_pipeline."
+                "tts_incremental_atomic_fallback_parent_sequence_ids"
+            ),
+            label=label,
+        )
+        for parent_id in raw_ids
+    )
+    if count != len(fallback_ids):
+        raise ValueError(
+            f"{label}: atomic fallback parent count and IDs do not match"
+        )
+    if fallback_ids != tuple(sorted(set(fallback_ids))) or any(
+        parent_id not in parent_ids for parent_id in fallback_ids
+    ):
+        raise ValueError(
+            f"{label}: atomic fallback parent IDs must be unique, ordered, "
+            "and completed"
+        )
+    if max_chars == 0 and fallback_ids:
+        raise ValueError(
+            f"{label}: atomic fallback parents require a positive threshold"
+        )
+    flagged_ids = tuple(
+        parent_id
+        for parent_id, _, _, _, fallback_applied in parent_summaries
+        if fallback_applied
+    )
+    if flagged_ids != fallback_ids:
+        raise ValueError(
+            f"{label}: parent fallback flags do not match fallback IDs"
+        )
+    return max_chars, fallback_ids
 
 
 def _event_observation(
@@ -1081,11 +1169,24 @@ def _load_incremental_publication_series(
         raise ValueError(
             f"{label}: schema-v3 parent summaries do not match segments"
         )
+    _, fallback_parent_ids = _incremental_atomic_fallback_metadata(
+        staged,
+        parent_summaries=parent_summaries,
+        parent_ids=parent_ids,
+        label=label,
+    )
+    fallback_parent_id_set = set(fallback_parent_ids)
 
     expected_keys: list[tuple[int, int]] = []
     parent_slices: dict[int, slice] = {}
     offset = 0
-    for parent_id, frame_count, audio_bytes, retry_count in parent_summaries:
+    for (
+        parent_id,
+        frame_count,
+        audio_bytes,
+        retry_count,
+        _fallback_applied,
+    ) in parent_summaries:
         request_key = (parent_id, 0, 1)
         if request_key not in tts_full:
             raise ValueError(
@@ -1185,6 +1286,7 @@ def _load_incremental_publication_series(
         name: ([], []) for name in frame_event_names
     }
     parent_event_names = (
+        ("tts", "completed"),
         ("output", "parent_complete_enqueued"),
         ("output", "parent_complete_dequeued"),
     )
@@ -1223,6 +1325,10 @@ def _load_incremental_publication_series(
                         "audio_frame_count": event.get("audio_frame_count"),
                         "audio_bytes": event.get("audio_bytes"),
                         "retry_count": event.get("retry_count"),
+                        "atomic_fallback_applied": event.get(
+                            "atomic_fallback_applied",
+                            False,
+                        ),
                     }
                 ],
                 field=field,
@@ -1248,7 +1354,13 @@ def _load_incremental_publication_series(
 
     logical_sends: dict[tuple[int, int, int], TimedObservation] = {}
     series: list[IncrementalPublicationSeries] = []
-    for parent_id, _, audio_bytes, _ in parent_summaries:
+    for (
+        parent_id,
+        _,
+        audio_bytes,
+        _,
+        fallback_applied,
+    ) in parent_summaries:
         request_key = (parent_id, 0, 1)
         parent_slice = parent_slices[parent_id]
         send_times = tuple(websocket_elapsed_ms[parent_slice])
@@ -1262,6 +1374,17 @@ def _load_incremental_publication_series(
         if send_times[0] < first_tts_ms:
             raise ValueError(
                 f"{label}: first schema-v3 frame was sent before first TTS PCM"
+            )
+        if (
+            parent_id in fallback_parent_id_set
+            and any(
+                sent_ms + SOURCE_TIME_TOLERANCE_MS < completed_tts_ms
+                for sent_ms in send_times
+            )
+        ):
+            raise ValueError(
+                f"{label}: atomic fallback frame was published before "
+                "TTS completion"
             )
         source_end_ms = segments[parent_id].source_end_ms
         logical_sends[request_key] = TimedObservation(
@@ -1278,6 +1401,7 @@ def _load_incremental_publication_series(
                 frame_send_elapsed_ms=send_times,
                 tts_first_elapsed_ms=first_tts_ms,
                 tts_completed_elapsed_ms=completed_tts_ms,
+                atomic_fallback_applied=fallback_applied,
             )
         )
     return logical_sends, tuple(series)
@@ -1359,6 +1483,7 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
     tts_first_frame_counts: dict[tuple[int, int, int], int] = {}
     tts_audio_frame_counts: dict[tuple[int, int, int], int] = {}
     tts_retry_counts: dict[tuple[int, int, int], int] = {}
+    tts_started_text_chars: dict[int, int] = {}
 
     for index, event in enumerate(events):
         stage = event.get("stage")
@@ -1458,6 +1583,20 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
                     field="TTS started",
                     label=label,
                 )
+                if (
+                    schema_version == 3
+                    and event.get("text_chars") is not None
+                ):
+                    text_chars = _require_positive_int(
+                        event.get("text_chars"),
+                        field=f"{field}.text_chars",
+                        label=label,
+                    )
+                    if key[0] in tts_started_text_chars:
+                        raise ValueError(
+                            f"{label}: duplicate TTS started text_chars"
+                        )
+                    tts_started_text_chars[key[0]] = text_chars
             elif event_name == "first_audio":
                 _store_unique(
                     tts_first,
@@ -1550,6 +1689,54 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
         ...,
     ] = ()
     if schema_version == 3:
+        summary_fallback_max_chars = _require_nonnegative_int(
+            staged.get(
+                "tts_incremental_atomic_fallback_max_chars",
+                0,
+            ),
+            field=(
+                "staged_pipeline."
+                "tts_incremental_atomic_fallback_max_chars"
+            ),
+            label=label,
+        )
+        backend_config = _require_object(
+            root.get("backend_config"),
+            field="backend_config",
+            label=label,
+        )
+        staged_config = backend_config.get("stagedConfig")
+        if staged_config is None:
+            if summary_fallback_max_chars != 0:
+                raise ValueError(
+                    f"{label}: fallback threshold requires backend "
+                    "stagedConfig provenance"
+                )
+        else:
+            staged_config = _require_object(
+                staged_config,
+                field="backend_config.stagedConfig",
+                label=label,
+            )
+            configured_fallback_max_chars = _require_nonnegative_int(
+                staged_config.get(
+                    "ttsIncrementalAtomicFallbackMaxChars",
+                    0,
+                ),
+                field=(
+                    "backend_config.stagedConfig."
+                    "ttsIncrementalAtomicFallbackMaxChars"
+                ),
+                label=label,
+            )
+            if (
+                configured_fallback_max_chars
+                != summary_fallback_max_chars
+            ):
+                raise ValueError(
+                    f"{label}: fallback threshold does not match backend "
+                    "configuration"
+                )
         websocket_sends, incremental_publications = (
             _load_incremental_publication_series(
                 staged,
@@ -1561,13 +1748,35 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
                 segments=segments,
                 tts_first=tts_first,
                 tts_full=tts_full,
-                    tts_audio_bytes=tts_audio_bytes,
-                    tts_first_frame_counts=tts_first_frame_counts,
-                    tts_audio_frame_counts=tts_audio_frame_counts,
+                tts_audio_bytes=tts_audio_bytes,
+                tts_first_frame_counts=tts_first_frame_counts,
+                tts_audio_frame_counts=tts_audio_frame_counts,
                 tts_retry_counts=tts_retry_counts,
                 label=label,
             )
         )
+        if summary_fallback_max_chars > 0:
+            if sorted(tts_started_text_chars) != list(parent_ids):
+                raise ValueError(
+                    f"{label}: fallback policy requires TTS started "
+                    "text_chars for every parent"
+                )
+            policy_fallback_ids = tuple(
+                parent_id
+                for parent_id in parent_ids
+                if tts_started_text_chars[parent_id]
+                <= summary_fallback_max_chars
+            )
+            observed_fallback_ids = tuple(
+                publication.identity[0]
+                for publication in incremental_publications
+                if publication.atomic_fallback_applied
+            )
+            if policy_fallback_ids != observed_fallback_ids:
+                raise ValueError(
+                    f"{label}: fallback IDs do not match the configured "
+                    "TTS started text threshold"
+                )
     else:
         websocket_events = _require_list(
             staged.get("websocket_send_events"),
@@ -1894,44 +2103,88 @@ def _observed_metrics(samples: Sequence[SampleLatency]) -> dict[str, Any]:
 def _incremental_publication_metrics(
     samples: Sequence[SampleLatency],
 ) -> dict[str, Any]:
-    series = tuple(
+    all_series = tuple(
         item
         for sample in samples
         for item in sample.incremental_publications
     )
-    if not series:
+    if not all_series:
         return {"available": False}
+    direct_series = tuple(
+        item
+        for item in all_series
+        if not item.atomic_fallback_applied
+    )
+    fallback_series = tuple(
+        item for item in all_series if item.atomic_fallback_applied
+    )
+    available = bool(direct_series)
     return {
-        "available": True,
+        "available": available,
+        "unavailable_reason": (
+            None
+            if available
+            else "all_schema_v3_parents_used_atomic_fallback"
+        ),
         "comparison_basis": (
             "within-parent same generated PCM; TTS completion is the "
             "earliest atomic publication point"
         ),
         "cross_arm_audio_duration_comparison": False,
-        "parent_count": len(series),
-        "audio_frame_count": sum(item.frame_count for item in series),
-        "audio_bytes": sum(item.total_audio_bytes for item in series),
-        "frames_per_parent": _distribution(
-            item.frame_count for item in series
+        "total_schema_v3_parent_count": len(all_series),
+        "direct_incremental_parent_count": len(direct_series),
+        "atomic_fallback_parent_count": len(fallback_series),
+        "excluded_atomic_fallback_parent_count": len(fallback_series),
+        "parent_count": len(direct_series),
+        "audio_frame_count": sum(
+            item.frame_count for item in direct_series
+        ),
+        "audio_bytes": sum(
+            item.total_audio_bytes for item in direct_series
+        ),
+        "total_schema_v3_audio_frame_count": sum(
+            item.frame_count for item in all_series
+        ),
+        "total_schema_v3_audio_bytes": sum(
+            item.total_audio_bytes for item in all_series
+        ),
+        "frames_per_parent": _optional_distribution(
+            item.frame_count for item in direct_series
         ),
         "tts_first_response_to_first_websocket_send_seconds": (
-            _distribution(
+            _optional_distribution(
                 item.first_response_to_first_publish_seconds
-                for item in series
+                for item in direct_series
             )
         ),
-        "atomic_withholding_equivalent_seconds": _distribution(
-            item.atomic_withholding_equivalent_seconds for item in series
+        "atomic_withholding_equivalent_seconds": _optional_distribution(
+            item.atomic_withholding_equivalent_seconds
+            for item in direct_series
         ),
-        "first_publish_lead_over_tts_completion_seconds": _distribution(
-            item.first_publish_lead_over_tts_completion_seconds
-            for item in series
+        "first_publish_lead_over_tts_completion_seconds": (
+            _optional_distribution(
+                item.first_publish_lead_over_tts_completion_seconds
+                for item in direct_series
+            )
         ),
-        "tts_completion_to_final_websocket_send_seconds": _distribution(
-            item.tts_completion_to_final_publish_seconds for item in series
+        "tts_completion_to_final_websocket_send_seconds": (
+            _optional_distribution(
+                item.tts_completion_to_final_publish_seconds
+                for item in direct_series
+            )
         ),
-        "first_to_final_websocket_send_seconds": _distribution(
-            item.first_to_final_publish_seconds for item in series
+        "first_to_final_websocket_send_seconds": _optional_distribution(
+            item.first_to_final_publish_seconds for item in direct_series
+        ),
+        "atomic_fallback_completion_to_first_websocket_send_seconds": (
+            _optional_distribution(
+                (
+                    item.first_send_elapsed_ms
+                    - item.tts_completed_elapsed_ms
+                )
+                / 1_000.0
+                for item in fallback_series
+            )
         ),
     }
 
@@ -2008,6 +2261,9 @@ def _initial_path(sample: SampleLatency) -> dict[str, Any]:
         )
         result.update(
             {
+                "atomic_fallback_applied": (
+                    publication.atomic_fallback_applied
+                ),
                 "first_websocket_send": _initial_event_payload(
                     TimedObservation(
                         identity=publication.identity,
@@ -2018,14 +2274,29 @@ def _initial_path(sample: SampleLatency) -> dict[str, Any]:
                     )
                 ),
                 "atomic_withholding_equivalent_seconds": (
-                    publication.atomic_withholding_equivalent_seconds
+                    None
+                    if publication.atomic_fallback_applied
+                    else publication.atomic_withholding_equivalent_seconds
                 ),
                 "tts_first_response_to_first_websocket_send_seconds": (
-                    publication.first_response_to_first_publish_seconds
+                    None
+                    if publication.atomic_fallback_applied
+                    else publication.first_response_to_first_publish_seconds
                 ),
                 "first_publish_lead_over_tts_completion_seconds": (
-                    publication
+                    None
+                    if publication.atomic_fallback_applied
+                    else publication
                     .first_publish_lead_over_tts_completion_seconds
+                ),
+                "atomic_fallback_completion_to_first_websocket_send_seconds": (
+                    (
+                        publication.first_send_elapsed_ms
+                        - publication.tts_completed_elapsed_ms
+                    )
+                    / 1_000.0
+                    if publication.atomic_fallback_applied
+                    else None
                 ),
             }
         )
@@ -2092,6 +2363,7 @@ def _structural_digest(samples: Sequence[SampleLatency]) -> str:
                     ],
                     round(publication.tts_first_elapsed_ms, 6),
                     round(publication.tts_completed_elapsed_ms, 6),
+                    publication.atomic_fallback_applied,
                 ]
             )
     encoded = json.dumps(
@@ -2127,6 +2399,14 @@ def _sample_payload(sample: SampleLatency) -> dict[str, Any]:
             "websocket_sends": len(sample.websocket_sends),
             "websocket_audio_frames": sum(
                 item.frame_count
+                for item in sample.incremental_publications
+            ),
+            "direct_incremental_parents": sum(
+                not item.atomic_fallback_applied
+                for item in sample.incremental_publications
+            ),
+            "atomic_fallback_parents": sum(
+                item.atomic_fallback_applied
                 for item in sample.incremental_publications
             ),
         },
@@ -2169,6 +2449,16 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
         ),
         "websocket_audio_frames": sum(
             item.frame_count
+            for sample in normalized
+            for item in sample.incremental_publications
+        ),
+        "direct_incremental_parents": sum(
+            not item.atomic_fallback_applied
+            for sample in normalized
+            for item in sample.incremental_publications
+        ),
+        "atomic_fallback_parents": sum(
+            item.atomic_fallback_applied
             for sample in normalized
             for item in sample.incremental_publications
         ),
@@ -2222,7 +2512,12 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             "schema_v3_first_publish_lead": (
                 "TTS completed time minus first WebSocket PCM frame send; "
                 "positive values show how much earlier incremental "
-                "publication began"
+                "publication began; atomic-fallback parents are excluded"
+            ),
+            "schema_v3_atomic_fallback": (
+                "fallback frames remain part of audience-facing parent and "
+                "WebSocket metrics, but are excluded from direct incremental "
+                "first-publish distributions"
             ),
             "negative_boundary_latency_is_retained": True,
         },
@@ -2243,6 +2538,11 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
                 "generated parent PCM. It does not compare audio duration "
                 "across runs, is not a microphone-to-ear latency reduction, "
                 "and does not include browser playback queue behavior."
+            ),
+            "schema_v3_atomic_fallback": (
+                "A short-parent atomic fallback deliberately publishes only "
+                "after TTS completion. Its audience timing remains observed, "
+                "but it cannot demonstrate incremental first-publish benefit."
             ),
             "batch_harness_frame_dispatch": (
                 "The standard batch harness dispatches whole 300 ms PCM "
@@ -2350,10 +2650,14 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                 "",
                 (
                     f"Observed {incremental['audio_frame_count']:,} PCM "
-                    f"frames across {incremental['parent_count']:,} parent "
-                    "TTS requests. The counterfactual uses each parent's own "
-                    "generated PCM and treats TTS completion as the earliest "
-                    "possible atomic publication point."
+                    f"frames across {incremental['parent_count']:,} direct "
+                    "incremental parent TTS requests. "
+                    f"Excluded "
+                    f"{incremental['excluded_atomic_fallback_parent_count']:,} "
+                    "atomic-fallback parent(s) from these direct benefit "
+                    "distributions. The counterfactual uses each parent's "
+                    "own generated PCM and treats TTS completion as the "
+                    "earliest possible atomic publication point."
                 ),
                 "",
                 "| Interval | Count | Min | p50 | p95 | Max | Mean |",
@@ -2401,6 +2705,21 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                     mean=_format_seconds(distribution["mean"]),
                 )
             )
+    elif incremental.get("atomic_fallback_parent_count", 0):
+        lines.extend(
+            [
+                "",
+                "## Incremental TTS publication (schema v3)",
+                "",
+                (
+                    "Direct incremental benefit is unavailable: all "
+                    f"{incremental['atomic_fallback_parent_count']:,} "
+                    "schema-v3 parent(s) used the short-parent atomic "
+                    "fallback. Audience-facing WebSocket and parent latency "
+                    "metrics above still include those parents."
+                ),
+            ]
+        )
 
     response_diagnostic = aggregate["tts_response_chunk_diagnostic"]
     if response_diagnostic["available"]:

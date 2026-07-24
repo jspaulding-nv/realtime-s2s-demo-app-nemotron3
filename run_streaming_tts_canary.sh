@@ -19,6 +19,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 CANARY_SOURCE="${CANARY_SOURCE:-test_audio/long-form-01.mp3}"
 CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS:-60}"
 CANARY_INCREMENTAL_FRAME_MS="${CANARY_INCREMENTAL_FRAME_MS:-100}"
+CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS="${CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS:-4}"
 CANARY_BACKEND_PORT="${CANARY_BACKEND_PORT:-8100}"
 CANARY_OUTPUT_ROOT="${CANARY_OUTPUT_ROOT:-experiment_results}"
 ALLOW_DIRTY_CANARY="${ALLOW_DIRTY_CANARY:-0}"
@@ -59,6 +60,9 @@ for setting in \
 done
 [[ "$ALLOW_DIRTY_CANARY" == "0" || "$ALLOW_DIRTY_CANARY" == "1" ]] ||
   fail_usage "ALLOW_DIRTY_CANARY must be 0 or 1"
+[[ "$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS" =~ ^[0-9]+$ ]] ||
+  fail_usage \
+    "CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS must be a non-negative integer"
 
 EVIDENCE_CLASS="formal"
 if [[ "$ALLOW_DIRTY_CANARY" == "1" ]]; then
@@ -248,6 +252,7 @@ PREFIX_SHA256="$(sha256sum "$PREFIX_WAV" | awk '{print $1}')"
   echo "duration_seconds=$CANARY_DURATION_SECONDS"
   echo "prefix_sha256=$PREFIX_SHA256"
   echo "incremental_frame_ms=$CANARY_INCREMENTAL_FRAME_MS"
+  echo "incremental_atomic_fallback_max_chars=$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS"
   echo "asr_image=$ASR_IMAGE"
   echo "asr_image_digest=$ASR_IMAGE_DIGEST"
   echo "nmt_image=$NMT_IMAGE"
@@ -322,6 +327,7 @@ for arm in atomic streaming; do
   STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=1 \
   STAGED_TTS_INCREMENTAL_PUBLISH="$incremental" \
   STAGED_TTS_INCREMENTAL_FRAME_MS="$CANARY_INCREMENTAL_FRAME_MS" \
+  STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS="$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS" \
   PYTHONPATH=".python-packages:backend:." \
     "$PYTHON_BIN" -m uvicorn main:app \
       --app-dir backend \
@@ -371,6 +377,10 @@ if staged.get("ttsIncrementalPublishEnabled", False) is not expected_incremental
     raise SystemExit("incremental-publication flag mismatch")
 if expected_incremental and staged.get("ttsIncrementalFrameMs") != int(sys.argv[9]):
     raise SystemExit("incremental frame duration mismatch")
+reported_fallback = staged.get("ttsIncrementalAtomicFallbackMaxChars", 0)
+expected_fallback = int(sys.argv[10]) if expected_incremental else 0
+if reported_fallback != expected_fallback:
+    raise SystemExit("incremental atomic-fallback threshold mismatch")
 models = config["modelConfig"]
 actual = [
     models["asr"]["image"], models["asr"]["imageDigest"],
@@ -384,7 +394,8 @@ if actual != expected[:6]:
       "$ASR_IMAGE" "$ASR_IMAGE_DIGEST" \
       "$NMT_IMAGE" "$NMT_IMAGE_DIGEST" \
       "$TTS_IMAGE" "$TTS_IMAGE_DIGEST" \
-      "$CANARY_INCREMENTAL_FRAME_MS"
+      "$CANARY_INCREMENTAL_FRAME_MS" \
+      "$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS"
 
   PYTHONPATH=".python-packages:backend:." \
     "$PYTHON_BIN" batch_latency_test.py \

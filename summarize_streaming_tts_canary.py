@@ -28,6 +28,7 @@ INTENDED_CONFIG_DIFFERENCES = (
     "stagedConfig.telemetrySchemaVersion",
     "stagedConfig.ttsIncrementalPublishEnabled",
     "stagedConfig.ttsIncrementalFrameMs",
+    "stagedConfig.ttsIncrementalAtomicFallbackMaxChars",
 )
 
 
@@ -115,6 +116,13 @@ def _distribution(values: Iterable[float]) -> dict[str, float]:
     }
 
 
+def _optional_distribution(
+    values: Iterable[float],
+) -> dict[str, float] | None:
+    observed = list(values)
+    return _distribution(observed) if observed else None
+
+
 def _round_floats(value: Any, digits: int = 6) -> Any:
     if isinstance(value, float):
         return round(value, digits)
@@ -150,6 +158,15 @@ def _run_info(path: Path) -> dict[str, str]:
     prefix_sha256 = result.get("prefix_sha256", "")
     if re.fullmatch(r"[0-9a-f]{64}", prefix_sha256) is None:
         raise ValueError("run_info: prefix_sha256 must be a SHA-256 digest")
+    fallback_max_chars = result.get(
+        "incremental_atomic_fallback_max_chars",
+        "0",
+    )
+    if not fallback_max_chars.isdigit():
+        raise ValueError(
+            "run_info: incremental_atomic_fallback_max_chars must be "
+            "a non-negative integer"
+        )
     return result
 
 
@@ -222,6 +239,23 @@ def _backend_provenance(
             label=label,
             positive=True,
         )
+        fallback_max_chars = staged.get(
+            "ttsIncrementalAtomicFallbackMaxChars",
+            0,
+        )
+        if (
+            not isinstance(fallback_max_chars, int)
+            or isinstance(fallback_max_chars, bool)
+            or fallback_max_chars < 0
+        ):
+            raise ValueError(
+                f"{label}: ttsIncrementalAtomicFallbackMaxChars must be "
+                "a non-negative integer"
+            )
+    elif staged.get("ttsIncrementalAtomicFallbackMaxChars", 0) != 0:
+        raise ValueError(
+            f"{label}: atomic control cannot enable incremental fallback"
+        )
 
     projection = copy.deepcopy(config)
     projection_staged = projection["stagedConfig"]
@@ -229,6 +263,7 @@ def _backend_provenance(
         "telemetrySchemaVersion",
         "ttsIncrementalPublishEnabled",
         "ttsIncrementalFrameMs",
+        "ttsIncrementalAtomicFallbackMaxChars",
     ):
         projection_staged.pop(field, None)
     return projection
@@ -413,6 +448,207 @@ def _elapsed_seconds(
     return max(0.0, value)
 
 
+def _fallback_metadata(
+    staged: dict[str, Any],
+    backend_config: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    parent_count: int,
+    incremental: bool,
+    label: str,
+) -> dict[str, Any]:
+    """Normalize old schema-3 evidence and reconcile new fallback fields."""
+
+    max_chars = staged.get(
+        "tts_incremental_atomic_fallback_max_chars",
+        0,
+    )
+    fallback_count = staged.get(
+        "tts_incremental_atomic_fallback_parent_count",
+        0,
+    )
+    if (
+        not isinstance(max_chars, int)
+        or isinstance(max_chars, bool)
+        or max_chars < 0
+    ):
+        raise ValueError(f"{label}: fallback max chars is invalid")
+    if (
+        not isinstance(fallback_count, int)
+        or isinstance(fallback_count, bool)
+        or fallback_count < 0
+    ):
+        raise ValueError(f"{label}: fallback parent count is invalid")
+    raw_ids = _list(
+        staged.get(
+            "tts_incremental_atomic_fallback_parent_sequence_ids",
+            [],
+        ),
+        field="tts_incremental_atomic_fallback_parent_sequence_ids",
+        label=label,
+    )
+    fallback_ids = [
+        _integer(
+            parent_id,
+            field="fallback parent sequence ID",
+            label=label,
+        )
+        for parent_id in raw_ids
+    ]
+    if (
+        fallback_count != len(fallback_ids)
+        or fallback_ids != sorted(set(fallback_ids))
+        or any(parent_id >= parent_count for parent_id in fallback_ids)
+    ):
+        raise ValueError(f"{label}: fallback parent metadata is inconsistent")
+    if max_chars == 0 and fallback_ids:
+        raise ValueError(
+            f"{label}: fallback parents require a positive threshold"
+        )
+    configured_max_chars = (
+        _object(
+            backend_config.get("stagedConfig"),
+            field="stagedConfig",
+            label=label,
+        ).get("ttsIncrementalAtomicFallbackMaxChars", 0)
+        if incremental
+        else 0
+    )
+    if configured_max_chars != max_chars:
+        raise ValueError(
+            f"{label}: fallback threshold does not match API config"
+        )
+
+    normalized_layers: list[list[tuple[int, int, int, int, bool]]] = []
+    for field in (
+        "produced_parent_summaries",
+        "completed_parent_summaries",
+        "websocket_completed_parent_summaries",
+    ):
+        summaries = _list(staged.get(field), field=field, label=label)
+        normalized: list[tuple[int, int, int, int, bool]] = []
+        for index, raw_summary in enumerate(summaries):
+            summary = _object(
+                raw_summary,
+                field=f"{field}[{index}]",
+                label=label,
+            )
+            fallback_applied = summary.get(
+                "atomic_fallback_applied",
+                False,
+            )
+            if not isinstance(fallback_applied, bool):
+                raise ValueError(
+                    f"{label}: {field}[{index}] fallback flag is invalid"
+                )
+            normalized.append(
+                (
+                    _integer(
+                        summary.get("parent_sequence_id"),
+                        field=f"{field}.parent_sequence_id",
+                        label=label,
+                    ),
+                    _integer(
+                        summary.get("audio_frame_count"),
+                        field=f"{field}.audio_frame_count",
+                        label=label,
+                        positive=True,
+                    ),
+                    _integer(
+                        summary.get("audio_bytes"),
+                        field=f"{field}.audio_bytes",
+                        label=label,
+                        positive=True,
+                    ),
+                    _integer(
+                        summary.get("retry_count"),
+                        field=f"{field}.retry_count",
+                        label=label,
+                    ),
+                    fallback_applied,
+                )
+            )
+        normalized_layers.append(normalized)
+    if normalized_layers[1:] != normalized_layers[:-1]:
+        raise ValueError(f"{label}: fallback parent summary layers differ")
+    canonical = normalized_layers[0]
+    if [item[0] for item in canonical] != list(range(parent_count)):
+        raise ValueError(f"{label}: fallback parent summaries are incomplete")
+    flagged_ids = [item[0] for item in canonical if item[4]]
+    if flagged_ids != fallback_ids:
+        raise ValueError(
+            f"{label}: fallback flags do not match fallback parent IDs"
+        )
+    if max_chars > 0:
+        started_text_chars: dict[int, int] = {}
+        for event in events:
+            if (event.get("stage"), event.get("event")) != (
+                "tts",
+                "started",
+            ):
+                continue
+            parent_id = _integer(
+                event.get("sequence_id"),
+                field="tts/started.sequence_id",
+                label=label,
+            )
+            if parent_id in started_text_chars:
+                raise ValueError(f"{label}: duplicate tts/started parent")
+            started_text_chars[parent_id] = _integer(
+                event.get("text_chars"),
+                field="tts/started.text_chars",
+                label=label,
+                positive=True,
+            )
+        if sorted(started_text_chars) != list(range(parent_count)):
+            raise ValueError(
+                f"{label}: fallback policy requires tts/started text_chars "
+                "for every parent"
+            )
+        policy_fallback_ids = [
+            parent_id
+            for parent_id in range(parent_count)
+            if started_text_chars[parent_id] <= max_chars
+        ]
+        if policy_fallback_ids != fallback_ids:
+            raise ValueError(
+                f"{label}: fallback IDs do not match configured text "
+                "threshold"
+            )
+
+    expected_event_flags = [
+        (parent_id, parent_id in set(fallback_ids))
+        for parent_id in range(parent_count)
+    ]
+    for event_type in (
+        ("tts", "completed"),
+        ("output", "parent_complete_enqueued"),
+        ("output", "parent_complete_dequeued"),
+    ):
+        records = []
+        for event in events:
+            if (event.get("stage"), event.get("event")) != event_type:
+                continue
+            fallback_applied = event.get(
+                "atomic_fallback_applied",
+                False,
+            )
+            if not isinstance(fallback_applied, bool):
+                raise ValueError(
+                    f"{label}: {event_type} fallback flag is invalid"
+                )
+            records.append((event.get("sequence_id"), fallback_applied))
+        if records != expected_event_flags:
+            raise ValueError(
+                f"{label}: {event_type} fallback flags are inconsistent"
+            )
+    return {
+        "max_chars": max_chars,
+        "parent_count": fallback_count,
+        "parent_sequence_ids": fallback_ids,
+    }
+
+
 def _boundary_seconds(
     event: dict[str, Any],
     *,
@@ -440,6 +676,8 @@ def _tts_metrics(
     nmt_by_parent: dict[int, dict[str, Any]],
     pipeline_start_ms: float,
     schema: int,
+    incremental: bool,
+    fallback_parent_ids: set[int],
     label: str,
 ) -> tuple[dict[str, Any], dict[int, int]]:
     started = _event_parent_map(
@@ -578,6 +816,7 @@ def _tts_metrics(
     boundary_to_first_websocket = []
     first_to_websocket = []
     first_websocket_lead_over_full = []
+    fallback_completion_to_first_websocket = []
     for parent in range(parent_count):
         first_ws = websocket_by_parent[parent][0]
         request = started[parent]
@@ -649,29 +888,37 @@ def _tts_metrics(
         boundary_to_first_websocket.append(
             (ws_ms - pipeline_start_ms - source_end_ms) / 1_000.0
         )
-        first_to_websocket.append(
-            (ws_ms - _number(
-                first_audio.get("monotonic_ms"),
-                field="TTS first monotonic_ms",
-                label=label,
-            ))
+        first_to_websocket_seconds = (
+            (
+                ws_ms
+                - _number(
+                    first_audio.get("monotonic_ms"),
+                    field="TTS first monotonic_ms",
+                    label=label,
+                )
+            )
             / 1_000.0
         )
-        if first_to_websocket[-1] < -1e-6:
+        if first_to_websocket_seconds < -1e-6:
             raise ValueError(
                 f"{label}: WebSocket publication preceded first TTS response"
             )
-        first_websocket_lead_over_full.append(
-            (
-                _number(
-                    full_audio.get("monotonic_ms"),
-                    field="TTS full monotonic_ms",
-                    label=label,
-                )
-                - ws_ms
-            )
-            / 1_000.0
+        full_audio_ms = _number(
+            full_audio.get("monotonic_ms"),
+            field="TTS full monotonic_ms",
+            label=label,
         )
+        lead_seconds = (full_audio_ms - ws_ms) / 1_000.0
+        if incremental and parent in fallback_parent_ids:
+            if lead_seconds > 1e-6:
+                raise ValueError(
+                    f"{label}: atomic fallback frame was published before "
+                    "TTS completion"
+                )
+            fallback_completion_to_first_websocket.append(-lead_seconds)
+        else:
+            first_to_websocket.append(first_to_websocket_seconds)
+            first_websocket_lead_over_full.append(lead_seconds)
 
     return (
         {
@@ -685,11 +932,28 @@ def _tts_metrics(
             ),
             "request_to_full_response_seconds": _distribution(request_to_full),
             "first_to_full_response_seconds": _distribution(first_to_full),
-            "first_response_to_first_websocket_seconds": _distribution(
+            "first_response_to_first_websocket_seconds": (
+                _optional_distribution(
                 first_to_websocket
+                )
             ),
-            "first_websocket_lead_over_full_response_seconds": _distribution(
+            "first_websocket_lead_over_full_response_seconds": (
+                _optional_distribution(
                 first_websocket_lead_over_full
+                )
+            ),
+            "direct_incremental_parent_count": (
+                parent_count - len(fallback_parent_ids)
+                if incremental
+                else 0
+            ),
+            "excluded_atomic_fallback_parent_count": (
+                len(fallback_parent_ids) if incremental else 0
+            ),
+            "atomic_fallback_completion_to_first_websocket_seconds": (
+                _optional_distribution(
+                    fallback_completion_to_first_websocket
+                )
             ),
             "source_boundary_to_request_seconds": _distribution(
                 boundary_to_request
@@ -838,6 +1102,22 @@ def _load_arm(
         raise ValueError(f"{arm_name}: emitted parent count mismatch")
     if staged.get("completed_sequence_ids") != list(range(parent_count)):
         raise ValueError(f"{arm_name}: completed parent IDs mismatch")
+    fallback = (
+        _fallback_metadata(
+            staged,
+            config,
+            events,
+            parent_count=parent_count,
+            incremental=incremental,
+            label=arm_name,
+        )
+        if incremental
+        else {
+            "max_chars": 0,
+            "parent_count": 0,
+            "parent_sequence_ids": [],
+        }
+    )
 
     tts, completed_bytes = _tts_metrics(
         staged,
@@ -846,6 +1126,8 @@ def _load_arm(
         nmt_by_parent=nmt_by_parent,
         pipeline_start_ms=pipeline_start_ms,
         schema=schema,
+        incremental=incremental,
+        fallback_parent_ids=set(fallback["parent_sequence_ids"]),
         label=arm_name,
     )
     received_bytes = _integer(
@@ -906,6 +1188,8 @@ def _load_arm(
         "arm": arm_name,
         "telemetry_schema_version": schema,
         "incremental_publication_enabled": incremental,
+        "incremental_atomic_fallback_max_chars": fallback["max_chars"],
+        "incremental_atomic_fallback_parent_count": fallback["parent_count"],
         "parent_translation_calls": parent_count,
         "audio_messages": audio_messages,
         "input_duration_seconds": input_seconds,
@@ -961,6 +1245,19 @@ def _difference(
     }
 
 
+def _optional_difference(
+    atomic: float | None,
+    streaming: float | None,
+) -> dict[str, float | None]:
+    if atomic is None or streaming is None:
+        return {
+            "streaming_minus_atomic": None,
+            "reduction": None,
+            "reduction_percent": None,
+        }
+    return _difference(atomic, streaming)
+
+
 def build_canary_summary(input_dir: Path) -> dict[str, Any]:
     """Load both arms, fail closed on matching, and return safe aggregates."""
 
@@ -983,6 +1280,16 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
         for arm_name, schema, incremental in ARMS
     ]
     atomic, streaming = loaded
+    expected_fallback_max_chars = int(
+        run_info.get("incremental_atomic_fallback_max_chars", "0")
+    )
+    if (
+        streaming["incremental_atomic_fallback_max_chars"]
+        != expected_fallback_max_chars
+    ):
+        raise ValueError(
+            "streaming: fallback threshold does not match run_info"
+        )
     atomic_match = atomic["_match"]
     streaming_match = streaming["_match"]
     if atomic_match["input_reference"] != streaming_match["input_reference"]:
@@ -1035,9 +1342,25 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
             atomic["tts"]["source_boundary_to_first_websocket_seconds"]["p95"],
             streaming["tts"]["source_boundary_to_first_websocket_seconds"]["p95"],
         ),
-        "first_response_withheld_p95": _difference(
-            atomic["tts"]["first_response_to_first_websocket_seconds"]["p95"],
-            streaming["tts"]["first_response_to_first_websocket_seconds"]["p95"],
+        "first_response_withheld_p95": _optional_difference(
+            (
+                atomic["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ]["p95"]
+                if atomic["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ]
+                else None
+            ),
+            (
+                streaming["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ]["p95"]
+                if streaming["tts"][
+                    "first_response_to_first_websocket_seconds"
+                ]
+                else None
+            ),
         ),
         "tts_request_to_first_response_p95": _difference(
             atomic["tts"]["request_to_first_response_seconds"]["p95"],
@@ -1127,6 +1450,10 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
                 "asr_final_structure_matched": True,
                 "parent_segmentation_matched": True,
                 "nmt_parent_structure_matched": True,
+                "incremental_atomic_fallback_threshold_matched": True,
+                "incremental_atomic_fallback_max_chars": (
+                    expected_fallback_max_chars
+                ),
                 "intended_backend_config_differences": list(
                     INTENDED_CONFIG_DIFFERENCES
                 ),
@@ -1162,7 +1489,23 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
                 ),
             },
             "primary_incremental_evidence": {
+                "available": (
+                    streaming["tts"]["direct_incremental_parent_count"] > 0
+                ),
                 "classification": "within_arm_direct_measurement",
+                "included_direct_incremental_parent_count": (
+                    streaming["tts"]["direct_incremental_parent_count"]
+                ),
+                "excluded_atomic_fallback_parent_count": streaming["tts"][
+                    "excluded_atomic_fallback_parent_count"
+                ],
+                "unavailable_reason": (
+                    None
+                    if streaming["tts"][
+                        "direct_incremental_parent_count"
+                    ]
+                    else "all_schema_v3_parents_used_atomic_fallback"
+                ),
                 "first_response_to_first_websocket_seconds": streaming["tts"][
                     "first_response_to_first_websocket_seconds"
                 ],
@@ -1171,7 +1514,8 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
                 ]["first_websocket_lead_over_full_response_seconds"],
                 "interpretation": (
                     "Positive full-response lead means schema 3 published "
-                    "the first PCM before the TTS RPC completed."
+                    "the first PCM before the TTS RPC completed. Atomic "
+                    "fallback parents are excluded."
                 ),
             },
             "interpretation": {
@@ -1210,17 +1554,14 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "Cross-arm playback metrics are descriptive matched-workload results; "
         "they are not an automatic promotion decision."
     )
-    lines = [
-        "# Matched Incremental TTS Publication Canary",
-        "",
-        "The source prefix, model provenance, ASR-final structure, parent "
-        "segmentation, NMT parent structure, and playback policy matched.",
-        "",
-        warning,
-        "",
-        "Direct within-arm schema-3 result: first PCM reached the WebSocket "
-        "{delay} after the first TTS response (p95) and {lead} before the full "
-        "TTS response completed (p95; positive means earlier publication).".format(
+    if primary["available"]:
+        primary_statement = (
+            "Direct within-arm schema-3 result: first PCM reached the "
+            "WebSocket {delay} after the first TTS response (p95) and "
+            "{lead} before the full TTS response completed (p95; positive "
+            "means earlier publication). Excluded {excluded} atomic-"
+            "fallback parent(s)."
+        ).format(
             delay=_seconds(
                 primary["first_response_to_first_websocket_seconds"]["p95"]
             ),
@@ -1229,7 +1570,24 @@ def render_markdown(summary: dict[str, Any]) -> str:
                     "first_websocket_lead_over_full_response_seconds"
                 ]["p95"]
             ),
-        ),
+            excluded=primary["excluded_atomic_fallback_parent_count"],
+        )
+    else:
+        primary_statement = (
+            "Direct within-arm schema-3 benefit is unavailable because all "
+            f"{primary['excluded_atomic_fallback_parent_count']} parent(s) "
+            "used the short-parent atomic fallback. Audience-facing metrics "
+            "still include them."
+        )
+    lines = [
+        "# Matched Incremental TTS Publication Canary",
+        "",
+        "The source prefix, model provenance, ASR-final structure, parent "
+        "segmentation, NMT parent structure, and playback policy matched.",
+        "",
+        warning,
+        "",
+        primary_statement,
         "",
         "| Metric | Atomic | Incremental | Incremental benefit |",
         "|---|---:|---:|---:|",
@@ -1265,14 +1623,20 @@ def render_markdown(summary: dict[str, Any]) -> str:
         ),
         "| TTS first response withheld (p95) | {a} | {s} | {b} |".format(
             a=_seconds(
-                atomic["tts"][
-                    "first_response_to_first_websocket_seconds"
-                ]["p95"]
+                (
+                    atomic["tts"][
+                        "first_response_to_first_websocket_seconds"
+                    ]
+                    or {}
+                ).get("p95")
             ),
             s=_seconds(
-                streaming["tts"][
-                    "first_response_to_first_websocket_seconds"
-                ]["p95"]
+                (
+                    streaming["tts"][
+                        "first_response_to_first_websocket_seconds"
+                    ]
+                    or {}
+                ).get("p95")
             ),
             b=_seconds(
                 comparison["first_response_withheld_p95"]["reduction"]

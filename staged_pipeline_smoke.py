@@ -118,6 +118,10 @@ def _resolved_config() -> StagedPipelineConfig:
         tts_incremental_frame_ms=(
             staged_pipeline_config.tts_incremental_frame_ms
         ),
+        tts_incremental_atomic_fallback_max_chars=(
+            staged_pipeline_config
+            .tts_incremental_atomic_fallback_max_chars
+        ),
         tts_subsegment_max_chars=(
             staged_pipeline_config.tts_subsegment_max_chars
         ),
@@ -180,6 +184,10 @@ async def run(args: argparse.Namespace) -> int:
             ),
             incremental_frame_ms=(
                 staged_pipeline_config.tts_incremental_frame_ms
+            ),
+            incremental_atomic_fallback_max_chars=(
+                staged_pipeline_config
+                .tts_incremental_atomic_fallback_max_chars
             ),
         ),
         target_language=args.target_language,

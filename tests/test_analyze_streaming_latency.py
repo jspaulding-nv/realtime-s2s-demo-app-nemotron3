@@ -540,6 +540,68 @@ def write_schema_v3_summary(path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def apply_schema_v3_fallback(
+    path,
+    *,
+    threshold=4,
+    fallback_parent_ids=(1,),
+    text_chars=None,
+):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    staged = payload["staged_pipeline"]
+    text_chars = text_chars or {0: 10, 1: 3}
+    fallback_ids = list(fallback_parent_ids)
+    fallback_set = set(fallback_ids)
+    payload["backend_config"]["stagedConfig"] = {
+        "ttsIncrementalAtomicFallbackMaxChars": threshold,
+    }
+    staged.update(
+        {
+            "tts_incremental_atomic_fallback_max_chars": threshold,
+            "tts_incremental_atomic_fallback_parent_count": len(
+                fallback_ids
+            ),
+            "tts_incremental_atomic_fallback_parent_sequence_ids": (
+                fallback_ids
+            ),
+        }
+    )
+    for field in (
+        "produced_parent_summaries",
+        "completed_parent_summaries",
+        "websocket_completed_parent_summaries",
+    ):
+        for summary in staged[field]:
+            summary["atomic_fallback_applied"] = (
+                summary["parent_sequence_id"] in fallback_set
+            )
+    completion_times = {}
+    for event in staged["events"]:
+        event_type = (event["stage"], event["event"])
+        parent = event.get("sequence_id")
+        if event_type == ("tts", "started"):
+            event["text_chars"] = text_chars[parent]
+        if event_type in {
+            ("tts", "completed"),
+            ("output", "parent_complete_enqueued"),
+            ("output", "parent_complete_dequeued"),
+        }:
+            event["atomic_fallback_applied"] = parent in fallback_set
+        if event_type == ("tts", "completed"):
+            completion_times[parent] = event["monotonic_ms"]
+    next_send_times = {0: [2310.0, 2320.0], 1: [3510.0]}
+    parent_frame_index = {0: 0, 1: 0}
+    for event in staged["websocket_send_events"]:
+        parent = event["parent_sequence_id"]
+        if parent not in fallback_set:
+            continue
+        index = parent_frame_index[parent]
+        event["sent_monotonic_ms"] = next_send_times[parent][index]
+        parent_frame_index[parent] += 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return completion_times
+
+
 def add_response_chunk_sidecar(path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     staged = payload["staged_pipeline"]
@@ -827,6 +889,8 @@ def test_schema_v3_quantifies_incremental_first_publish_benefit(tmp_path):
         "tts_first_response_to_websocket_send_seconds"
     ] is None
     assert incremental["available"] is True
+    assert incremental["atomic_fallback_parent_count"] == 0
+    assert incremental["direct_incremental_parent_count"] == 2
     assert incremental["cross_arm_audio_duration_comparison"] is False
     assert "same generated PCM" in incremental["comparison_basis"]
     assert incremental["parent_count"] == 2
@@ -859,6 +923,113 @@ def test_schema_v3_quantifies_incremental_first_publish_benefit(tmp_path):
     assert "Incremental TTS publication (schema v3)" in markdown
     assert "Atomic withholding equivalent" in markdown
     assert PRIVATE_MARKER not in markdown
+
+
+def test_schema_v3_mixed_fallback_excludes_only_fallback_from_direct_metrics(
+    tmp_path,
+):
+    path = tmp_path / "mixed_fallback_summary.json"
+    write_schema_v3_summary(path)
+    apply_schema_v3_fallback(path)
+
+    analysis = analyze_paths([path])
+    aggregate = analysis["aggregate"]
+    incremental = aggregate["incremental_tts_publication"]
+
+    assert incremental["available"] is True
+    assert incremental["total_schema_v3_parent_count"] == 2
+    assert incremental["direct_incremental_parent_count"] == 1
+    assert incremental["atomic_fallback_parent_count"] == 1
+    assert incremental["excluded_atomic_fallback_parent_count"] == 1
+    assert incremental[
+        "tts_first_response_to_first_websocket_send_seconds"
+    ]["observation_count"] == 1
+    assert incremental[
+        "tts_first_response_to_first_websocket_send_seconds"
+    ]["p50"] == 0.08
+    assert incremental[
+        "first_publish_lead_over_tts_completion_seconds"
+    ]["p50"] == 0.22
+    assert aggregate["counts"]["websocket_audio_frames"] == 3
+    assert aggregate["counts"]["atomic_fallback_parents"] == 1
+    assert aggregate["parent_level"][
+        "source_boundary_to_first_websocket_send_seconds"
+    ]["p95"] == 1.01
+    assert "Excluded 1 atomic-fallback parent" in render_markdown(analysis)
+
+
+def test_schema_v3_all_fallback_returns_null_direct_metrics(tmp_path):
+    path = tmp_path / "all_fallback_summary.json"
+    write_schema_v3_summary(path)
+    apply_schema_v3_fallback(
+        path,
+        threshold=10,
+        fallback_parent_ids=(0, 1),
+        text_chars={0: 4, 1: 3},
+    )
+
+    analysis = analyze_paths([path])
+    incremental = analysis["aggregate"]["incremental_tts_publication"]
+
+    assert incremental["available"] is False
+    assert (
+        incremental["unavailable_reason"]
+        == "all_schema_v3_parents_used_atomic_fallback"
+    )
+    assert incremental["direct_incremental_parent_count"] == 0
+    assert incremental["atomic_fallback_parent_count"] == 2
+    assert incremental[
+        "tts_first_response_to_first_websocket_send_seconds"
+    ] is None
+    assert incremental[
+        "first_publish_lead_over_tts_completion_seconds"
+    ] is None
+    assert analysis["aggregate"]["parent_level"][
+        "source_boundary_to_first_websocket_send_seconds"
+    ]["observation_count"] == 2
+    assert "Direct incremental benefit is unavailable" in render_markdown(
+        analysis
+    )
+
+
+def test_schema_v3_rejects_fallback_threshold_mismatch(tmp_path):
+    path = tmp_path / "fallback_threshold_summary.json"
+    write_schema_v3_summary(path)
+    apply_schema_v3_fallback(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["backend_config"]["stagedConfig"][
+        "ttsIncrementalAtomicFallbackMaxChars"
+    ] = 5
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="threshold does not match"):
+        analyze_paths([path])
+
+
+def test_schema_v3_rejects_fallback_text_policy_mismatch(tmp_path):
+    path = tmp_path / "fallback_policy_summary.json"
+    write_schema_v3_summary(path)
+    apply_schema_v3_fallback(path, text_chars={0: 10, 1: 5})
+
+    with pytest.raises(ValueError, match="text threshold"):
+        analyze_paths([path])
+
+
+def test_schema_v3_rejects_fallback_publish_before_completion(tmp_path):
+    path = tmp_path / "fallback_early_publish_summary.json"
+    write_schema_v3_summary(path)
+    completion_times = apply_schema_v3_fallback(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    fallback_send = next(
+        event
+        for event in payload["staged_pipeline"]["websocket_send_events"]
+        if event["parent_sequence_id"] == 1
+    )
+    fallback_send["sent_monotonic_ms"] = completion_times[1] - 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="published before TTS completion"):
+        analyze_paths([path])
 
 
 def test_schema_v3_preserves_response_chunk_diagnostic(tmp_path):

@@ -211,6 +211,7 @@ def incremental_parent_complete(
     audio_bytes,
     *,
     retry_count=0,
+    atomic_fallback_applied=False,
 ):
     return SimpleNamespace(
         kind=StagedOutputEventKind.PARENT_COMPLETE,
@@ -219,6 +220,7 @@ def incremental_parent_complete(
             audio_frame_count=audio_frame_count,
             audio_bytes=audio_bytes,
             retry_count=retry_count,
+            atomic_fallback_applied=atomic_fallback_applied,
         ),
     )
 
@@ -229,6 +231,7 @@ class FakeIncrementalStagedPipeline(FakeStagedPipeline):
     def __init__(self):
         super().__init__()
         self.config.tts_incremental_publish_enabled = True
+        self.config.tts_incremental_atomic_fallback_max_chars = 4
         self.published_audio_frame_keys = []
         self.published_audio_frame_bytes = []
         self.dequeued_audio_frame_keys = []
@@ -252,6 +255,9 @@ class FakeIncrementalStagedPipeline(FakeStagedPipeline):
                 "audio_frame_count": completion.audio_frame_count,
                 "audio_bytes": completion.audio_bytes,
                 "retry_count": completion.retry_count,
+                "atomic_fallback_applied": (
+                    completion.atomic_fallback_applied
+                ),
             }
             self.produced_parent_summaries.append(summary)
             self.completed_parent_summaries.append(dict(summary))
@@ -270,9 +276,21 @@ class FakeIncrementalStagedPipeline(FakeStagedPipeline):
                 for parent_sequence_id, audio_frame_id in keys
             ]
 
+        fallback_parent_ids = [
+            item["parent_sequence_id"]
+            for item in self.produced_parent_summaries
+            if item["atomic_fallback_applied"]
+        ]
         return {
             "telemetry_schema_version": 3,
             "tts_incremental_publish_enabled": True,
+            "tts_incremental_atomic_fallback_max_chars": 4,
+            "tts_incremental_atomic_fallback_parent_count": len(
+                fallback_parent_ids
+            ),
+            "tts_incremental_atomic_fallback_parent_sequence_ids": list(
+                fallback_parent_ids
+            ),
             "state": "closed" if self.closed else "running",
             "outcome": "complete",
             "cleanup_errors": [],
@@ -333,7 +351,14 @@ async def test_schema_v3_frames_are_sent_fifo_and_parent_complete_has_no_wire_by
     await pipeline.outputs.put(incremental_audio_frame(0, 1, b"bbbb"))
     await pipeline.outputs.put(incremental_parent_complete(0, 2, 6))
     await pipeline.outputs.put(incremental_audio_frame(1, 0, b"cc"))
-    await pipeline.outputs.put(incremental_parent_complete(1, 1, 2))
+    await pipeline.outputs.put(
+        incremental_parent_complete(
+            1,
+            1,
+            2,
+            atomic_fallback_applied=True,
+        )
+    )
     await pipeline.outputs.put(
         SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
     )
@@ -349,14 +374,25 @@ async def test_schema_v3_frames_are_sent_fifo_and_parent_complete_has_no_wire_by
             "audio_frame_count": 2,
             "audio_bytes": 6,
             "retry_count": 0,
+            "atomic_fallback_applied": False,
         },
         {
             "parent_sequence_id": 1,
             "audio_frame_count": 1,
             "audio_bytes": 2,
             "retry_count": 0,
+            "atomic_fallback_applied": True,
         },
     ]
+    snapshot = session.staged_telemetry_snapshot()
+    assert snapshot["tts_incremental_atomic_fallback_parent_count"] == 1
+    assert (
+        snapshot["tts_incremental_atomic_fallback_parent_sequence_ids"]
+        == [1]
+    )
+    assert snapshot["websocket_completed_parent_summaries"] == (
+        snapshot["produced_parent_summaries"]
+    )
     completed = {
         "type": "status",
         "status": "completed",
@@ -399,6 +435,7 @@ async def test_schema_v3_summary_reconciles_frames_bytes_and_parents(
             "audio_frame_count": 2,
             "audio_bytes": 6,
             "retry_count": 0,
+            "atomic_fallback_applied": False,
         }
     ]
     assert snapshot["published_audio_frame_keys"] == expected_keys
@@ -410,6 +447,11 @@ async def test_schema_v3_summary_reconciles_frames_bytes_and_parents(
     assert snapshot["produced_parent_summaries"] == expected_parent
     assert snapshot["completed_parent_summaries"] == expected_parent
     assert snapshot["websocket_completed_parent_summaries"] == expected_parent
+    assert snapshot["tts_incremental_atomic_fallback_parent_count"] == 0
+    assert (
+        snapshot["tts_incremental_atomic_fallback_parent_sequence_ids"]
+        == []
+    )
     assert snapshot["websocket_sent_sequence_ids"] == [0]
     assert [
         (
@@ -459,6 +501,46 @@ async def test_schema_v3_summary_mismatch_replaces_completion_with_error(
         for call in mock_websocket.send_json.await_args_list
         if call.args[0].get("type") == "status"
     )
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_fallback_summary_mismatch_replaces_completion_with_error(
+    mock_websocket,
+):
+    class MismatchedFallbackPipeline(FakeIncrementalStagedPipeline):
+        def summary(self, include_events=False):
+            result = super().summary(include_events=include_events)
+            result[
+                "tts_incremental_atomic_fallback_parent_count"
+            ] = 1
+            result[
+                "tts_incremental_atomic_fallback_parent_sequence_ids"
+            ] = [0]
+            return result
+
+    pipeline = MismatchedFallbackPipeline()
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 1, 2))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+
+    assert mock_websocket.send_json.await_args_list[-1].args[0] == {
+        "type": "error",
+        "message": (
+            "Staged cleanup failed: schema-3 atomic fallback summary did "
+            "not reconcile across pipeline and WebSocket"
+        ),
+    }
 
 
 @pytest.mark.asyncio

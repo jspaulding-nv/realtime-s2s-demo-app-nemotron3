@@ -152,6 +152,10 @@ async def get_config():
                     "ttsIncrementalFrameMs": (
                         staged_pipeline_config.tts_incremental_frame_ms
                     ),
+                    "ttsIncrementalAtomicFallbackMaxChars": (
+                        staged_pipeline_config
+                        .tts_incremental_atomic_fallback_max_chars
+                    ),
                 }
                 if staged_pipeline_config.tts_incremental_publish_enabled
                 else {}

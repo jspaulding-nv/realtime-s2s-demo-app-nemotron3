@@ -502,6 +502,78 @@ def successful_staged_export_v3():
     }
 
 
+def enable_atomic_fallback_v3(
+    export,
+    config,
+    *,
+    threshold=4,
+    fallback_parent_ids=(1,),
+    text_chars=None,
+):
+    text_chars = text_chars or {0: 10, 1: 3}
+    fallback_parent_ids = list(fallback_parent_ids)
+    config["stagedConfig"][
+        "ttsIncrementalAtomicFallbackMaxChars"
+    ] = threshold
+    export.update(
+        {
+            "tts_incremental_atomic_fallback_max_chars": threshold,
+            "tts_incremental_atomic_fallback_parent_count": len(
+                fallback_parent_ids
+            ),
+            "tts_incremental_atomic_fallback_parent_sequence_ids": list(
+                fallback_parent_ids
+            ),
+        }
+    )
+    fallback_set = set(fallback_parent_ids)
+    for field in (
+        "produced_parent_summaries",
+        "completed_parent_summaries",
+        "websocket_completed_parent_summaries",
+    ):
+        for summary in export[field]:
+            summary["atomic_fallback_applied"] = (
+                summary["parent_sequence_id"] in fallback_set
+            )
+    completion_times = {0: 1000.0, 1: 1002.0}
+    for event in export["events"]:
+        parent = event.get("sequence_id")
+        event_type = (event.get("stage"), event.get("event"))
+        if event_type in {
+            ("tts", "completed"),
+            ("output", "parent_complete_enqueued"),
+            ("output", "parent_complete_dequeued"),
+        }:
+            event["atomic_fallback_applied"] = parent in fallback_set
+        if event_type == ("tts", "completed"):
+            event["monotonic_ms"] = completion_times[parent]
+        if (
+            parent in fallback_set
+            and event_type
+            in {
+                ("tts", "frame_received"),
+                ("output", "frame_enqueued"),
+                ("output", "frame_dequeued"),
+            }
+        ):
+            event["monotonic_ms"] = (
+                completion_times[parent]
+                + 0.1
+                + event["audio_frame_id"] * 0.1
+            )
+    export["events"].extend(
+        {
+            "stage": "tts",
+            "event": "started",
+            "sequence_id": parent,
+            "text_chars": chars,
+        }
+        for parent, chars in sorted(text_chars.items())
+    )
+    return completion_times
+
+
 def successful_websocket_receive_events_v3():
     return [
         {
@@ -684,6 +756,101 @@ def test_staged_integrity_accepts_schema_v3_incremental_frame_lifecycle():
     )
 
     assert errors == []
+
+
+def test_staged_integrity_v3_accepts_mixed_atomic_fallback():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    enable_atomic_fallback_v3(export, config)
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_v3_legacy_omission_means_no_fallback():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert errors == []
+    assert not any("fallback" in error for error in errors)
+
+
+def test_staged_integrity_v3_rejects_fallback_threshold_mismatch():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    enable_atomic_fallback_v3(export, config)
+    config["stagedConfig"][
+        "ttsIncrementalAtomicFallbackMaxChars"
+    ] = 5
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("fallback_max_chars must match" in error for error in errors)
+
+
+def test_staged_integrity_v3_rejects_fallback_policy_mismatch():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    enable_atomic_fallback_v3(
+        export,
+        config,
+        text_chars={0: 10, 1: 5},
+    )
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "must exactly match the configured tts/started text_chars threshold"
+        in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_fallback_publish_before_completion():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    completion_times = enable_atomic_fallback_v3(export, config)
+    fallback_send = next(
+        event
+        for event in export["websocket_send_events"]
+        if event["parent_sequence_id"] == 1
+    )
+    fallback_send["sent_monotonic_ms"] = completion_times[1] - 0.1
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "WebSocket frame was published before TTS completion" in error
+        for error in errors
+    )
 
 
 def test_staged_integrity_rejects_identity_free_positive_audio_dequeue():

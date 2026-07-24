@@ -508,6 +508,8 @@ class SynthesizedStreamCompletion:
     completed_monotonic_ms: float
     retry_count: int = 0
     response_chunks: Tuple[TTSResponseChunkMetric, ...] = ()
+    # Appended after the existing schema-3 fields to preserve positional use.
+    atomic_fallback_applied: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.translation, TranslatedSegment):
@@ -547,6 +549,8 @@ class SynthesizedStreamCompletion:
             or self.retry_count not in {0, 1}
         ):
             raise ValueError("retry_count must be zero or one")
+        if not isinstance(self.atomic_fallback_applied, bool):
+            raise ValueError("atomic_fallback_applied must be a boolean")
         if not isinstance(self.response_chunks, tuple):
             raise ValueError("response_chunks must be a tuple")
         cumulative_audio_bytes = 0
@@ -640,6 +644,7 @@ class SynthesizedStreamCompletion:
             "processing_duration_ms": self.processing_duration_ms,
             "first_audio_latency_ms": self.first_audio_latency_ms,
             "retry_count": self.retry_count,
+            "atomic_fallback_applied": self.atomic_fallback_applied,
         }
         if self.response_chunks:
             payload["response_chunks"] = [
@@ -772,6 +777,7 @@ class PipelineEvent:
     # Appended after the legacy fields to preserve positional construction.
     audio_frame_id: Optional[int] = None
     audio_frame_count: Optional[int] = None
+    atomic_fallback_applied: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -840,6 +846,11 @@ class PipelineEvent:
             and self.sequence_id is None
         ):
             raise ValueError("audio frame identity requires a sequence_id")
+        if (
+            self.atomic_fallback_applied is not None
+            and not isinstance(self.atomic_fallback_applied, bool)
+        ):
+            raise ValueError("atomic_fallback_applied must be a boolean")
         if self.parent_text_chars is not None and (
             not isinstance(self.parent_text_chars, int)
             or isinstance(self.parent_text_chars, bool)
@@ -868,6 +879,8 @@ class PipelineEvent:
             payload.pop("audio_frame_id")
         if self.audio_frame_count is None:
             payload.pop("audio_frame_count")
+        if self.atomic_fallback_applied is None:
+            payload.pop("atomic_fallback_applied")
         if self.emission_reason is not None:
             payload["emission_reason"] = self.emission_reason.value
         return payload

@@ -29,7 +29,9 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
-- Default-off schema-v3 incremental TTS publication with 100 ms PCM framing, bounded backpressure, and pre-commit-only retry
+- Default-off schema-v3 incremental TTS publication with 100 ms PCM framing,
+  bounded backpressure, pre-commit-only retry, and a tiny-target atomic
+  reliability fallback
 - A matched atomic-versus-incremental canary with same-audio publication timing and explicit stochastic-output confounding checks
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
@@ -342,6 +344,7 @@ STAGED_TTS_MAX_RETRIES=1
 STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=0
 STAGED_TTS_INCREMENTAL_PUBLISH=0
 STAGED_TTS_INCREMENTAL_FRAME_MS=100
+STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS=4
 STAGED_TTS_SUBSEGMENT_MAX_CHARS=0
 STAGED_TTS_SUBSEGMENT_MIN_CHARS=12
 STAGED_CLOSE_TIMEOUT_SECONDS=10
@@ -647,7 +650,10 @@ calls. The comparator therefore does not require cross-arm byte equality and
 does not automatically attribute queue or listener-tail differences to
 publication mode. Its primary causal measurement is within the schema-v3 arm:
 how much earlier each parent's first frame was sent than that same parent's
-TTS completion. See the
+TTS completion. Validated targets of four characters or fewer use a narrow
+atomic fallback so the known intermittent Magpie `UNKNOWN` shape can still
+retry before any PCM is published; those parents remain in audience metrics
+but are excluded from the direct incremental-lead distribution. See the
 [incremental publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md).
 
 Detailed guides:

@@ -271,6 +271,7 @@ def test_incremental_reframes_variable_responses_and_preserves_exact_pcm():
     assert completion.started_monotonic_ms == 100
     assert completion.first_audio_monotonic_ms == 110
     assert completion.completed_monotonic_ms == 140
+    assert completion.atomic_fallback_applied is False
     assert [
         (
             chunk.response_index,
@@ -284,6 +285,171 @@ def test_incremental_reframes_variable_responses_and_preserves_exact_pcm():
         (1, 2_600, 3_600, 120),
         (2, 3_000, 6_600, 130),
     ]
+
+
+def test_incremental_short_target_retries_privately_then_frames_only_success():
+    failed_audio = b"\x01\x02" * 3_200
+    successful_audio = b"\x03\x04" * 3_300
+    first = FailingAfterResponses(
+        [Response(failed_audio)],
+        grpc.StatusCode.UNKNOWN,
+    )
+    service = AttemptService(
+        [first, iter([Response(successful_audio)])]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        capture_response_chunk_metrics=True,
+        incremental_atomic_fallback_max_chars=4,
+        clock_ms=MagicMock(
+            side_effect=(100, 110, 120, 130, 140)
+        ),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    completion = client.synthesize_incremental(
+        translated_segment(text="A."),
+        frames.append,
+    )
+
+    assert len(service.calls) == 2
+    assert first.cancelled is True
+    assert [len(frame.audio) for frame in frames] == [3_200, 3_200, 200]
+    assert [frame.audio_frame_id for frame in frames] == [0, 1, 2]
+    assert [frame.retry_count for frame in frames] == [1, 1, 1]
+    assert [frame.received_monotonic_ms for frame in frames] == [
+        140,
+        140,
+        140,
+    ]
+    assert b"".join(frame.audio for frame in frames) == successful_audio
+    assert failed_audio not in b"".join(frame.audio for frame in frames)
+    assert completion.audio_frame_count == 3
+    assert completion.audio_bytes == len(successful_audio)
+    assert completion.started_monotonic_ms == 100
+    assert completion.first_audio_monotonic_ms == 130
+    assert completion.completed_monotonic_ms == 140
+    assert completion.retry_count == 1
+    assert completion.atomic_fallback_applied is True
+    assert [
+        (
+            chunk.audio_bytes,
+            chunk.cumulative_audio_bytes,
+            chunk.received_monotonic_ms,
+            chunk.retry_count,
+        )
+        for chunk in completion.response_chunks
+    ] == [(6_600, 6_600, 130, 1)]
+
+
+def test_incremental_atomic_fallback_uses_normalized_trimmed_target_length():
+    service = RecordingService([Response(b"\x01\x02" * 1_600)])
+    client = DirectTTSClient(
+        incremental_atomic_fallback_max_chars=3,
+        clock_ms=MagicMock(side_effect=(100, 110, 120)),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    completion = client.synthesize_incremental(
+        translated_segment(text="  Si\u0301.  "),
+        frames.append,
+    )
+
+    assert service.calls[0]["text"] == "Sí."
+    assert completion.atomic_fallback_applied is True
+    assert [frame.received_monotonic_ms for frame in frames] == [120]
+
+
+def test_incremental_target_above_atomic_fallback_limit_remains_live():
+    first = FailingAfterResponses(
+        [Response(b"\x01\x02" * 1_600)],
+        grpc.StatusCode.UNKNOWN,
+    )
+    service = AttemptService(
+        [first, iter([Response(b"\x03\x04" * 1_600)])]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        incremental_atomic_fallback_max_chars=4,
+        clock_ms=MagicMock(side_effect=(100, 110)),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    with pytest.raises(DirectTTSPartialStreamError):
+        client.synthesize_incremental(
+            translated_segment(text="Hola."),
+            frames.append,
+        )
+
+    assert len(service.calls) == 1
+    assert [frame.audio_frame_id for frame in frames] == [0]
+
+
+def test_zero_atomic_fallback_limit_leaves_short_target_incremental():
+    first = FailingAfterResponses(
+        [Response(b"\x01\x02" * 1_600)],
+        grpc.StatusCode.UNKNOWN,
+    )
+    service = AttemptService(
+        [first, iter([Response(b"\x03\x04" * 1_600)])]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        incremental_atomic_fallback_max_chars=0,
+        clock_ms=MagicMock(side_effect=(100, 110)),
+    )
+    client._connected = True
+    client._service = service
+    frames = []
+
+    with pytest.raises(DirectTTSPartialStreamError):
+        client.synthesize_incremental(
+            translated_segment(text="A."),
+            frames.append,
+        )
+
+    assert len(service.calls) == 1
+    assert [frame.audio_frame_id for frame in frames] == [0]
+
+
+def test_atomic_fallback_publisher_failure_after_ack_never_retries_or_replays():
+    service = AttemptService(
+        [
+            iter([Response(b"\x01\x02" * 3_200)]),
+            iter([Response(b"\x03\x04" * 1_600)]),
+        ]
+    )
+    client = DirectTTSClient(
+        max_retries=1,
+        incremental_atomic_fallback_max_chars=4,
+        clock_ms=MagicMock(side_effect=(100, 110, 120)),
+    )
+    client._connected = True
+    client._service = service
+    committed = []
+
+    def publish(frame):
+        if frame.audio_frame_id == 1:
+            raise RuntimeError("publisher stopped")
+        committed.append(frame)
+
+    with pytest.raises(DirectTTSPartialStreamError) as failure:
+        client.synthesize_incremental(
+            translated_segment(text="A."),
+            publish,
+        )
+
+    assert len(service.calls) == 1
+    assert [frame.audio_frame_id for frame in committed] == [0]
+    assert failure.value.committed_frame_count == 1
+    assert failure.value.committed_audio_bytes == 3_200
+    assert failure.value.retry_count == 0
 
 
 def test_incremental_exact_frame_multiple_does_not_publish_empty_tail():
@@ -903,6 +1069,14 @@ def test_audio_format_validation(kwargs, message):
         ),
         ({"incremental_frame_ms": 0}, "incremental_frame_ms"),
         ({"incremental_frame_ms": True}, "incremental_frame_ms"),
+        (
+            {"incremental_atomic_fallback_max_chars": -1},
+            "incremental_atomic_fallback_max_chars",
+        ),
+        (
+            {"incremental_atomic_fallback_max_chars": True},
+            "incremental_atomic_fallback_max_chars",
+        ),
     ],
 )
 def test_audio_bound_validation(kwargs, message):
