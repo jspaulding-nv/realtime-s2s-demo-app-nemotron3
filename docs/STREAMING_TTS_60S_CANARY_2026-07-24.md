@@ -154,3 +154,9 @@ all three long-form fixtures. The audience gate remains separate:
    native-language review; and
 4. treat any queue/tail comparison as causal only when generated workloads are
    comparable or when the measurement is within one generated stream.
+
+The five-minute gate subsequently passed operationally but recorded a
+17.077-second adaptive queue p95 and 27.120-second adaptive listener tail in
+the schema-3 arm. The next experiment therefore moves to an explicit hard
+freshness-cap simulation before another three-fixture matrix. See
+[Incremental TTS publication: five-minute matched canary](STREAMING_TTS_5MIN_CANARY_2026-07-24.md).

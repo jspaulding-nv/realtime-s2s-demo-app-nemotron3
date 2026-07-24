@@ -947,6 +947,30 @@ remain confounded. First audio also remained about 15.1-15.5 seconds. This is
 an operational/direct-publication pass, not an audience-delay pass. See
 [Incremental TTS publication: 60-second formal canary](STREAMING_TTS_60S_CANARY_2026-07-24.md).
 
+The next clean five-minute matched canary ran from `29cdf4e`. Both arms
+completed the same 1,000 input chunks and 74 parent structure without a model
+retry, incomplete parent, terminal failure, or cleanup error. Schema 3
+delivered 2,782 frames and again classified the two-character parent 7 as its
+only atomic fallback.
+
+Across 73 true-incremental parents, first PCM followed the first TTS response
+by 35.5 ms p50 / 46.7 ms p95 and led full TTS completion by 348.1 ms p50 /
+1.659 s p95. The direct publication benefit therefore persisted over five
+minutes. Cross-arm playback remained confounded because generated duration
+differed by 7.43%.
+
+The schema-3 arm independently missed the live-audience bound: the no-drop
+adaptive queue had a 17.077-second time-weighted p95, 23.412-second peak, and
+27.120-second listener tail. It spent 44.286 seconds above the nominal
+10-second limit even though 55.20% of source audio was accelerated and 30.69%
+played at 1.10x. First audio remained 15.196 seconds.
+
+The unchanged no-drop policy is therefore not promoted directly to another
+three-fixture matrix. The next experiment is a deterministic hard
+freshness-cap simulation over the completed schema-3 arrival trace, reporting
+the explicit fidelity cost of whole-parent eviction at 5/8/10-second caps. See
+[Incremental TTS publication: five-minute matched canary](STREAMING_TTS_5MIN_CANARY_2026-07-24.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
