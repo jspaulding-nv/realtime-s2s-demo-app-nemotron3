@@ -30,6 +30,7 @@ def staged_config():
             "nmtRpcTimeoutSeconds": 15,
             "ttsRpcTimeoutSeconds": 60,
             "ttsMaxSegmentAudioSeconds": 60,
+            "ttsMaxRetries": 1,
             "closeTimeoutSeconds": 10,
         },
     }
@@ -56,6 +57,7 @@ def successful_staged_export():
                     "stage": "tts",
                     "event": "completed",
                     "sequence_id": sequence_id,
+                    "retry_count": 0,
                 },
                 {
                     "stage": "output",
@@ -73,6 +75,7 @@ def successful_staged_export():
         "segments_emitted": 2,
         "audio_segments_produced": 2,
         "nmt_retry_count": 0,
+        "tts_retry_count": 0,
         "completed_sequence_ids": completed,
         "incomplete_sequence_ids": [],
         "failure": None,
@@ -275,6 +278,65 @@ def test_staged_integrity_accepts_and_reconciles_one_shot_nmt_recovery():
     )
 
     assert errors == []
+
+
+def test_staged_integrity_accepts_and_reconciles_one_shot_tts_recovery():
+    export = successful_staged_export()
+    tts_completed = [
+        event
+        for event in export["events"]
+        if event["stage"] == "tts" and event["event"] == "completed"
+    ]
+    tts_completed[1]["retry_count"] = 1
+    export["tts_retry_count"] = 1
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config(),
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_rejects_mismatched_tts_retry_summary():
+    export = successful_staged_export()
+    export["tts_retry_count"] = 1
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config(),
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert any(
+        "tts_retry_count must equal the sum" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_rejects_tts_retry_when_configured_off():
+    export = successful_staged_export()
+    tts_completed = [
+        event
+        for event in export["events"]
+        if event["stage"] == "tts" and event["event"] == "completed"
+    ]
+    tts_completed[0]["retry_count"] = 1
+    export["tts_retry_count"] = 1
+    config = staged_config()
+    config["stagedConfig"]["ttsMaxRetries"] = 0
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert any("TTS retry telemetry is incompatible" in error for error in errors)
 
 
 @pytest.mark.parametrize("event_retry", [-1, 2, True, None])

@@ -43,6 +43,25 @@ class StagedPipelineError(RuntimeError):
     """Raised for an invalid lifecycle or failed model stage."""
 
 
+class StagedModelTimeoutError(StagedPipelineError):
+    """Privacy-safe timeout with segment and retry-attempt attribution."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        segment: TextSegment,
+        timeout_s: float,
+        retry_count: int = 0,
+    ) -> None:
+        self.segment = segment
+        self.retry_count = retry_count if retry_count in {0, 1} else 0
+        super().__init__(
+            f"{stage.upper()} model RPC exceeded {timeout_s:.3f} seconds "
+            f"for sequence {segment.sequence_id}"
+        )
+
+
 @dataclass(frozen=True)
 class _QueuedItem:
     payload: Any
@@ -277,6 +296,11 @@ class StagedPipelineSession:
                 event.retry_count
                 for event in self._telemetry
                 if event.stage == "nmt" and event.event == "completed"
+            ),
+            "tts_retry_count": sum(
+                event.retry_count
+                for event in self._telemetry
+                if event.stage == "tts" and event.event == "completed"
             ),
             "completed_sequence_ids": list(self._consumed_sequence_ids),
             "incomplete_sequence_ids": sorted(
@@ -577,13 +601,35 @@ class StagedPipelineSession:
                     queue_residence_ms=residence_ms,
                     text_chars=len(translation.text),
                 )
-                synthesized = await self._call_blocking(
-                    self._tts_executor,
-                    self.tts_client.synthesize,
-                    translation,
-                    timeout_s=self.config.tts_rpc_timeout_s,
-                    abort=self.tts_client.disconnect,
-                )
+                timeout_retry_count = 0
+
+                def abort_tts() -> None:
+                    nonlocal timeout_retry_count
+                    value = getattr(self.tts_client, "active_retry_count", 0)
+                    timeout_retry_count = (
+                        value
+                        if isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value in {0, 1}
+                        else 0
+                    )
+                    self.tts_client.disconnect()
+
+                try:
+                    synthesized = await self._call_blocking(
+                        self._tts_executor,
+                        self.tts_client.synthesize,
+                        translation,
+                        timeout_s=self.config.tts_rpc_timeout_s,
+                        abort=abort_tts,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise StagedModelTimeoutError(
+                        stage="tts",
+                        segment=translation.segment,
+                        timeout_s=self.config.tts_rpc_timeout_s,
+                        retry_count=timeout_retry_count,
+                    ) from exc
                 if not isinstance(synthesized, SynthesizedSegment):
                     raise StagedPipelineError("TTS returned an invalid segment type")
                 if synthesized.sequence_id != translation.sequence_id:
@@ -604,6 +650,7 @@ class StagedPipelineSession:
                     audio_bytes=len(synthesized.audio),
                     audio_duration_ms=synthesized.audio_duration_ms,
                     processing_duration_ms=synthesized.processing_duration_ms,
+                    retry_count=synthesized.retry_count,
                 )
                 await self._enqueue(
                     self._output_queue,

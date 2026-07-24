@@ -137,10 +137,11 @@ class FakeNMTClient:
 
 
 class FakeTTSClient:
-    def __init__(self, delay_s=0, fail_sequence=None):
+    def __init__(self, delay_s=0, fail_sequence=None, retry_count=0):
         self.connected = True
         self.delay_s = delay_s
         self.fail_sequence = fail_sequence
+        self.retry_count = retry_count
         self.sequences = []
         self.starts = {}
         self.ends = {}
@@ -177,7 +178,41 @@ class FakeTTSClient:
             started_monotonic_ms=completed - self.delay_s * 1_000,
             first_audio_monotonic_ms=completed - self.delay_s * 500,
             completed_monotonic_ms=completed,
+            retry_count=self.retry_count,
         )
+
+
+class SyntheticTTSRetryError(RuntimeError):
+    retry_count = 1
+
+    def __init__(self, translation):
+        self.segment = translation.segment
+        super().__init__(
+            f"synthetic exhausted TTS retry for sequence {translation.sequence_id}"
+        )
+
+
+class ExhaustedRetryTTS(FakeTTSClient):
+    def synthesize(self, translation):
+        raise SyntheticTTSRetryError(translation)
+
+
+class BlockingRetryTTS(FakeTTSClient):
+    def __init__(self):
+        super().__init__()
+        self.active_retry_count = 1
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def synthesize(self, translation):
+        del translation
+        self.started.set()
+        self.cancelled.wait(timeout=2)
+        raise RuntimeError("synthetic timed-out retry cancelled")
+
+    def disconnect(self):
+        super().disconnect()
+        self.cancelled.set()
 
 
 class BlockingNMTClient(FakeNMTClient):
@@ -339,6 +374,103 @@ async def test_nmt_recovery_retry_is_observable_without_changing_order_or_tts_co
         if event["stage"] == "nmt" and event["event"] == "completed"
     ) == 1
     assert all("text" not in event for event in summary["events"])
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_atomic_tts_retry_is_observable_without_duplicate_audio():
+    tts = FakeTTSClient(retry_count=1)
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "Peace."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(),
+        session_id="tts-retry",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO,
+        StagedOutputEventKind.COMPLETE,
+    ]
+    assert tts.sequences == [0]
+    tts_completed = [
+        event
+        for event in session.telemetry
+        if event.stage == "tts" and event.event == "completed"
+    ]
+    assert len(tts_completed) == 1
+    assert tts_completed[0].sequence_id == 0
+    assert tts_completed[0].retry_count == 1
+    summary = session.summary(include_events=True)
+    assert summary["tts_retry_count"] == 1
+    assert summary["audio_segments_produced"] == 1
+    assert summary["completed_sequence_ids"] == [0]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_tts_retry_records_sequence_and_retry_without_audio():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "Peace."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=ExhaustedRetryTTS(),
+        config=config(),
+        session_id="tts-retry-failed",
+    )
+
+    await session.start()
+    session.finish_input()
+    terminal = await session.next_output(timeout_s=2)
+
+    assert terminal.kind is StagedOutputEventKind.ERROR
+    assert terminal.stage == "tts"
+    retry_error = next(
+        event
+        for event in session.telemetry
+        if event.stage == "tts" and event.event == "error"
+    )
+    assert retry_error.sequence_id == 0
+    assert retry_error.retry_count == 1
+    summary = session.summary()
+    assert summary["tts_retry_count"] == 0
+    assert summary["audio_segments_produced"] == 0
+    assert summary["completed_sequence_ids"] == []
+    assert summary["incomplete_sequence_ids"] == [0]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tts_timeout_preserves_active_sequence_and_retry_attribution():
+    tts = BlockingRetryTTS()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "Peace."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(tts_rpc_timeout_s=0.03),
+        session_id="tts-retry-timeout",
+    )
+
+    await session.start()
+    session.finish_input()
+    terminal = await session.next_output(timeout_s=1)
+
+    assert terminal.kind is StagedOutputEventKind.ERROR
+    assert terminal.stage == "tts"
+    assert tts.started.is_set()
+    assert tts.cancelled.is_set()
+    timeout_error = next(
+        event
+        for event in session.telemetry
+        if event.stage == "tts" and event.event == "error"
+    )
+    assert timeout_error.sequence_id == 0
+    assert timeout_error.retry_count == 1
+    assert timeout_error.error_code == "StagedModelTimeoutError"
+    assert session.summary()["incomplete_sequence_ids"] == [0]
     await session.aclose()
 
 
@@ -673,6 +805,8 @@ def test_staged_config_rejects_invalid_mode_and_nonpositive_limits():
         config(nmt_queue_maxsize=0)
     with pytest.raises(ValueError, match="tts_rpc_timeout_s"):
         config(tts_rpc_timeout_s=0)
+    with pytest.raises(ValueError, match="tts_max_retries"):
+        config(tts_max_retries=2)
 
 
 @pytest.mark.asyncio

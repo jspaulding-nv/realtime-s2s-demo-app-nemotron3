@@ -161,13 +161,19 @@ fails closed. Non-Latin or mixed-script letters, detached marks, symbols, and
 control/format characters also fail with sequence-scoped metadata; raw text is
 not included in the diagnostic and invalid text never reaches Magpie.
 
-The pipeline never retries an unchanged NMT or TTS payload. After a first-pass
+The pipeline never retries an unchanged NMT payload. After a first-pass
 `TargetTextValidationError`, the direct NMT adapter has exactly one narrower
 option: for exact `es-US` and a source containing 1-32 ASCII letters followed
 by one `.`, `?`, or `!`, it may make one request with only that punctuation
 removed. The original segment identity and provenance remain unchanged, and
 the second result must pass full validation before TTS. All other failures,
 including a second validation failure, remain terminal.
+
+After text has passed that boundary, the direct TTS adapter may repeat the
+same Magpie request once only for a server-side gRPC `UNKNOWN`. Each attempt
+uses a fresh private PCM buffer, both attempts share the staged RPC deadline,
+and only a complete successful attempt can reach the output queue. All other
+TTS failure classes remain single-attempt and terminal.
 
 The wider Unicode punctuation list used by the source-side segmenter above is
 only for finding ASR boundaries. It does not define what target text may cross

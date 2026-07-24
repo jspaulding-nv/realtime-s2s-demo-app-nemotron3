@@ -727,6 +727,48 @@ Runtime failures:
 Artifact locations:
 ```
 
+## July 24, 2026: intermittent short-target TTS recovery
+
+The first post-reboot provenance-frozen matrix passed preflight and then
+failed during Sample 01 at source position 39.3 seconds. Sequence 7 had a
+three-character source and validated two-character `es-US` target. NMT
+completed normally with no retry, but Magpie returned gRPC `UNKNOWN` with an
+internal Triton zero-token tensor mismatch.
+
+Retained evidence ruled out queue pressure, transport loss, GPU exhaustion,
+container restart, OOM, and a persistent service failure. The same source
+hash and sequence shape had succeeded earlier, and a direct known-good TTS
+call passed after the failure.
+
+A new privacy-safe `diagnose_short_segment.py` replayed the first 39.3 seconds
+through the production-style asynchronous ASR bridge and age-polling segmenter.
+It retains no text, path, filename, or endpoint hostname and uses only
+structural counts plus a per-run keyed HMAC whose key is discarded. The replay
+recreated sequence 7 exactly: three source characters and a validated
+two-character target. With client retry disabled, four of five exact TTS calls
+passed and one reproduced gRPC `UNKNOWN`. The adjacent-context translation
+passed five of five calls. With retry enabled, all 20 isolated calls passed and
+two recorded `client_retry_count=1`, directly exercising successful recovery
+against the live pinned service.
+
+The direct TTS adapter now permits one retry only for gRPC `UNKNOWN`, controlled
+by `STAGED_TTS_MAX_RETRIES` (`0` or `1`, default `1` for the staged path).
+Both attempts remain inside one orchestrator deadline and use separate private
+PCM buffers. Validation, cancellation, timeout, resource, format, and local
+safety failures are never retried. Successful and exhausted recovery paths
+retain sequence attribution and privacy-safe retry telemetry. Batch integrity
+reconciles `tts_retry_count` against completed TTS events.
+
+True post-NMT coalescing was intentionally deferred. It requires grouped
+synthesis units and grouped sequence accounting. The five-call context result
+is promising but does not establish a general classifier, and broadly holding
+short utterances would add avoidable audience delay. See
+[Atomic TTS recovery for an intermittent short-segment failure](TTS_SHORT_SEGMENT_RECOVERY.md).
+
+The failed `700aeec` matrix remains an immutable baseline. Because the harness
+correctly rejects cross-commit resume, the recovery must be evaluated in a
+fresh formal matrix after commit, backend restart, and preflight.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch

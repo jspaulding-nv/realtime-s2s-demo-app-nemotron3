@@ -7,6 +7,7 @@ import time
 import math
 from typing import Any, Callable, Dict, Optional
 
+import grpc
 import riva.client
 
 from config import SUPPORTED_LANGUAGES, audio_config, riva_config
@@ -17,9 +18,65 @@ from target_text_validation import validate_target_text
 class DirectTTSError(RuntimeError):
     """Raised when a direct TTS request cannot produce a complete segment."""
 
+    retry_count = 0
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        segment: Optional[Any] = None,
+    ) -> None:
+        self.segment = segment
+        self.sequence_id = (
+            segment.sequence_id if segment is not None else None
+        )
+        super().__init__(message)
+
 
 class DirectTTSCancelled(DirectTTSError):
     """Raised when client shutdown cancels an in-flight synthesis request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        segment: Optional[Any] = None,
+        retry_count: int = 0,
+    ) -> None:
+        if (
+            not isinstance(retry_count, int)
+            or isinstance(retry_count, bool)
+            or retry_count not in {0, 1}
+        ):
+            raise ValueError("retry_count must be zero or one")
+        self.retry_count = retry_count
+        super().__init__(message, segment=segment)
+
+
+class DirectTTSRetryError(DirectTTSError):
+    """Privacy-safe terminal error after the one allowed atomic retry."""
+
+    retry_count = 1
+
+    def __init__(
+        self,
+        *,
+        translation: TranslatedSegment,
+        initial_error: Exception,
+        retry_error: Exception,
+    ) -> None:
+        self.initial_status_code = _grpc_status_name(initial_error)
+        self.retry_error_code = type(retry_error).__name__
+        self.retry_status_code = _grpc_status_name(retry_error)
+        message = (
+            "Direct TTS retry failed for segment "
+            f"{translation.sequence_id}; initial_status="
+            f"{self.initial_status_code or 'unknown'}; retry_error="
+            f"{self.retry_error_code}"
+        )
+        if self.retry_status_code:
+            message += f"; retry_status={self.retry_status_code}"
+        super().__init__(message, segment=translation.segment)
 
 
 def _default_clock_ms() -> float:
@@ -47,6 +104,7 @@ class DirectTTSClient:
         bytes_per_sample: Optional[int] = None,
         max_response_chunk_bytes: int = 256 * 1024,
         max_audio_duration_s: float = 60.0,
+        max_retries: int = 0,
         language_configs: Optional[Dict[str, dict]] = None,
         clock_ms: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -95,6 +153,13 @@ class DirectTTSClient:
             raise ValueError("max_audio_duration_s must be a positive finite number")
         self.max_response_chunk_bytes = max_response_chunk_bytes
         self.max_audio_duration_s = float(max_audio_duration_s)
+        if (
+            not isinstance(max_retries, int)
+            or isinstance(max_retries, bool)
+            or max_retries not in {0, 1}
+        ):
+            raise ValueError("max_retries must be zero or one")
+        self.max_retries = max_retries
         self.max_audio_bytes = int(
             self.sample_rate_hz
             * self.channels
@@ -111,6 +176,7 @@ class DirectTTSClient:
         self._connected = False
         self._closing = False
         self._synthesis_active = False
+        self._active_retry_count = 0
         self._active_call = None
         self._lifecycle_lock = threading.RLock()
 
@@ -145,6 +211,12 @@ class DirectTTSClient:
         with self._lifecycle_lock:
             return self._connected
 
+    @property
+    def active_retry_count(self) -> int:
+        """Return the attempt count for timeout/cancellation attribution."""
+        with self._lifecycle_lock:
+            return self._active_retry_count
+
     def disconnect(self) -> None:
         """Cancel an active RPC, if any, and close the channel exactly once."""
         with self._lifecycle_lock:
@@ -173,7 +245,12 @@ class DirectTTSClient:
     def synthesize_segment(
         self, translation: TranslatedSegment
     ) -> SynthesizedSegment:
-        """Return one atomically collected PCM segment for ``translation``."""
+        """Return one atomically collected PCM segment for ``translation``.
+
+        A configured retry is attempted only for a server-side gRPC UNKNOWN.
+        Every attempt owns a fresh private PCM buffer. The caller therefore
+        receives exactly one complete successful attempt or one exception.
+        """
         if not isinstance(translation, TranslatedSegment):
             raise TypeError("translation must be a TranslatedSegment")
         text = validate_target_text(
@@ -191,15 +268,92 @@ class DirectTTSClient:
             if self._synthesis_active:
                 raise RuntimeError("a direct TTS synthesis is already active")
             self._synthesis_active = True
+            self._active_retry_count = 0
             service = self._service
 
+        initial_error = None
+        overall_started_ms = None
+        retry_count = 0
+        try:
+            while True:
+                with self._lifecycle_lock:
+                    self._active_retry_count = retry_count
+                    if (
+                        self._closing
+                        or not self._connected
+                        or self._service is not service
+                    ):
+                        raise DirectTTSCancelled(
+                            "Direct TTS client disconnected before synthesis "
+                            "attempt",
+                            segment=translation.segment,
+                            retry_count=retry_count,
+                        )
+                try:
+                    attempt_started_ms = self._clock_ms()
+                except Exception as exc:
+                    clock_error = DirectTTSError(
+                        "Direct TTS synthesis failed for segment "
+                        f"{translation.sequence_id}: timing clock failed",
+                        segment=translation.segment,
+                    )
+                    if initial_error is not None:
+                        raise DirectTTSRetryError(
+                            translation=translation,
+                            initial_error=initial_error,
+                            retry_error=clock_error,
+                        ) from exc
+                    raise clock_error from exc
+                if overall_started_ms is None:
+                    overall_started_ms = attempt_started_ms
+                try:
+                    return self._synthesize_once(
+                        service=service,
+                        translation=translation,
+                        text=text,
+                        voice_name=voice_name,
+                        overall_started_ms=overall_started_ms,
+                        retry_count=retry_count,
+                    )
+                except DirectTTSCancelled:
+                    raise
+                except DirectTTSError as exc:
+                    if (
+                        initial_error is None
+                        and self.max_retries == 1
+                        and _is_retryable_unknown(exc)
+                    ):
+                        initial_error = exc
+                        retry_count = 1
+                        continue
+                    if initial_error is not None:
+                        raise DirectTTSRetryError(
+                            translation=translation,
+                            initial_error=initial_error,
+                            retry_error=exc,
+                        ) from exc
+                    raise
+        finally:
+            with self._lifecycle_lock:
+                self._synthesis_active = False
+                self._active_retry_count = 0
+
+    def _synthesize_once(
+        self,
+        *,
+        service: Any,
+        translation: TranslatedSegment,
+        text: str,
+        voice_name: str,
+        overall_started_ms: float,
+        retry_count: int,
+    ) -> SynthesizedSegment:
+        """Collect one private Magpie attempt without publishing partial PCM."""
         call = None
-        started_ms = None
         chunks = []
         total_audio_bytes = 0
         first_audio_ms = None
         try:
-            started_ms = self._clock_ms()
             call = service.synthesize_online(
                 text=text,
                 voice_name=voice_name,
@@ -211,7 +365,9 @@ class DirectTTSClient:
                 if not self._connected:
                     _cancel_call(call)
                     raise DirectTTSCancelled(
-                        "Direct TTS client disconnected before synthesis started"
+                        "Direct TTS client disconnected before synthesis started",
+                        segment=translation.segment,
+                        retry_count=retry_count,
                     )
                 self._active_call = call
 
@@ -220,7 +376,9 @@ class DirectTTSClient:
                 with self._lifecycle_lock:
                     if not self._connected:
                         raise DirectTTSCancelled(
-                            "Direct TTS client disconnected during synthesis"
+                            "Direct TTS client disconnected during synthesis",
+                            segment=translation.segment,
+                            retry_count=retry_count,
                         )
                 audio = bytes(getattr(response, "audio", b""))
                 if not audio:
@@ -228,18 +386,21 @@ class DirectTTSClient:
                 if len(audio) > self.max_response_chunk_bytes:
                     raise DirectTTSError(
                         "Direct TTS response chunk exceeded the configured limit: "
-                        f"{len(audio)} > {self.max_response_chunk_bytes} bytes"
+                        f"{len(audio)} > {self.max_response_chunk_bytes} bytes",
+                        segment=translation.segment,
                     )
                 if len(audio) % frame_bytes:
                     raise DirectTTSError(
                         "Direct TTS returned a partial PCM frame "
-                        f"({len(audio)} bytes for {frame_bytes}-byte frames)"
+                        f"({len(audio)} bytes for {frame_bytes}-byte frames)",
+                        segment=translation.segment,
                     )
                 total_audio_bytes += len(audio)
                 if total_audio_bytes > self.max_audio_bytes:
                     raise DirectTTSError(
                         "Direct TTS segment exceeded the configured audio limit: "
-                        f"{total_audio_bytes} > {self.max_audio_bytes} bytes"
+                        f"{total_audio_bytes} > {self.max_audio_bytes} bytes",
+                        segment=translation.segment,
                     )
                 if first_audio_ms is None:
                     first_audio_ms = self._clock_ms()
@@ -248,10 +409,15 @@ class DirectTTSClient:
             with self._lifecycle_lock:
                 if not self._connected:
                     raise DirectTTSCancelled(
-                        "Direct TTS client disconnected before synthesis completed"
+                        "Direct TTS client disconnected before synthesis completed",
+                        segment=translation.segment,
+                        retry_count=retry_count,
                     )
             if not chunks or first_audio_ms is None:
-                raise DirectTTSError("Direct TTS returned no audio")
+                raise DirectTTSError(
+                    "Direct TTS returned no audio",
+                    segment=translation.segment,
+                )
             completed_ms = self._clock_ms()
             return SynthesizedSegment(
                 translation=translation,
@@ -259,9 +425,10 @@ class DirectTTSClient:
                 sample_rate_hz=self.sample_rate_hz,
                 channels=self.channels,
                 bytes_per_sample=self.bytes_per_sample,
-                started_monotonic_ms=started_ms,
+                started_monotonic_ms=overall_started_ms,
                 first_audio_monotonic_ms=first_audio_ms,
                 completed_monotonic_ms=completed_ms,
+                retry_count=retry_count,
             )
         except DirectTTSError:
             _cancel_call(call)
@@ -272,17 +439,23 @@ class DirectTTSClient:
                 disconnected = not self._connected
             if disconnected:
                 raise DirectTTSCancelled(
-                    "Direct TTS synthesis was cancelled by client shutdown"
+                    "Direct TTS synthesis was cancelled by client shutdown",
+                    segment=translation.segment,
+                    retry_count=retry_count,
                 ) from exc
+            status = _grpc_status_name(exc)
+            diagnostic = type(exc).__name__
+            if status:
+                diagnostic += f"/{status}"
             raise DirectTTSError(
                 "Direct TTS synthesis failed for segment "
-                f"{translation.segment.sequence_id}: {exc}"
+                f"{translation.segment.sequence_id}: {diagnostic}",
+                segment=translation.segment,
             ) from exc
         finally:
             with self._lifecycle_lock:
                 if self._active_call is call:
                     self._active_call = None
-                self._synthesis_active = False
 
     def _voice_for_language(self, language: str) -> str:
         if not language or not language.strip():
@@ -304,6 +477,48 @@ def _cancel_call(call: Any) -> None:
         except Exception:
             # Channel close below remains the final abort mechanism.
             pass
+
+
+def _exception_chain(exc: BaseException):
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _grpc_status_name(exc: BaseException) -> str:
+    for current in _exception_chain(exc):
+        code = getattr(current, "code", None)
+        if not callable(code):
+            continue
+        try:
+            status = code()
+        except Exception:
+            continue
+        name = getattr(status, "name", "")
+        if name:
+            return str(name)
+        text = str(status)
+        if text:
+            return text.rsplit(".", 1)[-1]
+    return ""
+
+
+def _is_retryable_unknown(exc: BaseException) -> bool:
+    for current in _exception_chain(exc):
+        if not isinstance(current, grpc.RpcError):
+            continue
+        code = getattr(current, "code", None)
+        if not callable(code):
+            continue
+        try:
+            if code() is grpc.StatusCode.UNKNOWN:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _required_text(name: str, value: object) -> str:

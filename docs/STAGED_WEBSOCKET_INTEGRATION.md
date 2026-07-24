@@ -104,8 +104,10 @@ or replacement by another single-user session awaits staged cleanup.
 - A generation token prevents audio or terminal messages from an older stream
   leaking into a restarted stream.
 
-TTS is never retried. NMT is normally a single request and never repeats an
-unchanged request. One diagnosed short-segment case may issue a single
+TTS may retry once only after a server-side gRPC `UNKNOWN`. Both attempts are
+private to the atomic adapter and produce at most one WebSocket PCM send. NMT
+is normally a single request and never repeats an unchanged request. One
+diagnosed short-segment case may issue a single
 punctuation-removed request before TTS has started, while retaining the same
 sequence ID and provenance. The second result must pass the full target-text
 validator, so the recovery cannot duplicate audible speech. See
@@ -126,8 +128,10 @@ The full-sample attempts established a fail-closed boundary before Magpie:
 - after a first-pass `TargetTextValidationError`, exact `es-US` input shaped as
   1-32 ASCII letters plus one `.`, `?`, or `!` may be requested once without
   that punctuation; and
-- every ineligible or second-attempt invalid result terminates the session.
-  There is no blind retry of unchanged NMT or TTS input.
+- every ineligible or second-attempt invalid result terminates the session;
+  there is no blind retry of unchanged NMT input; and
+- a validated TTS request may be repeated once only for gRPC `UNKNOWN`, never
+  for validation, cancellation, timeout, resource, or local PCM safety errors.
 
 Suppression happens before ID allocation. Once an ID exists, its translated
 text/audio is never silently dropped: it must complete in order or make the
@@ -150,7 +154,8 @@ Important fields include:
 - maximum queue depths and blocked-put counts;
 - per-event segment identity, ASR-final provenance, and emission reason;
 - NMT/TTS processing, first-audio, and queue-residence times;
-- per-completed-NMT `retry_count` plus the summary `nmt_retry_count`;
+- per-completed NMT/TTS `retry_count` plus the reconciled summary totals
+  `nmt_retry_count` and `tts_retry_count`;
 - sequence/provenance and `retry_count=1` on an exhausted recovery error;
 - audio bytes and duration;
 - `websocket_sent_sequence_ids`; and
@@ -226,6 +231,8 @@ Before promotion, require:
 - cleanup and incomplete-sequence lists are empty;
 - every completed NMT event has `retry_count` zero or one and their sum equals
   `nmt_retry_count`;
+- every completed TTS event has `retry_count` zero or one and their sum equals
+  `tts_retry_count`;
 - dequeued and successfully sent sequence IDs match exactly; and
 - every observed queue depth is within its recorded capacity.
 

@@ -108,6 +108,7 @@ def _resolved_config() -> StagedPipelineConfig:
         nmt_rpc_timeout_s=staged_pipeline_config.nmt_rpc_timeout_s,
         tts_rpc_timeout_s=staged_pipeline_config.tts_rpc_timeout_s,
         tts_max_segment_audio_s=staged_pipeline_config.tts_max_segment_audio_s,
+        tts_max_retries=staged_pipeline_config.tts_max_retries,
         close_timeout_s=staged_pipeline_config.close_timeout_s,
     )
 
@@ -158,6 +159,7 @@ async def run(args: argparse.Namespace) -> int:
         tts_client=DirectTTSClient(
             uri=args.tts_uri,
             max_audio_duration_s=staged_pipeline_config.tts_max_segment_audio_s,
+            max_retries=staged_pipeline_config.tts_max_retries,
         ),
         target_language=args.target_language,
         config=_resolved_config(),

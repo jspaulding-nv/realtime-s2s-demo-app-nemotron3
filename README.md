@@ -31,7 +31,9 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
 - Browser acceptance that requires server completion as well as an empty Web Audio queue
 - Standalone hesitation-filler suppression before sequence allocation, narrow known-short-utterance overrides, fail-closed target-script validation, and one guarded punctuation-normalized NMT recovery before TTS
+- One atomic Magpie retry only for a server-side gRPC `UNKNOWN`, with privacy-safe retry telemetry and no partial-audio publication
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
+- A privacy-safe short-segment replay tool that retains structural metadata and per-run keyed equality fingerprints, never text
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
 The safe default browser path still uses the monolithic Riva S2S operation.
@@ -47,11 +49,15 @@ with no missing IDs or stage errors. Its fixed 1.00x listener tail was still
 marked-phrase delay, and native-listener speed/quality gates remain open before
 the staged route should be treated as the preferred live path.
 
-The Sample 03 canary predates the final target-text, short-segment recovery,
-and failure-evidence hardening. The Sample 02 canary exercised the recovery
-commit, but it was a standalone targeted run rather than a resumable matrix
-checkpoint. The current code snapshot still needs a fresh GPU preflight and a
-new provenance-frozen three-sample run.
+The first provenance-frozen matrix passed its preflight, then stopped on
+Sample 01 when Magpie returned an internal zero-token tensor error for a very
+short, validated target. ASR, NMT, queues, GPU capacity, and service health
+were ruled out. A privacy-safe production-style replay reproduced the exact
+3-to-2-character shape and the same TTS failure on one of five raw calls.
+With the bounded retry enabled, all 20 subsequent calls completed and two
+reported a successful retry. The current branch still needs a fresh GPU
+preflight and a new provenance-frozen three-sample run; the failed baseline
+must not be resumed across the code change.
 
 ## Architecture
 
@@ -122,6 +128,7 @@ realtime-s2s-demo-app/
 ├── direct_asr_smoke.py      # Opt-in direct Nemotron compatibility smoke
 ├── direct_asr_bridge_smoke.py # Opt-in bounded DirectASRStream smoke
 ├── staged_pipeline_smoke.py # Opt-in direct ASR -> NMT -> TTS preflight
+├── diagnose_short_segment.py # Privacy-safe isolated/context replay
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
@@ -304,6 +311,7 @@ STAGED_OUTPUT_QUEUE_MAXSIZE=4
 STAGED_NMT_RPC_TIMEOUT_SECONDS=15
 STAGED_TTS_RPC_TIMEOUT_SECONDS=60
 STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
+STAGED_TTS_MAX_RETRIES=1
 STAGED_CLOSE_TIMEOUT_SECONDS=10
 S2S_PIPELINE_MODE=monolithic
 ```
@@ -559,6 +567,7 @@ Detailed guides:
 - [Bounded staged NMT/TTS pipeline, preflight, and full canary](docs/STAGED_NMT_TTS_PIPELINE.md)
 - [Feature-flagged staged WebSocket integration](docs/STAGED_WEBSOCKET_INTEGRATION.md)
 - [Narrow NMT short-segment recovery and failed-capture evidence](docs/NMT_SHORT_SEGMENT_RECOVERY.md)
+- [Atomic TTS recovery and privacy-safe short-segment replay](docs/TTS_SHORT_SEGMENT_RECOVERY.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

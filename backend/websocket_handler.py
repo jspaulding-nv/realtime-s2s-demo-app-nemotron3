@@ -43,6 +43,7 @@ def create_staged_pipeline(target_language: str):
         ),
         tts_client=DirectTTSClient(
             max_audio_duration_s=staged_pipeline_config.tts_max_segment_audio_s,
+            max_retries=staged_pipeline_config.tts_max_retries,
         ),
         target_language=target_language,
         config=staged_pipeline_config,

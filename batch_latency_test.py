@@ -414,6 +414,8 @@ def validate_staged_pipeline_integrity(
         ("output", "dequeued"): [],
     }
     nmt_event_retry_total = 0
+    tts_event_retry_total = 0
+    tts_retry_observed = False
     for index, event in enumerate(events):
         if not isinstance(event, dict):
             errors.append(f"events[{index}] must be an object")
@@ -431,7 +433,12 @@ def validate_staged_pipeline_integrity(
             else:
                 event_sequences[key].append(sequence_id)
 
-        if key in {("nmt", "completed"), ("nmt", "error")}:
+        if key in {
+            ("nmt", "completed"),
+            ("nmt", "error"),
+            ("tts", "completed"),
+            ("tts", "error"),
+        }:
             retry_count = event.get("retry_count")
             if (
                 not isinstance(retry_count, int)
@@ -443,6 +450,11 @@ def validate_staged_pipeline_integrity(
                 )
             elif key == ("nmt", "completed"):
                 nmt_event_retry_total += retry_count
+            elif key == ("tts", "completed"):
+                tts_event_retry_total += retry_count
+                tts_retry_observed = tts_retry_observed or retry_count == 1
+            elif key == ("tts", "error"):
+                tts_retry_observed = tts_retry_observed or retry_count == 1
 
         queue_depth = event.get("queue_depth")
         queue_capacity = event.get("queue_capacity")
@@ -485,10 +497,38 @@ def validate_staged_pipeline_integrity(
             f"({nmt_retry_count} != {nmt_event_retry_total})"
         )
 
+    tts_retry_count = staged_pipeline.get("tts_retry_count")
+    if (
+        not isinstance(tts_retry_count, int)
+        or isinstance(tts_retry_count, bool)
+        or tts_retry_count < 0
+    ):
+        errors.append("tts_retry_count must be a non-negative integer")
+    elif tts_retry_count != tts_event_retry_total:
+        errors.append(
+            "tts_retry_count must equal the sum of tts/completed event retries "
+            f"({tts_retry_count} != {tts_event_retry_total})"
+        )
+
     staged_config = backend_config.get("stagedConfig")
     if staged_config is not None and not isinstance(staged_config, dict):
         errors.append("/api/config.stagedConfig must be an object")
         staged_config = None
+    if staged_config is not None:
+        tts_max_retries = staged_config.get("ttsMaxRetries")
+        if (
+            not isinstance(tts_max_retries, int)
+            or isinstance(tts_max_retries, bool)
+            or tts_max_retries not in {0, 1}
+        ):
+            errors.append(
+                "/api/config.stagedConfig.ttsMaxRetries must be zero or one"
+            )
+        elif tts_max_retries == 0 and tts_retry_observed:
+            errors.append(
+                "TTS retry telemetry is incompatible with "
+                "/api/config.stagedConfig.ttsMaxRetries=0"
+            )
 
     max_depths = staged_pipeline.get("max_queue_depths")
     if not isinstance(max_depths, dict):

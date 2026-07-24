@@ -180,8 +180,10 @@ whitespace, and Latin-attached combining marks. CJK punctuation such as
 `U+3002`, non-Latin or mixed-script letters, detached marks, symbols, and
 control/format characters fail closed with sequence-scoped, privacy-safe
 metadata. Invalid output is never sent to Magpie. The pipeline never retries
-an unchanged NMT or TTS payload because that cannot make deterministic invalid
-text safe and can produce inconsistent or wrong-language audio.
+an unchanged NMT payload because that cannot make deterministic invalid text
+safe and can produce inconsistent or wrong-language audio. After validation
+has passed, the atomic TTS adapter may repeat the same request once only for a
+server-side gRPC `UNKNOWN`; no failed-attempt PCM is published.
 
 One diagnosed request-shape boundary has a narrower alternate input. If the
 first result raises `TargetTextValidationError`, exact `es-US` source text
@@ -271,13 +273,13 @@ which sequence IDs did not complete.
 
 - Give every session and segment a stable ID in logs.
 - Fail closed on invalid or wrong-script target text before TTS, with no
-  unchanged NMT/TTS retry.
+  unchanged NMT retry and no TTS call.
 - Permit only the documented one-shot punctuation-normalized alternate request
   for the diagnosed deterministic request-shape boundary. This is not a
   transient retry, and a second failure remains terminal.
-- Retry other failures only if they are separately proven transient, cap retry
-  counts, and keep that policy outside this recovery.
-- Make TTS retry output atomic so a partial first attempt is not followed by a
+- Permit one unchanged TTS retry only for the separately diagnosed transient
+  gRPC `UNKNOWN`; both attempts remain inside one overall deadline.
+- Keep TTS retry output atomic so a partial first attempt is not followed by a
   duplicated full segment.
 - Surface stage failure to the WebSocket client with the affected sequence ID.
 - Do not restart a stream in a tight loop without delay and an error budget.
@@ -311,9 +313,10 @@ error_code
 source_override_applied
 ```
 
-The session summary must also include `nmt_retry_count`, equal to the sum of
-`retry_count` over completed NMT events. Each such event is constrained to zero
-or one.
+The session summary includes `nmt_retry_count` and `tts_retry_count`, each
+equal to the sum of `retry_count` over that stage's completed events. Each
+event is constrained to zero or one. Exhausted recovery records its attempt
+on the stage error without increasing the completed-recovery total.
 
 Recommended events are:
 

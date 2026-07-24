@@ -25,7 +25,7 @@ direct path through the existing `/ws/translate` protocol.
 | Component | Contract |
 |---|---|
 | `backend/direct_nmt_client.py` | One source segment per RPC, explicit deadline, exact-one/nonempty output, narrow known-short-utterance overrides, Spanish target-text validation, and one guarded punctuation-normalized recovery |
-| `backend/direct_tts_client.py` | Spanish voice lookup, defensive pre-TTS target-text validation, 16 kHz mono Int16 PCM, full-segment atomic buffering, first-audio/completion timing, active-call cancellation, no retries |
+| `backend/direct_tts_client.py` | Spanish voice lookup, defensive pre-TTS target-text validation, 16 kHz mono Int16 PCM, full-segment atomic buffering, first-audio/completion timing, active-call cancellation, and one configured retry only for gRPC `UNKNOWN` |
 | `backend/staged_pipeline.py` | One ASR consumer, one NMT worker, one TTS worker, bounded queues, ordered drain, first-failure ownership, per-stage telemetry |
 | `staged_pipeline_smoke.py` | Real-time WAV feed, direct three-service run, raw PCM output, JSON report, and an overall terminal deadline |
 
@@ -36,9 +36,12 @@ while TTS synthesizes segment `n`.
 TTS output is atomic per segment. Although Magpie streams response chunks, the
 adapter publishes only after the RPC has completed and every nonempty chunk
 has been validated. A failed request therefore cannot leak partial audio and
-then duplicate it during a later attempt. TTS performs zero retries. NMT has
-only the narrow, source-normalizing recovery described below; it never repeats
-an unchanged request.
+then duplicate it during a later attempt. The staged configuration permits
+one unchanged TTS retry only for a server-side gRPC `UNKNOWN`; both attempts
+share the original orchestrator deadline, and failed-attempt PCM is discarded.
+Validation, cancellation, timeout, resource, format, and local safety failures
+are not retried. NMT has only the narrow, source-normalizing recovery described
+below; it never repeats an unchanged request.
 
 ## Pinned services
 
@@ -83,6 +86,11 @@ ineligible-input, and second-attempt failures are not retried. See
 A recovered completion records `retry_count=1` on its NMT event; the normal
 path records zero, and the session summary's `nmt_retry_count` must equal the
 sum across completed NMT events.
+
+The same accounting is separate for TTS: a successful `UNKNOWN` recovery
+records `retry_count=1` on `tts/completed`, and `tts_retry_count` equals the
+sum across completed TTS events. An exhausted retry records its count on
+`tts/error` without increasing the successful-recovery total.
 
 ## Data flow and bounds
 
@@ -146,6 +154,7 @@ STAGED_OUTPUT_QUEUE_MAXSIZE=4
 STAGED_NMT_RPC_TIMEOUT_SECONDS=15
 STAGED_TTS_RPC_TIMEOUT_SECONDS=60
 STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
+STAGED_TTS_MAX_RETRIES=1
 STAGED_CLOSE_TIMEOUT_SECONDS=10
 ```
 

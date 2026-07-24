@@ -132,6 +132,7 @@ async def get_config():
             "ttsMaxSegmentAudioSeconds": (
                 staged_pipeline_config.tts_max_segment_audio_s
             ),
+            "ttsMaxRetries": staged_pipeline_config.tts_max_retries,
             "closeTimeoutSeconds": staged_pipeline_config.close_timeout_s,
         },
     }

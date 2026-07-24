@@ -2,12 +2,14 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import grpc
 import pytest
 import riva.client
 
 from direct_tts_client import (
     DirectTTSClient,
     DirectTTSCancelled,
+    DirectTTSRetryError,
     DirectTTSError,
 )
 from staged_models import (
@@ -58,6 +60,46 @@ class FailingService:
     def synthesize_online(self, **kwargs):
         del kwargs
         raise RuntimeError("TTS unavailable")
+
+
+class GrpcStatusError(grpc.RpcError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(status.name)
+
+    def code(self):
+        return self.status
+
+
+class GrpcLookalikeError(RuntimeError):
+    def code(self):
+        return grpc.StatusCode.UNKNOWN
+
+
+class FailingAfterAudio:
+    def __init__(self, status):
+        self.status = status
+        self.cancelled = False
+
+    def __iter__(self):
+        yield Response(b"\x01\x02")
+        raise GrpcStatusError(self.status)
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class AttemptService:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def synthesize_online(self, **kwargs):
+        self.calls.append(kwargs)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 class BlockingCall:
@@ -172,29 +214,40 @@ def test_unsafe_target_text_never_calls_magpie(
 def test_no_audio_is_an_explicit_failure_and_never_publishes_a_result():
     service = RecordingService([Response(b""), SimpleNamespace()])
     client, _ = configured_client(service, ticks=(100,))
+    client.max_retries = 1
 
     with pytest.raises(DirectTTSError, match="no audio"):
         client.synthesize(translated_segment())
 
+    assert len(service.calls) == 1
     assert client._synthesis_active is False
 
 
 def test_partial_pcm_frame_is_rejected():
     service = RecordingService([Response(b"\x00")])
     client, _ = configured_client(service, ticks=(100,))
+    client.max_retries = 1
 
     with pytest.raises(DirectTTSError, match="partial PCM frame"):
         client.synthesize(translated_segment())
 
+    assert len(service.calls) == 1
+
 
 def test_oversized_response_chunk_is_rejected_before_buffering():
     service = RecordingService([Response(b"\x00\x00\x00\x00")])
-    client = DirectTTSClient(max_response_chunk_bytes=2, clock_ms=lambda: 100)
+    client = DirectTTSClient(
+        max_response_chunk_bytes=2,
+        max_retries=1,
+        clock_ms=lambda: 100,
+    )
     client._connected = True
     client._service = service
 
     with pytest.raises(DirectTTSError, match="response chunk exceeded"):
         client.synthesize(translated_segment())
+
+    assert len(service.calls) == 1
 
 
 def test_total_segment_audio_limit_is_enforced_across_chunks():
@@ -202,6 +255,7 @@ def test_total_segment_audio_limit_is_enforced_across_chunks():
     client = DirectTTSClient(
         sample_rate_hz=1,
         max_audio_duration_s=1,
+        max_retries=1,
         clock_ms=lambda: 100,
     )
     client._connected = True
@@ -209,6 +263,8 @@ def test_total_segment_audio_limit_is_enforced_across_chunks():
 
     with pytest.raises(DirectTTSError, match="segment exceeded"):
         client.synthesize(translated_segment())
+
+    assert len(service.calls) == 1
 
 
 def test_service_failure_is_wrapped_with_segment_identity_and_releases_state():
@@ -221,6 +277,111 @@ def test_service_failure_is_wrapped_with_segment_identity_and_releases_state():
     assert "TTS unavailable" in str(failure.value.__cause__)
     assert client._synthesis_active is False
     assert client._active_call is None
+
+
+def test_unknown_after_private_pcm_retries_once_and_publishes_only_second_attempt():
+    first = FailingAfterAudio(grpc.StatusCode.UNKNOWN)
+    second = iter([Response(b"\x03\x04"), Response(b"\x05\x06")])
+    service = AttemptService([first, second])
+    client, _ = configured_client(
+        service,
+        ticks=(100, 110, 120, 130, 140),
+    )
+    client.max_retries = 1
+    translation = translated_segment()
+
+    result = client.synthesize(translation)
+
+    assert result.audio == b"\x03\x04\x05\x06"
+    assert result.retry_count == 1
+    assert result.started_monotonic_ms == 100
+    assert result.first_audio_monotonic_ms == 130
+    assert result.completed_monotonic_ms == 140
+    assert first.cancelled is True
+    assert len(service.calls) == 2
+    assert service.calls[0] == service.calls[1]
+    assert client._synthesis_active is False
+    assert client._active_call is None
+
+
+def test_two_unknown_failures_raise_privacy_safe_retry_error_once():
+    service = AttemptService(
+        [
+            GrpcStatusError(grpc.StatusCode.UNKNOWN),
+            GrpcStatusError(grpc.StatusCode.UNKNOWN),
+        ]
+    )
+    client, _ = configured_client(service, ticks=(100, 110))
+    client.max_retries = 1
+
+    with pytest.raises(DirectTTSRetryError) as failure:
+        client.synthesize(translated_segment(text="Texto privado."))
+
+    assert failure.value.sequence_id == 7
+    assert failure.value.retry_count == 1
+    assert failure.value.initial_status_code == "UNKNOWN"
+    assert failure.value.retry_status_code == "UNKNOWN"
+    assert "Texto privado" not in str(failure.value)
+    assert len(service.calls) == 2
+    assert client._synthesis_active is False
+    assert client._active_call is None
+
+
+def test_disconnect_during_second_attempt_preserves_retry_attribution():
+    second = BlockingCall()
+    service = AttemptService(
+        [
+            GrpcStatusError(grpc.StatusCode.UNKNOWN),
+            second,
+        ]
+    )
+    client, channel = configured_client(service, ticks=(100, 110))
+    client.max_retries = 1
+    failures = []
+
+    worker = threading.Thread(
+        target=lambda: _capture_failure(
+            failures,
+            lambda: client.synthesize(translated_segment()),
+        )
+    )
+    worker.start()
+    assert second.iterating.wait(timeout=1)
+
+    client.disconnect()
+    worker.join(timeout=1)
+
+    assert worker.is_alive() is False
+    assert len(failures) == 1
+    assert isinstance(failures[0], DirectTTSCancelled)
+    assert failures[0].sequence_id == 7
+    assert failures[0].retry_count == 1
+    assert len(service.calls) == 2
+    channel.close.assert_called_once_with()
+
+
+def test_nonretryable_grpc_status_is_attempted_once():
+    service = AttemptService(
+        [GrpcStatusError(grpc.StatusCode.INVALID_ARGUMENT)]
+    )
+    client, _ = configured_client(service, ticks=(100,))
+    client.max_retries = 1
+
+    with pytest.raises(DirectTTSError):
+        client.synthesize(translated_segment())
+
+    assert len(service.calls) == 1
+
+
+def test_non_grpc_unknown_lookalike_is_attempted_once():
+    service = AttemptService([GrpcLookalikeError("not an RPC error")])
+    client, _ = configured_client(service, ticks=(100,))
+    client.max_retries = 1
+
+    with pytest.raises(DirectTTSError):
+        client.synthesize(translated_segment())
+
+    assert len(service.calls) == 1
 
 
 def test_disconnected_client_fails_before_calling_service():
@@ -355,6 +516,9 @@ def test_audio_format_validation(kwargs, message):
         ({"max_audio_duration_s": 0}, "max_audio_duration_s"),
         ({"max_audio_duration_s": float("inf")}, "max_audio_duration_s"),
         ({"max_audio_duration_s": True}, "max_audio_duration_s"),
+        ({"max_retries": -1}, "max_retries"),
+        ({"max_retries": 2}, "max_retries"),
+        ({"max_retries": True}, "max_retries"),
     ],
 )
 def test_audio_bound_validation(kwargs, message):
@@ -366,3 +530,10 @@ def test_audio_bound_validation(kwargs, message):
 def test_explicit_invalid_uri_is_rejected(uri):
     with pytest.raises(ValueError, match="uri"):
         DirectTTSClient(uri=uri)
+
+
+def _capture_failure(destination, operation):
+    try:
+        operation()
+    except BaseException as exc:
+        destination.append(exc)

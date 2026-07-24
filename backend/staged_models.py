@@ -196,6 +196,7 @@ class SynthesizedSegment:
     started_monotonic_ms: float
     first_audio_monotonic_ms: float
     completed_monotonic_ms: float
+    retry_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.translation, TranslatedSegment):
@@ -219,6 +220,12 @@ class SynthesizedSegment:
             raise ValueError("first TTS audio cannot precede its start")
         if self.completed_monotonic_ms < self.first_audio_monotonic_ms:
             raise ValueError("TTS completion cannot precede first audio")
+        if (
+            not isinstance(self.retry_count, int)
+            or isinstance(self.retry_count, bool)
+            or self.retry_count not in {0, 1}
+        ):
+            raise ValueError("retry_count must be zero or one")
 
     @property
     def sequence_id(self) -> int:
@@ -252,6 +259,7 @@ class SynthesizedSegment:
             "completed_monotonic_ms": self.completed_monotonic_ms,
             "processing_duration_ms": self.processing_duration_ms,
             "first_audio_latency_ms": self.first_audio_latency_ms,
+            "retry_count": self.retry_count,
         }
         if include_audio:
             payload["audio"] = self.audio

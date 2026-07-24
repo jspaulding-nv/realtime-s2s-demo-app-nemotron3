@@ -82,6 +82,7 @@ class StagedPipelineConfig:
     tts_max_segment_audio_s: float = float(
         os.getenv("STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS", "60")
     )
+    tts_max_retries: int = int(os.getenv("STAGED_TTS_MAX_RETRIES", "1"))
     close_timeout_s: float = float(
         os.getenv("STAGED_CLOSE_TIMEOUT_SECONDS", "10")
     )
@@ -105,6 +106,12 @@ class StagedPipelineConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if (
+            not isinstance(self.tts_max_retries, int)
+            or isinstance(self.tts_max_retries, bool)
+            or self.tts_max_retries not in {0, 1}
+        ):
+            raise ValueError("tts_max_retries must be zero or one")
         for name in (
             "nmt_rpc_timeout_s",
             "tts_rpc_timeout_s",
