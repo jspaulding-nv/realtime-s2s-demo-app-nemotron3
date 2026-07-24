@@ -11,8 +11,10 @@ seconds of *Long-form sample 03* completed through the staged WebSocket
 path with 646 contiguous translated-audio sequence IDs and no pipeline,
 cleanup, WebSocket, container, or integrity error. The later post-recovery
 Sample 02 canary also passed with 805 contiguous IDs and three validated NMT
-recoveries. Both remain standalone canaries rather than a completed,
-provenance-frozen matrix.
+recoveries. Both remain useful standalone canaries. A later clean,
+preflight-gated matrix completed all three samples with 2,027/2,027 ordered
+segments; see
+[Staged recovery three-sample matrix](STAGED_RECOVERY_MATRIX_2026-07-24.md).
 
 This document records the direct orchestrator milestone and its standalone
 smoke. The later feature-flagged browser integration is documented in
@@ -248,8 +250,9 @@ ID, container restart, or GPU OOM.
 This is preserved historical evidence. It predates the narrow NMT recovery,
 closed-export settling, and allowlisted failed-capture retention. The final
 recovery snapshot was subsequently exercised by the standalone Sample 02
-canary, but the current code still requires a fresh post-reboot preflight and
-clean sample matrix.
+canary. The later clean post-reboot preflight and three-sample matrix passed;
+the measurements below remain the historical Sample 03 canary rather than a
+matrix checkpoint.
 
 | Metric | Observed |
 |---|---:|
@@ -321,15 +324,11 @@ tail is under one second.
 
 ## Remaining work
 
-1. Relaunch FastAPI after the VM restart, run a fresh staged WebSocket
-   preflight, and then run all three samples from one clean provenance-frozen
-   commit. The standalone Sample 02 and historical Sample 03 canaries are
-   evidence, not resumable matrix checkpoints.
-2. Use the browser's existing 1.00x/1.05x/1.10x controller to record actual
+1. Use the browser's existing 1.00x/1.05x/1.10x controller to record actual
    Web Audio queue seconds.
-3. Add synchronized marked-phrase/joke measurements; service tail alone does
+2. Add synchronized marked-phrase/joke measurements; service tail alone does
    not answer the audience-experience question.
-4. If the browser queue still grows, evaluate 1.05–1.10x playback/prosody with
+3. Evaluate 1.05–1.10x playback/prosody with
    native Spanish listeners and document quality tradeoffs.
 
 The direct ASR input iterator itself is still unbounded. Bounds begin at the

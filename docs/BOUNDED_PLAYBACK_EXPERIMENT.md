@@ -153,6 +153,26 @@ python analyze_playback_policy.py \
   --markdown-output test_results_nemotron/playback_policy_analysis.md
 ```
 
+To add a no-drop capacity grid and captured wall-clock burst diagnostics,
+repeat `--constant-rate` and, optionally, `--media-duration-scale`:
+
+```bash
+python analyze_playback_policy.py \
+  --input-dir experiment_results/<run-id>/repeat-01 \
+  --json-output experiment_results/<run-id>/playback_capacity_sweep.json \
+  --markdown-output experiment_results/<run-id>/playback_capacity_sweep.md \
+  --constant-rate 1.05 \
+  --constant-rate 1.10 \
+  --constant-rate 1.15 \
+  --media-duration-scale 1.0 \
+  --media-duration-scale 0.952381 \
+  --media-duration-scale 0.909091
+```
+
+Duration scaling is an offline counterfactual: it changes PCM duration while
+retaining the captured arrival timestamps and input boundary. It does not
+establish server-side prosody support or listening quality.
+
 Run its focused regression tests with:
 
 ```bash

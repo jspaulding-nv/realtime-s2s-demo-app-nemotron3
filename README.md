@@ -26,6 +26,7 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Queue-aware test completion: file input ends independently, then Riva output and browser playback drain
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - A resumable one-command harness for sequential matched-policy runs across all three samples
+- Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -39,15 +40,15 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 The safe default browser path still uses the monolithic Riva S2S operation.
 Set `S2S_PIPELINE_MODE=staged` and restart FastAPI to route the same WebSocket
 protocol through the direct bounded pipeline. The staged path has completed a
-real-time one-minute direct preflight and a separate terminal-aware one-minute
-WebSocket preflight. It also passed a real-time 31:28 Sample 03 full-sample
-operational canary with 646 ordered segments and no missing IDs or stage
-errors. After the narrow NMT recovery was added, a separate 40:27 Sample 02
-canary completed 805 ordered segments, including three validated recoveries,
-with no missing IDs or stage errors. Its fixed 1.00x listener tail was still
-239.156 seconds. The clean three-sample matrix, actual browser queue,
-marked-phrase delay, and native-listener speed/quality gates remain open before
-the staged route should be treated as the preferred live path.
+clean, preflight-gated real-time matrix over all three long-form samples:
+2,027/2,027 ordered segments, three recovered NMT retries, no TTS retries, no
+missing work, and no runtime failure. A separate immediate post-run check found
+all three pinned NIMs healthy on the 96 GB RTX PRO 6000. This is an operational
+pass, not an audience-latency pass. The no-drop 1.00x/1.05x/1.10x simulation
+reduced summed listener tail by 77.7%, but per-sample queue p95 remained
+23-61 seconds. Actual browser queue, marked-phrase delay, and native-listener
+speed/quality gates remain open before the staged route should be treated as
+the preferred live path.
 
 The first provenance-frozen matrix passed its preflight, then stopped on
 Sample 01 when Magpie returned an internal zero-token tensor error for a very
@@ -55,9 +56,10 @@ short, validated target. ASR, NMT, queues, GPU capacity, and service health
 were ruled out. A privacy-safe production-style replay reproduced the exact
 3-to-2-character shape and the same TTS failure on one of five raw calls.
 With the bounded retry enabled, all 20 subsequent calls completed and two
-reported a successful retry. The current branch still needs a fresh GPU
-preflight and a new provenance-frozen three-sample run; the failed baseline
-must not be resumed across the code change.
+reported a successful retry. The subsequent clean three-sample matrix completed
+without a TTS fault or retry. That matrix validates long-form compatibility
+with the recovery enabled; the targeted probe, not the matrix, is the evidence
+that directly exercised successful TTS recovery.
 
 ## Architecture
 
@@ -568,6 +570,7 @@ Detailed guides:
 - [Feature-flagged staged WebSocket integration](docs/STAGED_WEBSOCKET_INTEGRATION.md)
 - [Narrow NMT short-segment recovery and failed-capture evidence](docs/NMT_SHORT_SEGMENT_RECOVERY.md)
 - [Atomic TTS recovery and privacy-safe short-segment replay](docs/TTS_SHORT_SEGMENT_RECOVERY.md)
+- [July 24 staged recovery three-sample matrix](docs/STAGED_RECOVERY_MATRIX_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

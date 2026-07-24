@@ -12,14 +12,14 @@ WebSocket check and first full-length Sample 03 operational canary passed. A
 later standalone Sample 02 canary from recovery commit `55b59bd` also passed
 with 805 ordered audio segments and three validated NMT recoveries. The long
 runs showed that operational health does not prove the audience stays within
-roughly 5–10 seconds of scheduled Spanish playback. The remaining live
-promotion sequence is:
+roughly 5–10 seconds of scheduled Spanish playback. A later clean,
+preflight-gated three-sample matrix also passed its operational gates with
+2,027/2,027 ordered segments, but all three traces missed the audience queue
+gate. The remaining live promotion sequence is:
 
-1. relaunch FastAPI after the VM restart and pass a fresh preflight;
-2. run a new three-sample matrix through the resumable staged batch harness;
-3. execute browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
-4. measure a synchronized English phrase to audible Spanish; and
-5. obtain native-Spanish review of any playback/prosody acceleration.
+1. execute browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
+2. measure a synchronized source phrase to audible Spanish; and
+3. obtain native-Spanish review of any playback/prosody acceleration.
 
 ## Selecting the backend path
 
@@ -331,8 +331,8 @@ See [Sample 03 staged full-sample canary](LONG_FORM_03_STAGED_CANARY.md). Raw
 event streams, client logs, plots, and runtime manifests are intentionally not
 published; the report retains the aggregate measurements and integrity result.
 
-The Sample 02 recovery canary passed this hard gate once. The next
-provenance-frozen matrix applies it independently to all three samples:
+The Sample 02 recovery canary passed this hard gate once. The later
+provenance-frozen matrix also passed it independently for all three samples:
 
 Hard gate:
 
@@ -376,7 +376,8 @@ coverage. The subsequent Sample 02 recovery canary exercised the hardened
 terminal, parity, provenance, cleanup, and target-validation path over a full
 sample. See
 [Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
-The clean three-sample matrix remains outstanding.
+The clean matrix result and remaining audience gates are documented in
+[Staged recovery three-sample matrix](STAGED_RECOVERY_MATRIX_2026-07-24.md).
 
 ## Rollback
 

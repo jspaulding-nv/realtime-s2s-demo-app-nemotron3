@@ -134,7 +134,7 @@ The replay established one failing structural shape and the adjacent-context
 variant passed five calls, but that is not enough to define a general
 coalescing classifier. Broadly holding short utterances would add audience
 delay to valid phrases such as short answers. Coalescing therefore remains a
-follow-up if the fresh matrix exhausts the retry or a larger probe establishes
+follow-up if a future run exhausts the retry or a larger probe establishes
 a bounded policy. The atomic retry directly addresses the observed
 intermittent failure without changing segmentation or normal-path latency.
 
@@ -151,5 +151,31 @@ Focused tests cover:
 
 The failed `700aeec` matrix cannot be resumed with this code because the
 experiment harness correctly requires the original clean Git commit. Preserve
-it as the baseline. After committing the recovery, restart FastAPI with the
-same pinned NIM digests, pass preflight, and start a new three-sample matrix.
+it as the baseline. The recovery was then committed, FastAPI was restarted
+with the same pinned NIM digests, preflight passed, and a new three-sample
+matrix started.
+
+## Formal matrix result
+
+The required fresh matrix subsequently completed from clean commit
+`636f4784797372a8b6092255d0438951f9300c0b`. Its preflight and all three
+real-time long-form captures passed provenance, staged-integrity, sequence,
+PCM-parity, terminal, and artifact-hash validation:
+
+- 2,027/2,027 emitted segments completed;
+- three guarded NMT retries recovered;
+- zero TTS retries were needed;
+- no incomplete work or runtime failure occurred.
+
+An immediate separate post-run check found all three pinned NIMs healthy with
+zero restarts or OOM events; that state was not frozen in the matrix artifact
+manifest. Because the intermittent Magpie fault did not recur, the formal
+matrix establishes long-form completion and shows no observed operational
+regression in this matrix with recovery enabled; it does not itself demonstrate
+a retry event. The separate 20-call exact-target probe, which recorded two
+successful retries, remains the direct live evidence for the atomic recovery
+path.
+
+The matrix still missed the audience queue objective. See
+[Staged recovery three-sample matrix](STAGED_RECOVERY_MATRIX_2026-07-24.md) for
+the transcript-free operational and playback results.

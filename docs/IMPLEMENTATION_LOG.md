@@ -769,6 +769,43 @@ The failed `700aeec` matrix remains an immutable baseline. Because the harness
 correctly rejects cross-commit resume, the recovery must be evaluated in a
 fresh formal matrix after commit, backend restart, and preflight.
 
+## July 24, 2026: clean staged recovery matrix
+
+Recovery commit `636f4784797372a8b6092255d0438951f9300c0b` passed the
+one-minute preflight and completed one new real-time trace for each neutral
+long-form sample. The repository was clean, the manifest froze the pinned
+ASR/NMT/TTS digests, and all promoted artifact hashes validated.
+
+The three captures produced 2,027/2,027 ordered PCM segments with exact
+server-send/client-receive count and byte parity. Three guarded NMT retries
+recovered during Sample 02. No TTS retry was needed, and there was no incomplete
+sequence, connection loss, timeout, pipeline failure, or cleanup error. A
+separate immediate post-run check, outside the hashed manifest, found all
+containers healthy with zero restarts or OOM events.
+
+The run is an operational pass and an audience-latency miss. Matched no-drop
+adaptive replay reduced the sum of fixed listener tails from 526.441 seconds to
+117.516 seconds, or 77.677%. Per-sample adaptive queue p95 remained 61.414,
+38.158, and 23.210 seconds. The controller already played 78.650-94.811% of
+translated media at 1.10x, so threshold-only tuning is unlikely to establish the
+5-10 second objective.
+
+Retain the ignored raw artifacts separately. The tracked, transcript-free
+result and next-experiment decision are in
+[Staged recovery three-sample matrix](STAGED_RECOVERY_MATRIX_2026-07-24.md).
+
+The offline analyzer now accepts repeatable `--constant-rate` and
+`--media-duration-scale` options. Its optional capacity report preserves every
+chunk and records tail, time-weighted queue p50/p95, peak, time above 10
+seconds, captured chunk-duration quantiles, and 30/60/300-second wall-clock
+media-arrival p95. The default analyzer output remains byte-compatible when
+the new flags are absent. Constant rates through 1.15x did not reach queue p95
+at or below 10 seconds on any of the three captured traces.
+
+The post-sweep full Python suite passed 413 tests with one optional local-trace
+test skipped. Independent review matched the rolling-rate implementation
+against a brute-force calculation over 10,000 randomized cases.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -787,6 +824,7 @@ fresh formal matrix after commit, backend restart, and preflight.
 - [x] Pass the terminal-aware one-minute staged WebSocket preflight
 - [x] Pass one complete staged Sample 03 operational canary
 - [x] Pass one complete post-recovery staged Sample 02 canary
-- [ ] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
+- [x] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
+- [x] Sweep no-drop playback capacity on the completed matched traces
 - [x] Keep unapproved private/internal container references out of external
   documentation

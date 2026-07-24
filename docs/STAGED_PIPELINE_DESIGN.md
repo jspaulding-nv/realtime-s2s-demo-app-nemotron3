@@ -22,9 +22,10 @@ errors. This passes the operational gate, but not the audience-experience
 gate: fixed 1.00x listener playback still ended 64.038 seconds after the
 source. A later standalone Sample 02 canary from recovery commit `55b59bd`
 also passed with 805 ordered segments and three validated NMT recoveries, but
-its fixed listener tail was 239.156 seconds. Sample 01, the complete staged
-comparison matrix, browser Web Audio validation, and marked-phrase/punchline
-timing remain open.
+its fixed listener tail was 239.156 seconds. The later clean staged matrix
+completed all three samples with 2,027/2,027 ordered segments, but adaptive
+queue p95 remained 23-61 seconds. Browser Web Audio validation,
+marked-phrase/punchline timing, and native-listener quality remain open.
 
 The monolithic endpoint still connects to remote ASR and TTS services without
 application-owned stage boundaries. Staged mode makes punctuation,
@@ -369,12 +370,12 @@ offset measurement.
    add one fail-closed punctuation-normalized recovery with retry telemetry.
 9. **Completed:** run one full standalone Sample 02 recovery canary with
    805/805 ordered segments and three validated recoveries.
-10. After the VM restart, relaunch FastAPI, pass a fresh preflight, and run a
-    clean three-sample comparison matrix with identical models, input, EOU,
-    and playback policy.
+10. **Completed:** after the VM restart, relaunch FastAPI, pass a fresh
+    preflight, and run a clean three-sample comparison matrix with identical
+    models, input, EOU, and playback policy.
 11. Cross-check scheduling in browser Web Audio and measure marked-phrase or
-    punchline delay; the 239.156-second Sample 02 fixed listener tail leaves
-    this audience gate open.
+    punchline delay; the matrix's 228.357-second fixed Sample 02 tail and
+    38.158-second adaptive queue p95 leave this audience gate open.
 12. Increase workers only if stage telemetry justifies it.
 
 ## Validation gates
