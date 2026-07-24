@@ -20,6 +20,7 @@ CANARY_SOURCE="${CANARY_SOURCE:-test_audio/long-form-01.mp3}"
 CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS:-300}"
 CANARY_CAPS="${CANARY_CAPS:-0 40 45 60}"
 CANARY_MIN_CHARS="${CANARY_MIN_CHARS:-12}"
+CANARY_TTS_RESPONSE_CHUNK_TELEMETRY="${CANARY_TTS_RESPONSE_CHUNK_TELEMETRY:-${STAGED_TTS_RESPONSE_CHUNK_TELEMETRY:-0}}"
 CANARY_BACKEND_PORT="${CANARY_BACKEND_PORT:-8100}"
 CANARY_OUTPUT_ROOT="${CANARY_OUTPUT_ROOT:-experiment_results}"
 ALLOW_DIRTY_CANARY="${ALLOW_DIRTY_CANARY:-0}"
@@ -79,6 +80,28 @@ if [[ "$ALLOW_DIRTY_CANARY" != "0" && "$ALLOW_DIRTY_CANARY" != "1" ]]; then
   echo "ALLOW_DIRTY_CANARY must be 0 or 1" >&2
   exit 2
 fi
+if [[ "$CANARY_TTS_RESPONSE_CHUNK_TELEMETRY" != "0" &&
+  "$CANARY_TTS_RESPONSE_CHUNK_TELEMETRY" != "1" ]]; then
+  echo "CANARY_TTS_RESPONSE_CHUNK_TELEMETRY must be 0 or 1" >&2
+  exit 2
+fi
+read -r -a CANARY_CAP_VALUES <<<"$CANARY_CAPS"
+if ((${#CANARY_CAP_VALUES[@]} == 0)); then
+  echo "CANARY_CAPS must contain at least one non-negative integer." >&2
+  exit 2
+fi
+declare -A SEEN_CANARY_CAPS=()
+for cap in "${CANARY_CAP_VALUES[@]}"; do
+  if ! [[ "$cap" =~ ^[0-9]+$ ]]; then
+    echo "Every CANARY_CAPS value must be a non-negative integer: $cap" >&2
+    exit 2
+  fi
+  if [[ -n "${SEEN_CANARY_CAPS[$cap]:-}" ]]; then
+    echo "CANARY_CAPS must not contain duplicate values: $cap" >&2
+    exit 2
+  fi
+  SEEN_CANARY_CAPS[$cap]=1
+done
 
 EVIDENCE_CLASS="formal"
 if [[ "$ALLOW_DIRTY_CANARY" == "1" ]]; then
@@ -328,6 +351,7 @@ PREFIX_SHA256="$(sha256sum "$PREFIX_WAV" | awk '{print $1}')"
   echo "prefix_sha256=$PREFIX_SHA256"
   echo "caps=$CANARY_CAPS"
   echo "min_chars=$CANARY_MIN_CHARS"
+  echo "tts_response_chunk_telemetry=$CANARY_TTS_RESPONSE_CHUNK_TELEMETRY"
   echo "backend_port=$CANARY_BACKEND_PORT"
   echo "asr_http_port=$ASR_HTTP_PORT"
   echo "nmt_http_port=$NMT_HTTP_PORT"
@@ -341,6 +365,7 @@ PREFIX_SHA256="$(sha256sum "$PREFIX_WAV" | awk '{print $1}')"
 } >"$RUN_DIR/run_info.txt"
 
 BACKEND_PID=""
+CANARY_ARM_COUNT="${#CANARY_CAP_VALUES[@]}"
 stop_backend() {
   local owned_pid="$BACKEND_PID"
   local waited_seconds=0
@@ -396,12 +421,7 @@ curl_local() {
     "$@"
 }
 
-for cap in $CANARY_CAPS; do
-  if ! [[ "$cap" =~ ^[0-9]+$ ]]; then
-    echo "Every CANARY_CAPS value must be a non-negative integer: $cap" >&2
-    exit 2
-  fi
-
+for cap in "${CANARY_CAP_VALUES[@]}"; do
   ARM_NAME="cap-${cap}"
   ARM_DIR="$RUN_DIR/$ARM_NAME"
   mkdir -p "$ARM_DIR"
@@ -412,6 +432,7 @@ for cap in $CANARY_CAPS; do
   S2S_PIPELINE_MODE=staged \
   STAGED_TTS_SUBSEGMENT_MAX_CHARS="$cap" \
   STAGED_TTS_SUBSEGMENT_MIN_CHARS="$CANARY_MIN_CHARS" \
+  STAGED_TTS_RESPONSE_CHUNK_TELEMETRY="$CANARY_TTS_RESPONSE_CHUNK_TELEMETRY" \
   PYTHONPATH=".python-packages:backend:." \
     "$PYTHON_BIN" -m uvicorn main:app \
       --app-dir backend \
@@ -449,6 +470,7 @@ staged = config["stagedConfig"]
 models = config["modelConfig"]
 print(
     staged["ttsSubsegmentMaxChars"],
+    staged["ttsResponseChunkTelemetryEnabled"],
     models["asr"]["image"],
     models["asr"]["imageDigest"],
     models["nmt"]["image"],
@@ -460,12 +482,21 @@ print(
   )"
   IFS=$'\t' read -r \
     CONFIG_CAP \
+    CONFIG_TTS_RESPONSE_CHUNK_TELEMETRY \
     CONFIG_ASR_IMAGE CONFIG_ASR_DIGEST \
     CONFIG_NMT_IMAGE CONFIG_NMT_DIGEST \
     CONFIG_TTS_IMAGE CONFIG_TTS_DIGEST \
     <<<"$CONFIG_REPORT"
   if [[ "$CONFIG_CAP" != "$cap" ]]; then
     echo "Backend cap mismatch: requested $cap, reported $CONFIG_CAP" >&2
+    exit 1
+  fi
+  EXPECTED_TTS_RESPONSE_CHUNK_TELEMETRY="False"
+  if [[ "$CANARY_TTS_RESPONSE_CHUNK_TELEMETRY" == "1" ]]; then
+    EXPECTED_TTS_RESPONSE_CHUNK_TELEMETRY="True"
+  fi
+  if [[ "$CONFIG_TTS_RESPONSE_CHUNK_TELEMETRY" != "$EXPECTED_TTS_RESPONSE_CHUNK_TELEMETRY" ]]; then
+    echo "Backend TTS response-chunk telemetry flag mismatch." >&2
     exit 1
   fi
   if [[ "$CONFIG_ASR_IMAGE" != "$ASR_IMAGE" ]] ||
@@ -496,15 +527,25 @@ print(
       --json-output "$ARM_DIR/playback_policy_analysis.json" \
       --markdown-output "$ARM_DIR/playback_policy_analysis.md"
 
+  PYTHONPATH=".python-packages:backend:." \
+    "$PYTHON_BIN" analyze_streaming_latency.py \
+      "$ARM_DIR/shared-prefix_summary.json" \
+      --json-output "$ARM_DIR/streaming_latency_analysis.json" \
+      --markdown-output "$ARM_DIR/streaming_latency_analysis.md"
+
   stop_backend
   echo "=== Completed matched canary arm: $ARM_NAME ==="
 done
 
-PYTHONPATH=".python-packages:backend:." \
-  "$PYTHON_BIN" summarize_tts_subsegment_canary.py \
-    --input-dir "$RUN_DIR" \
-    --json-output "$RUN_DIR/canary_comparison.json" \
-    --markdown-output "$RUN_DIR/canary_comparison.md"
+if ((CANARY_ARM_COUNT > 1)); then
+  PYTHONPATH=".python-packages:backend:." \
+    "$PYTHON_BIN" summarize_tts_subsegment_canary.py \
+      --input-dir "$RUN_DIR" \
+      --json-output "$RUN_DIR/canary_comparison.json" \
+      --markdown-output "$RUN_DIR/canary_comparison.md"
+else
+  echo "Single-arm diagnostic: skipped cross-arm subsegment comparison."
+fi
 
 trap - EXIT INT TERM
 echo

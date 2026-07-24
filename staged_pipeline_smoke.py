@@ -109,6 +109,9 @@ def _resolved_config() -> StagedPipelineConfig:
         tts_rpc_timeout_s=staged_pipeline_config.tts_rpc_timeout_s,
         tts_max_segment_audio_s=staged_pipeline_config.tts_max_segment_audio_s,
         tts_max_retries=staged_pipeline_config.tts_max_retries,
+        tts_response_chunk_telemetry_enabled=(
+            staged_pipeline_config.tts_response_chunk_telemetry_enabled
+        ),
         tts_subsegment_max_chars=(
             staged_pipeline_config.tts_subsegment_max_chars
         ),
@@ -166,6 +169,9 @@ async def run(args: argparse.Namespace) -> int:
             uri=args.tts_uri,
             max_audio_duration_s=staged_pipeline_config.tts_max_segment_audio_s,
             max_retries=staged_pipeline_config.tts_max_retries,
+            capture_response_chunk_metrics=(
+                staged_pipeline_config.tts_response_chunk_telemetry_enabled
+            ),
         ),
         target_language=args.target_language,
         config=_resolved_config(),

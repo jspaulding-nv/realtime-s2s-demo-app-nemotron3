@@ -83,6 +83,11 @@ class StagedPipelineConfig:
         os.getenv("STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS", "60")
     )
     tts_max_retries: int = int(os.getenv("STAGED_TTS_MAX_RETRIES", "1"))
+    # Default-off diagnostic: retain response timing/byte counts only. It
+    # never publishes partial PCM and therefore does not change retry safety.
+    tts_response_chunk_telemetry_enabled: bool = (
+        os.getenv("STAGED_TTS_RESPONSE_CHUNK_TELEMETRY", "0") == "1"
+    )
     # Zero preserves the existing one-parent/one-TTS-call path. Positive
     # values opt into post-NMT target-text subsegmentation.
     tts_subsegment_max_chars: int = int(
@@ -120,6 +125,10 @@ class StagedPipelineConfig:
             or self.tts_max_retries not in {0, 1}
         ):
             raise ValueError("tts_max_retries must be zero or one")
+        if not isinstance(self.tts_response_chunk_telemetry_enabled, bool):
+            raise ValueError(
+                "tts_response_chunk_telemetry_enabled must be a boolean"
+            )
         if (
             not isinstance(self.tts_subsegment_max_chars, int)
             or isinstance(self.tts_subsegment_max_chars, bool)

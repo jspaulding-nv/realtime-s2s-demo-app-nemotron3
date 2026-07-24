@@ -16,6 +16,7 @@ from staged_models import (
     StagedOutputEvent,
     StagedOutputEventKind,
     SynthesizedSegment,
+    TTSResponseChunkMetric,
     TextSegment,
     TranslatedSegment,
 )
@@ -214,6 +215,36 @@ class FakeTTSClient:
                 if self.retry_order_key is None
                 or translation.order_key == self.retry_order_key
                 else 0
+            ),
+        )
+
+
+class ResponseMetricTTS(FakeTTSClient):
+    def synthesize(self, translation):
+        synthesized = super().synthesize(translation)
+        first_bytes = len(synthesized.audio) // 2
+        second_bytes = len(synthesized.audio) - first_bytes
+        return replace(
+            synthesized,
+            response_chunks=(
+                TTSResponseChunkMetric(
+                    response_index=0,
+                    audio_bytes=first_bytes,
+                    cumulative_audio_bytes=first_bytes,
+                    received_monotonic_ms=(
+                        synthesized.first_audio_monotonic_ms
+                    ),
+                    retry_count=synthesized.retry_count,
+                ),
+                TTSResponseChunkMetric(
+                    response_index=1,
+                    audio_bytes=second_bytes,
+                    cumulative_audio_bytes=len(synthesized.audio),
+                    received_monotonic_ms=(
+                        synthesized.completed_monotonic_ms
+                    ),
+                    retry_count=synthesized.retry_count,
+                ),
             ),
         )
 
@@ -434,12 +465,84 @@ async def test_default_off_preserves_one_call_and_parent_translation_identity():
     summary = session.summary(include_events=True)
     assert summary["telemetry_schema_version"] == 1
     assert summary["tts_subsegmentation_enabled"] is False
+    assert "tts_response_chunk_telemetry_enabled" not in summary
+    assert "tts_response_chunk_telemetry" not in summary
     assert "planned_subsegment_keys" not in summary
     assert all(
         event["subsequence_id"] is None
         and event["subsequence_count"] is None
         for event in summary["events"]
     )
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_opt_in_retains_privacy_safe_tts_response_chunk_sidecar():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "A compact parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=ResponseMetricTTS(),
+        config=config(tts_response_chunk_telemetry_enabled=True),
+        session_id="response-chunk-diagnostic",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO,
+        StagedOutputEventKind.COMPLETE,
+    ]
+    summary = session.summary(include_events=True)
+    assert summary["telemetry_schema_version"] == 1
+    assert summary["tts_response_chunk_telemetry_enabled"] is True
+    diagnostic = summary["tts_response_chunk_telemetry"]
+    assert diagnostic["schema_version"] == 1
+    assert diagnostic["segments_observed"] == 1
+    assert diagnostic["response_chunk_count"] == 2
+    assert [
+        (
+            chunk["parent_sequence_id"],
+            chunk["subsequence_id"],
+            chunk["subsequence_count"],
+            chunk["response_index"],
+            chunk["response_count"],
+            chunk["audio_bytes"],
+            chunk["cumulative_audio_bytes"],
+        )
+        for chunk in diagnostic["chunks"]
+    ] == [
+        (0, 0, 1, 0, 2, 160, 160),
+        (0, 0, 1, 1, 2, 160, 320),
+    ]
+    assert all(
+        chunk["audio_duration_ms"] == pytest.approx(5)
+        for chunk in diagnostic["chunks"]
+    )
+    assert "audio" not in diagnostic["chunks"][0]
+    assert "text" not in str(diagnostic)
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_opt_in_fails_closed_when_tts_omits_response_metrics():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "A compact parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=FakeTTSClient(),
+        config=config(tts_response_chunk_telemetry_enabled=True),
+        session_id="response-chunk-diagnostic-missing",
+    )
+
+    await session.start()
+    session.finish_input()
+    terminal = await session.next_output(timeout_s=2)
+
+    assert terminal.kind is StagedOutputEventKind.ERROR
+    assert terminal.stage == "tts"
+    assert "response-chunk telemetry" in terminal.error
+    assert session.summary()["completed_sequence_ids"] == []
     await session.aclose()
 
 
@@ -1494,6 +1597,7 @@ async def test_cancelled_output_waiter_cannot_consume_and_lose_queue_item():
         {"nmt_queue_maxsize": 1.5},
         {"nmt_rpc_timeout_s": float("nan")},
         {"tts_rpc_timeout_s": float("inf")},
+        {"tts_response_chunk_telemetry_enabled": 1},
         {"tts_subsegment_max_chars": -1},
         {"tts_subsegment_max_chars": True},
         {"tts_subsegment_max_chars": 1.5},

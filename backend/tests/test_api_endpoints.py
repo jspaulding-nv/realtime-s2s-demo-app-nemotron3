@@ -159,6 +159,9 @@ async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
             staged_pipeline_config.tts_max_segment_audio_s
         ),
         "ttsMaxRetries": staged_pipeline_config.tts_max_retries,
+        "ttsResponseChunkTelemetryEnabled": (
+            staged_pipeline_config.tts_response_chunk_telemetry_enabled
+        ),
         "ttsSubsegmentMaxChars": (
             staged_pipeline_config.tts_subsegment_max_chars
         ),

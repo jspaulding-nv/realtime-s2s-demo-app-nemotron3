@@ -28,6 +28,7 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A resumable one-command harness for sequential matched-policy runs across all three samples
 - Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
+- A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -142,6 +143,7 @@ realtime-s2s-demo-app/
 ├── staged_pipeline_smoke.py # Opt-in direct ASR -> NMT -> TTS preflight
 ├── diagnose_short_segment.py # Privacy-safe isolated/context replay
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
+├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
@@ -333,6 +335,7 @@ STAGED_NMT_RPC_TIMEOUT_SECONDS=15
 STAGED_TTS_RPC_TIMEOUT_SECONDS=60
 STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
 STAGED_TTS_MAX_RETRIES=1
+STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=0
 STAGED_TTS_SUBSEGMENT_MAX_CHARS=0
 STAGED_TTS_SUBSEGMENT_MIN_CHARS=12
 STAGED_CLOSE_TIMEOUT_SECONDS=10
@@ -597,6 +600,22 @@ see the measured tradeoffs and required composite sequence contract in
 The default-off implementation and automated matched canary procedure are in
 [Post-NMT TTS subsegment implementation](docs/TTS_SUBSEGMENT_IMPLEMENTATION.md).
 
+To measure Magpie's response cadence without changing listener output, run one
+unsplit real-time arm from a clean commit:
+
+```bash
+CANARY_TTS_RESPONSE_CHUNK_TELEMETRY=1 \
+CANARY_CAPS=0 \
+CANARY_DURATION_SECONDS=300 \
+./run_tts_subsegment_canary.sh
+```
+
+The runner verifies the pinned model containers, retains only numeric
+response-cadence data in the staged sidecar, and writes a privacy-safe
+`streaming_latency_analysis.md`. The diagnostic remains atomic: it does not
+forward partial PCM. See
+[Atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md).
+
 Detailed guides:
 
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
@@ -613,6 +632,7 @@ Detailed guides:
 - [Default-off post-NMT TTS subsegmentation and matched canary](docs/TTS_SUBSEGMENT_IMPLEMENTATION.md)
 - [Post-NMT TTS subsegmentation 60-second live probe](docs/TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md)
 - [Post-NMT TTS subsegmentation five-minute matched canary](docs/TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md)
+- [Atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

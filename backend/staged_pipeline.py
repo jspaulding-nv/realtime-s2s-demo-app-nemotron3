@@ -240,6 +240,8 @@ class StagedPipelineSession:
         self._consumed_subsegment_keys: list[Tuple[int, int, int]] = []
         self._consumed_sequence_ids: list[int] = []
         self._parent_translation_char_counts: Dict[int, int] = {}
+        self._tts_response_chunk_metrics: list[Dict[str, Any]] = []
+        self._tts_response_segments_observed = 0
         self._expected_nmt_sequence = 0
         self._expected_tts_sequence = 0
         self._expected_tts_subsequence = 0
@@ -422,6 +424,19 @@ class StagedPipelineSession:
             "blocked_put_counts": dict(self._blocked_put_counts),
             "telemetry_event_count": len(self._telemetry),
         }
+        if self.config.tts_response_chunk_telemetry_enabled:
+            result["tts_response_chunk_telemetry_enabled"] = True
+            result["tts_response_chunk_telemetry"] = {
+                "schema_version": 1,
+                "segments_observed": self._tts_response_segments_observed,
+                "response_chunk_count": len(
+                    self._tts_response_chunk_metrics
+                ),
+                "chunks": [
+                    dict(metric)
+                    for metric in self._tts_response_chunk_metrics
+                ],
+            }
         if self.config.tts_subsegment_max_chars > 0:
             result.update(
                 {
@@ -846,6 +861,18 @@ class StagedPipelineSession:
                         translation,
                     )
                     raise contract_error
+                if self.config.tts_response_chunk_telemetry_enabled:
+                    if not synthesized.response_chunks:
+                        contract_error = StagedPipelineError(
+                            "TTS response-chunk telemetry was enabled but "
+                            "the adapter returned no response metrics"
+                        )
+                        _retain_translation_identity(
+                            contract_error,
+                            translation,
+                        )
+                        raise contract_error
+                    self._capture_tts_response_chunks(synthesized)
                 self._advance_tts_cursor(translation)
                 self._record(
                     stage="tts",
@@ -918,6 +945,55 @@ class StagedPipelineSession:
         return self._parent_translation_char_counts.get(
             translation.sequence_id
         )
+
+    def _capture_tts_response_chunks(
+        self,
+        synthesized: SynthesizedSegment,
+    ) -> None:
+        """Retain timing/size evidence without retaining PCM or text."""
+        bytes_per_second = (
+            synthesized.sample_rate_hz
+            * synthesized.channels
+            * synthesized.bytes_per_sample
+        )
+        response_count = len(synthesized.response_chunks)
+        previous_received_ms = synthesized.started_monotonic_ms
+        for chunk in synthesized.response_chunks:
+            self._tts_response_chunk_metrics.append(
+                {
+                    "parent_sequence_id": synthesized.parent_sequence_id,
+                    "subsequence_id": synthesized.subsequence_id,
+                    "subsequence_count": synthesized.subsequence_count,
+                    "response_index": chunk.response_index,
+                    "response_count": response_count,
+                    "audio_bytes": chunk.audio_bytes,
+                    "cumulative_audio_bytes": (
+                        chunk.cumulative_audio_bytes
+                    ),
+                    "audio_duration_ms": (
+                        chunk.audio_bytes / bytes_per_second * 1_000
+                    ),
+                    "cumulative_audio_duration_ms": (
+                        chunk.cumulative_audio_bytes
+                        / bytes_per_second
+                        * 1_000
+                    ),
+                    "received_monotonic_ms": (
+                        chunk.received_monotonic_ms
+                    ),
+                    "since_request_start_ms": (
+                        chunk.received_monotonic_ms
+                        - synthesized.started_monotonic_ms
+                    ),
+                    "since_previous_response_ms": (
+                        chunk.received_monotonic_ms
+                        - previous_received_ms
+                    ),
+                    "retry_count": chunk.retry_count,
+                }
+            )
+            previous_received_ms = chunk.received_monotonic_ms
+        self._tts_response_segments_observed += 1
 
     def _validate_tts_cursor(self, translation: TranslatedSegment) -> None:
         if not isinstance(translation, TranslatedSegment):

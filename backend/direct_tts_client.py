@@ -11,7 +11,11 @@ import grpc
 import riva.client
 
 from config import SUPPORTED_LANGUAGES, audio_config, riva_config
-from staged_models import SynthesizedSegment, TranslatedSegment
+from staged_models import (
+    SynthesizedSegment,
+    TTSResponseChunkMetric,
+    TranslatedSegment,
+)
 from target_text_validation import TargetTextValidationError, validate_target_text
 
 
@@ -127,6 +131,7 @@ class DirectTTSClient:
         max_response_chunk_bytes: int = 256 * 1024,
         max_audio_duration_s: float = 60.0,
         max_retries: int = 0,
+        capture_response_chunk_metrics: bool = False,
         language_configs: Optional[Dict[str, dict]] = None,
         clock_ms: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -182,6 +187,11 @@ class DirectTTSClient:
         ):
             raise ValueError("max_retries must be zero or one")
         self.max_retries = max_retries
+        if not isinstance(capture_response_chunk_metrics, bool):
+            raise ValueError(
+                "capture_response_chunk_metrics must be a boolean"
+            )
+        self.capture_response_chunk_metrics = capture_response_chunk_metrics
         self.max_audio_bytes = int(
             self.sample_rate_hz
             * self.channels
@@ -383,6 +393,7 @@ class DirectTTSClient:
         """Collect one private Magpie attempt without publishing partial PCM."""
         call = None
         chunks = []
+        response_chunk_metrics = []
         total_audio_bytes = 0
         first_audio_ms = None
         try:
@@ -434,9 +445,25 @@ class DirectTTSClient:
                         f"{total_audio_bytes} > {self.max_audio_bytes} bytes",
                         translation=translation,
                     )
+                received_ms = None
+                if (
+                    first_audio_ms is None
+                    or self.capture_response_chunk_metrics
+                ):
+                    received_ms = self._clock_ms()
                 if first_audio_ms is None:
-                    first_audio_ms = self._clock_ms()
+                    first_audio_ms = received_ms
                 chunks.append(audio)
+                if self.capture_response_chunk_metrics:
+                    response_chunk_metrics.append(
+                        TTSResponseChunkMetric(
+                            response_index=len(response_chunk_metrics),
+                            audio_bytes=len(audio),
+                            cumulative_audio_bytes=total_audio_bytes,
+                            received_monotonic_ms=received_ms,
+                            retry_count=retry_count,
+                        )
+                    )
 
             with self._lifecycle_lock:
                 if not self._connected:
@@ -461,6 +488,7 @@ class DirectTTSClient:
                 first_audio_monotonic_ms=first_audio_ms,
                 completed_monotonic_ms=completed_ms,
                 retry_count=retry_count,
+                response_chunks=tuple(response_chunk_metrics),
             )
         except DirectTTSError:
             _cancel_call(call)

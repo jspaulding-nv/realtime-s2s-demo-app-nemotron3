@@ -155,6 +155,8 @@ def test_synthesis_collects_complete_pcm_atomically_and_preserves_provenance():
     assert result.started_monotonic_ms == 100
     assert result.first_audio_monotonic_ms == 125
     assert result.completed_monotonic_ms == 200
+    assert result.response_chunks == ()
+    assert "response_chunks" not in result.to_dict()
     assert service.calls == [
         {
             "text": "La congregación se rió.",
@@ -166,6 +168,55 @@ def test_synthesis_collects_complete_pcm_atomically_and_preserves_provenance():
     ]
     client.disconnect()
     channel.close.assert_called_once_with()
+
+
+def test_opt_in_records_privacy_safe_response_chunk_metrics():
+    service = RecordingService(
+        [Response(b"\x01\x02"), Response(b"\x03\x04\x05\x06")]
+    )
+    clock = MagicMock(side_effect=(100, 125, 150, 200))
+    client = DirectTTSClient(
+        capture_response_chunk_metrics=True,
+        clock_ms=clock,
+    )
+    client._connected = True
+    client._service = service
+
+    result = client.synthesize_segment(translated_segment())
+
+    assert [
+        (
+            chunk.response_index,
+            chunk.audio_bytes,
+            chunk.cumulative_audio_bytes,
+            chunk.received_monotonic_ms,
+            chunk.retry_count,
+        )
+        for chunk in result.response_chunks
+    ] == [
+        (0, 2, 2, 125, 0),
+        (1, 4, 6, 150, 0),
+    ]
+    assert result.first_audio_monotonic_ms == 125
+    payload = result.to_dict()
+    assert payload["response_chunks"] == [
+        {
+            "response_index": 0,
+            "audio_bytes": 2,
+            "cumulative_audio_bytes": 2,
+            "received_monotonic_ms": 125,
+            "retry_count": 0,
+        },
+        {
+            "response_index": 1,
+            "audio_bytes": 4,
+            "cumulative_audio_bytes": 6,
+            "received_monotonic_ms": 150,
+            "retry_count": 0,
+        },
+    ]
+    assert "audio" not in payload
+    assert "text" not in str(payload["response_chunks"])
 
 
 def test_empty_responses_do_not_set_first_audio_time():
@@ -302,6 +353,43 @@ def test_unknown_after_private_pcm_retries_once_and_publishes_only_second_attemp
     assert service.calls[0] == service.calls[1]
     assert client._synthesis_active is False
     assert client._active_call is None
+
+
+def test_response_metrics_discard_failed_attempt_pcm_before_atomic_retry():
+    first = FailingAfterAudio(grpc.StatusCode.UNKNOWN)
+    second = iter([Response(b"\x03\x04"), Response(b"\x05\x06")])
+    service = AttemptService([first, second])
+    clock = MagicMock(side_effect=(100, 110, 120, 130, 140, 150))
+    client = DirectTTSClient(
+        max_retries=1,
+        capture_response_chunk_metrics=True,
+        clock_ms=clock,
+    )
+    client._connected = True
+    client._service = service
+
+    result = client.synthesize(translated_segment())
+
+    assert result.audio == b"\x03\x04\x05\x06"
+    assert result.retry_count == 1
+    assert result.started_monotonic_ms == 100
+    assert result.first_audio_monotonic_ms == 130
+    assert result.completed_monotonic_ms == 150
+    assert [
+        (
+            chunk.response_index,
+            chunk.audio_bytes,
+            chunk.cumulative_audio_bytes,
+            chunk.received_monotonic_ms,
+            chunk.retry_count,
+        )
+        for chunk in result.response_chunks
+    ] == [
+        (0, 2, 2, 130, 1),
+        (1, 2, 4, 140, 1),
+    ]
+    assert first.cancelled is True
+    assert len(service.calls) == 2
 
 
 def test_two_unknown_failures_raise_privacy_safe_retry_error_once():
@@ -519,6 +607,10 @@ def test_audio_format_validation(kwargs, message):
         ({"max_retries": -1}, "max_retries"),
         ({"max_retries": 2}, "max_retries"),
         ({"max_retries": True}, "max_retries"),
+        (
+            {"capture_response_chunk_metrics": 1},
+            "capture_response_chunk_metrics",
+        ),
     ],
 )
 def test_audio_bound_validation(kwargs, message):

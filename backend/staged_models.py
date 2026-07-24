@@ -210,6 +210,48 @@ class TranslatedSegment:
 
 
 @dataclass(frozen=True)
+class TTSResponseChunkMetric:
+    """Privacy-safe timing metadata for one successful TTS response.
+
+    The record deliberately excludes PCM and response metadata because the
+    latter can reproduce request text.  It is retained only when the explicit
+    response-chunk diagnostic is enabled.
+    """
+
+    response_index: int
+    audio_bytes: int
+    cumulative_audio_bytes: int
+    received_monotonic_ms: float
+    retry_count: int = 0
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("response_index", self.response_index),
+            ("audio_bytes", self.audio_bytes),
+            ("cumulative_audio_bytes", self.cumulative_audio_bytes),
+            ("retry_count", self.retry_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+        if self.response_index < 0:
+            raise ValueError("response_index must be non-negative")
+        if self.audio_bytes <= 0:
+            raise ValueError("audio_bytes must be positive")
+        if self.cumulative_audio_bytes < self.audio_bytes:
+            raise ValueError(
+                "cumulative_audio_bytes cannot be smaller than audio_bytes"
+            )
+        if self.retry_count not in {0, 1}:
+            raise ValueError("retry_count must be zero or one")
+        _validate_nonnegative_finite(
+            "received_monotonic_ms", self.received_monotonic_ms
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class SynthesizedSegment:
     """Atomic PCM output for one translated segment plus TTS timing."""
 
@@ -222,6 +264,7 @@ class SynthesizedSegment:
     first_audio_monotonic_ms: float
     completed_monotonic_ms: float
     retry_count: int = 0
+    response_chunks: Tuple[TTSResponseChunkMetric, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.translation, TranslatedSegment):
@@ -251,6 +294,48 @@ class SynthesizedSegment:
             or self.retry_count not in {0, 1}
         ):
             raise ValueError("retry_count must be zero or one")
+        if not isinstance(self.response_chunks, tuple):
+            raise ValueError("response_chunks must be a tuple")
+        cumulative_audio_bytes = 0
+        previous_received_ms = self.started_monotonic_ms
+        for expected_index, chunk in enumerate(self.response_chunks):
+            if not isinstance(chunk, TTSResponseChunkMetric):
+                raise ValueError(
+                    "response_chunks must contain TTSResponseChunkMetric records"
+                )
+            if chunk.response_index != expected_index:
+                raise ValueError(
+                    "response chunk indices must be contiguous from zero"
+                )
+            cumulative_audio_bytes += chunk.audio_bytes
+            if chunk.cumulative_audio_bytes != cumulative_audio_bytes:
+                raise ValueError(
+                    "response chunk cumulative byte counts must reconcile"
+                )
+            if chunk.received_monotonic_ms < previous_received_ms:
+                raise ValueError(
+                    "response chunk timestamps must be nondecreasing"
+                )
+            if chunk.received_monotonic_ms > self.completed_monotonic_ms:
+                raise ValueError(
+                    "response chunk timestamp cannot follow TTS completion"
+                )
+            if chunk.retry_count != self.retry_count:
+                raise ValueError(
+                    "response chunk retry count must match its segment"
+                )
+            previous_received_ms = chunk.received_monotonic_ms
+        if self.response_chunks:
+            if self.response_chunks[0].received_monotonic_ms != (
+                self.first_audio_monotonic_ms
+            ):
+                raise ValueError(
+                    "first response chunk timestamp must match first TTS audio"
+                )
+            if cumulative_audio_bytes != len(self.audio):
+                raise ValueError(
+                    "response chunk byte counts must match synthesized audio"
+                )
 
     @property
     def sequence_id(self) -> int:
@@ -306,6 +391,10 @@ class SynthesizedSegment:
             "first_audio_latency_ms": self.first_audio_latency_ms,
             "retry_count": self.retry_count,
         }
+        if self.response_chunks:
+            payload["response_chunks"] = [
+                chunk.to_dict() for chunk in self.response_chunks
+            ]
         if include_audio:
             payload["audio"] = self.audio
         return payload
