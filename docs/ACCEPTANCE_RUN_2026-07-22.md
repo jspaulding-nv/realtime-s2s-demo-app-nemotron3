@@ -24,6 +24,17 @@ policy. The final capture matrix and recovery automation passed, the run also
 exposed a service robustness failure, and the overall candidate
 audience-latency result missed on every sample trace.
 
+## Later staged-recovery postscript
+
+This report remains the historical July 22 monolithic acceptance record. On
+July 23, the final staged recovery snapshot separately completed one full
+Sample 02 canary with 805 ordered segments and three validated NMT recoveries.
+Its 0.308-second service tail coexisted with a 239.156-second fixed playback
+tail, so it passed the operational gate without closing the audience gate.
+That standalone result is documented in
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md);
+the clean final-snapshot three-sample matrix remains pending.
+
 ## Run identity and provenance
 
 | Field | Value |

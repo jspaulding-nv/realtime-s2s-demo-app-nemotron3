@@ -8,16 +8,18 @@ default-off backend feature flag. The client protocol and translated PCM format
 are unchanged.
 
 This milestone is an integration and observability gate. Its one-minute live
-WebSocket check and first full-length Sample 03 operational canary passed. The
-long run also showed that operational health does not prove the audience stays
-within roughly 5–10 seconds of scheduled Spanish playback. The remaining live
+WebSocket check and first full-length Sample 03 operational canary passed. A
+later standalone Sample 02 canary from recovery commit `55b59bd` also passed
+with 805 ordered audio segments and three validated NMT recoveries. The long
+runs showed that operational health does not prove the audience stays within
+roughly 5–10 seconds of scheduled Spanish playback. The remaining live
 promotion sequence is:
 
-1. a fresh preflight and targeted Sample 02 pass from the recovery commit;
-2. a new three-sample run through the resumable staged batch harness;
-3. executed browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
-4. a synchronized English-phrase to audible-Spanish measurement; and
-5. native-Spanish review of any playback/prosody acceleration.
+1. relaunch FastAPI after the VM restart and pass a fresh preflight;
+2. run a new three-sample matrix through the resumable staged batch harness;
+3. execute browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
+4. measure a synchronized English phrase to audible Spanish; and
+5. obtain native-Spanish review of any playback/prosody acceleration.
 
 ## Selecting the backend path
 
@@ -322,7 +324,8 @@ See [Sample 03 staged full-sample canary](LONG_FORM_03_STAGED_CANARY.md). Raw
 event streams, client logs, plots, and runtime manifests are intentionally not
 published; the report retains the aggregate measurements and integrity result.
 
-The same hard gate now applies to Sample 01 and Sample 02:
+The Sample 02 recovery canary passed this hard gate once. The next
+provenance-frozen matrix applies it independently to all three samples:
 
 Hard gate:
 
@@ -356,13 +359,17 @@ that no PCM followed completion. The archived full summary does not contain
 the newer `modelConfig` or top-level terminal-arrival fields and therefore is
 historical, not a resumable new-format checkpoint.
 
-After the live run, deterministic tests added rejection of premature
+After the Sample 03 live run, deterministic tests added rejection of premature
 completion, automatic send/receive count-and-byte parity, full model
 provenance freezing, exact terminal-arrival timestamps, and cancellation-safe
 session cleanup. Unknown controls now claim one staged error terminal and
 close the active pipeline; unsafe CJK punctuation in Spanish-target text is
 rejected before Magpie. These edge changes have complete unit/integration test
-coverage but have not yet been exercised by another full GPU sample canary.
+coverage. The subsequent Sample 02 recovery canary exercised the hardened
+terminal, parity, provenance, cleanup, and target-validation path over a full
+sample. See
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
+The clean three-sample matrix remains outstanding.
 
 ## Rollback
 

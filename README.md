@@ -40,15 +40,18 @@ protocol through the direct bounded pipeline. The staged path has completed a
 real-time one-minute direct preflight and a separate terminal-aware one-minute
 WebSocket preflight. It also passed a real-time 31:28 Sample 03 full-sample
 operational canary with 646 ordered segments and no missing IDs or stage
-errors. The staged Sample 01/Sample 02 matrix, actual browser queue, marked-phrase
-delay, and native-listener speed/quality gates remain open before it should be
-treated as the preferred live path.
+errors. After the narrow NMT recovery was added, a separate 40:27 Sample 02
+canary completed 805 ordered segments, including three validated recoveries,
+with no missing IDs or stage errors. Its fixed 1.00x listener tail was still
+239.156 seconds. The clean three-sample matrix, actual browser queue,
+marked-phrase delay, and native-listener speed/quality gates remain open before
+the staged route should be treated as the preferred live path.
 
-That live canary predates the final target-text, short-segment recovery, and
-failure-evidence hardening. Its raw trace satisfies the later terminal-order
-and PCM count/byte checks, but the current code snapshot still needs a fresh
-GPU preflight and three-sample run. Its saved summary is historical and cannot
-resume under the tightened provenance schema.
+The Sample 03 canary predates the final target-text, short-segment recovery,
+and failure-evidence hardening. The Sample 02 canary exercised the recovery
+commit, but it was a standalone targeted run rather than a resumable matrix
+checkpoint. The current code snapshot still needs a fresh GPU preflight and a
+new provenance-frozen three-sample run.
 
 ## Architecture
 
@@ -190,6 +193,14 @@ nvidia-smi
 ```
 
 The application connects to the NMT/S2S gRPC endpoint at `localhost:50051`. ASR and TTS are also exposed at `localhost:50052` and `localhost:50053` for direct tests.
+
+After a host reboot, Compose's `unless-stopped` policy should restart the three
+NIM containers, but readiness must still be verified with the commands above.
+The FastAPI backend is not part of this Compose project and does not restart
+unless the operator manages it separately. Relaunch it, verify `/` and
+`/api/config`, and rerun the one-minute preflight before any long-form capture.
+This behavior was observed after the July 24 VM restart; see the
+[Sample 02 recovery canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md).
 
 Optional: validate all three direct services and the bounded staged drain with
 a real-time one-minute WAV before starting the browser application:
@@ -548,6 +559,7 @@ Detailed guides:
 - [Bounded staged NMT/TTS pipeline, preflight, and full canary](docs/STAGED_NMT_TTS_PIPELINE.md)
 - [Feature-flagged staged WebSocket integration](docs/STAGED_WEBSOCKET_INTEGRATION.md)
 - [Narrow NMT short-segment recovery and failed-capture evidence](docs/NMT_SHORT_SEGMENT_RECOVERY.md)
+- [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)
 - [Staged ASR -> NMT -> TTS design](docs/STAGED_PIPELINE_DESIGN.md)

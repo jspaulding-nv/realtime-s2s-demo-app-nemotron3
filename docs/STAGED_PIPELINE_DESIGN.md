@@ -20,8 +20,11 @@ processed all 1,888.1045 seconds, delivered 646 consecutive ordered sequence
 IDs, and reached natural completion with no pipeline, WebSocket, or cleanup
 errors. This passes the operational gate, but not the audience-experience
 gate: fixed 1.00x listener playback still ended 64.038 seconds after the
-source. Sample 01, Sample 02, the complete staged comparison matrix, browser Web
-Audio validation, and marked-phrase/punchline timing remain open.
+source. A later standalone Sample 02 canary from recovery commit `55b59bd`
+also passed with 805 ordered segments and three validated NMT recoveries, but
+its fixed listener tail was 239.156 seconds. Sample 01, the complete staged
+comparison matrix, browser Web Audio validation, and marked-phrase/punchline
+timing remain open.
 
 The monolithic endpoint still connects to remote ASR and TTS services without
 application-owned stage boundaries. Staged mode makes punctuation,
@@ -361,12 +364,15 @@ offset measurement.
    and delivered all 646 ordered IDs without errors.
 8. **Completed:** diagnose the pinned NMT short-token punctuation boundary and
    add one fail-closed punctuation-normalized recovery with retry telemetry.
-9. Run a fresh preflight and Sample 02, then complete the staged three-sample
-   comparison matrix with identical models, input, EOU, and playback policy.
-10. Cross-check scheduling in browser Web Audio and measure marked-phrase or
-   punchline delay; the 64.038-second Sample 03 fixed listener tail leaves this
-   audience gate open.
-11. Increase workers only if stage telemetry justifies it.
+9. **Completed:** run one full standalone Sample 02 recovery canary with
+   805/805 ordered segments and three validated recoveries.
+10. After the VM restart, relaunch FastAPI, pass a fresh preflight, and run a
+    clean three-sample comparison matrix with identical models, input, EOU,
+    and playback policy.
+11. Cross-check scheduling in browser Web Audio and measure marked-phrase or
+    punchline delay; the 239.156-second Sample 02 fixed listener tail leaves
+    this audience gate open.
+12. Increase workers only if stage telemetry justifies it.
 
 ## Validation gates
 

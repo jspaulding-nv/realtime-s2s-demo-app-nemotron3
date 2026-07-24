@@ -87,11 +87,31 @@ harness now:
 
 - This is one Nemotron run compared with three older runs. Repeat runs are
   needed before treating the percentages as stable.
-- Automatic punctuation is enabled. Explicit punctuation-boundary splitting
-  and NMT/TTS queue parallelism are internal to the monolithic S2S endpoint;
-  the client cannot confirm those stages independently. Testing a client-side
-  ASR -> punctuation splitter -> queued NMT/TTS pipeline would isolate them.
+- In this July 8 baseline, explicit punctuation-boundary splitting and
+  NMT/TTS queue parallelism were internal to the monolithic S2S endpoint, so
+  the client could not confirm those stages independently. The later staged
+  pipeline now isolates and measures them.
 - The output/input ratio includes silence in the source file. A speech-only TTS
   expansion ratio requires source VAD or aligned ASR segment durations.
-- If Sample 02 remains near a 3–4 minute playback tail, evaluate 1.05x and 1.10x
-  TTS playback/prosody speed and compare intelligibility.
+- Sample 02's later staged canary remained near a four-minute fixed playback
+  tail, so 1.05x and 1.10x playback/prosody and intelligibility remain required
+  evaluations.
+
+## Staged Sample 02 recovery update: 2026-07-23
+
+The direct staged `ASR -> punctuation splitter -> bounded NMT -> bounded TTS`
+path later completed one full Sample 02 canary from the recovery snapshot.
+It passed integrity with all 805 segments ordered and complete, including
+three validated short-segment NMT recoveries.
+
+The service flush tail was only 0.308 seconds, but output was 1.08831x the
+source duration and fixed 1.00x arrival replay ended 239.156 seconds late.
+This independently confirms the original audience concern: a short service
+tail does not mean a listener has caught up with queued Spanish audio. An
+actual browser/device playback run and native-listener review are still
+required.
+
+See
+[Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
+for the frozen configuration, aggregate measurements, caveats, and next-run
+boundary.

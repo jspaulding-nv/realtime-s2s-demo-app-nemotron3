@@ -30,8 +30,10 @@ the first full sample operational canary have passed. Sample 03 attempt 3
 processed all 1,888.1045 seconds, delivered 646 consecutive ordered IDs, and
 reached natural completion with no errors. Its fixed 1.00x listener tail was
 still 64.038 seconds, so this operational success does not close the
-audience-experience gate. Sample 01, Sample 02, the complete staged matrix, browser
-Web Audio validation, and marked-phrase/punchline timing remain open.
+audience-experience gate. A later standalone Sample 02 recovery canary also
+passed with 805 ordered segments and three guarded recoveries, while its fixed
+listener tail reached 239.156 seconds. Sample 01, the complete staged matrix,
+browser Web Audio validation, and marked-phrase/punchline timing remain open.
 
 ## Files and responsibilities
 
@@ -289,8 +291,9 @@ Completed implementation sequence:
 
 Remaining promotion gates:
 
-1. Run Sample 01 and Sample 02 and complete the staged three-sample comparison
-   matrix.
+1. After a fresh post-reboot preflight, run the clean staged three-sample
+   comparison matrix. The standalone Sample 02 recovery canary is evidence,
+   not a resumable matrix checkpoint.
 2. Cross-check queue scheduling and final drain in browser Web Audio.
 3. Capture marked-phrase or punchline delay for the live-audience experience.
 4. Evaluate bounded-queue and playback-speed policy without dropping speech or

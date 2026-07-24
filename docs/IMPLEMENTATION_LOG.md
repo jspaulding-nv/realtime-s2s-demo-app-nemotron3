@@ -570,8 +570,8 @@ Source audio, generated audio, arbitrary temporary files, logs, and credentials
 are not copied into the failed-capture record. The complete behavior,
 verification gates, and clean rerun order are documented in
 [Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
-A fresh GPU preflight, targeted Sample 02 pass, and clean three-sample matrix
-remain required before promotion.
+At that point, the next gates were a targeted Sample 02 pass followed by a
+fresh preflight and clean three-sample matrix.
 
 Local verification passed `376` Python tests with one skipped integration test,
 all `88` frontend tests, frontend lint, and the production build. All three
@@ -579,6 +579,49 @@ pinned service HTTP readiness probes returned ready. A privacy-safe live call
 through the updated direct adapter used the exact protected failure segment and
 reported one retry, preserved sequence 77, returned exact `es-US`, and passed
 target validation without printing source or translated text.
+
+## 2026-07-23: full Sample 02 post-recovery canary
+
+Commit `55b59bd` completed one standalone 2,427.011-second Sample 02 run through
+the hardened staged WebSocket path. The artifact reached `closed` / `complete`
+and passed staged integrity with:
+
+- 805 emitted, NMT-completed, TTS-completed, produced, WebSocket-sent, and
+  client-received audio segments;
+- contiguous unique sequence IDs 0–804 and exact PCM count-and-byte parity;
+- no incomplete IDs, pipeline failure, cleanup error, connection loss, drain
+  timeout, server error, or PCM after terminal completion;
+- three validated NMT recoveries at sequence IDs 77, 92, and 449;
+- maximum NMT/TTS/output queue depths of 4/4/1; and
+- 17/5/0 blocked puts, demonstrating bounded backpressure without drops.
+
+First audio arrived after 4.807 seconds. Last translated audio arrived 0.308
+seconds after source input ended, and the completed terminal arrived after
+1.455 seconds. Operationally, the recovery and drain paths passed.
+
+The audience gate did not pass. Translated PCM totaled 2,641.342 seconds,
+1.08831x the 2,427.011-second input, and fixed 1.00x arrival replay ended
+239.156 seconds late. This makes 1.10x a more plausible catch-up candidate than
+1.05x for this sample, but executed browser playback, marked-phrase timing, and
+native-Spanish quality review remain required.
+
+This targeted canary is not part of a resumable experiment manifest and must
+not be treated as a completed matrix checkpoint. The compact, transcript-free
+record is
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
+
+## 2026-07-24: VM restart readiness observation
+
+The completed canary artifacts survived a later VM lease expiry and shutdown.
+After the VM returned, all three Compose-managed NIM containers restarted at
+approximately 00:03:24 UTC and reported `healthy`; their `unless-stopped`
+policy behaved as configured. The separately launched FastAPI process did not
+restart and its staged endpoint was not listening.
+
+The next formal experiment must therefore relaunch FastAPI, verify `/` and
+`/api/config`, and pass a new 60-second preflight before starting a clean
+three-sample matrix. Healthy model containers alone are not sufficient
+readiness after a host restart.
 
 ## Reproducible validation commands
 
@@ -701,6 +744,7 @@ Artifact locations:
 - [x] Integrate the staged pipeline into `/ws/translate` behind a default-off flag
 - [x] Pass the terminal-aware one-minute staged WebSocket preflight
 - [x] Pass one complete staged Sample 03 operational canary
+- [x] Pass one complete post-recovery staged Sample 02 canary
 - [ ] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
 - [x] Keep unapproved private/internal container references out of external
   documentation

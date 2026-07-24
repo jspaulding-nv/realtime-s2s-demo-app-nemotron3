@@ -158,12 +158,19 @@ The recovery implementation was verified on 2026-07-23 with:
   sequence 77, returned exact `es-US`, and passed target validation without
   printing either source or translated text.
 
-Then verify the pinned live services:
+The subsequent full Sample 02 recovery canary also passed. It reached
+`closed` / `complete` with 805 emitted, produced, and completed segments;
+contiguous IDs 0–804; no incomplete IDs, stage failure, cleanup error,
+connection loss, or timeout; and three successful recoveries at sequence IDs
+77, 92, and 449. Its aggregate, transcript-free record is
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
 
-1. Run the one-minute staged WebSocket preflight.
-2. Run `long-form-02.mp3` once and require natural completion, a closed staged
-   export, contiguous sequence IDs, zero incomplete IDs, and consistent NMT
-   retry telemetry.
+That standalone canary closes the targeted recovery gate, but it is not a
+resumable three-sample checkpoint. For the next formal run:
+
+1. Relaunch the staged FastAPI backend after any host restart and verify `/`
+   and `/api/config`.
+2. Run the one-minute staged WebSocket preflight.
 3. Start a new clean, provenance-frozen one-repeat run across
    `long-form-01.mp3`, `long-form-02.mp3`, and `long-form-03.mp3`.
 4. Retain the ignored runtime directory, review any allowlisted failure record,

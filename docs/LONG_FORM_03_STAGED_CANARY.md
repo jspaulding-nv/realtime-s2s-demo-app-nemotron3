@@ -182,16 +182,20 @@ provenance, and separates the 1.744-second terminal-arrival lag from the
 cleanup cancellation-safe, prevents displaced sessions from restarting,
 avoids lifecycle locks across WebSocket writes, latches protocol errors, and
 rejects Spanish-target punctuation outside Magpie's explicit safe set. These
-changes passed the deterministic test suite, but no full GPU canary has yet
-been rerun on that final code snapshot.
+changes passed the deterministic test suite. A later full Sample 02 canary from
+recovery commit `55b59bd` exercised the hardened path and passed with 805
+ordered segments, exact send/receive parity, and three validated NMT
+recoveries. See
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
 
 ## Promotion status
 
 The one-minute staged WebSocket gate and historical Sample 03 operational gate
-are passed. A short final-snapshot preflight should precede the remaining
-staged Sample 01/Sample 02/full matrix,
+are passed, as is the standalone post-recovery Sample 02 gate. A fresh
+post-reboot preflight should precede the remaining clean three-sample matrix,
 an actual browser Web Audio run, marked-phrase/punchline delay, and native
-Spanish review of sustained 1.05x/1.10x playback or TTS prosody changes.
+Spanish review of sustained 1.05x/1.10x playback or TTS prosody changes. The
+standalone canaries are not resumable matrix checkpoints.
 
 For live listeners, retain a target queue near 5 seconds with 10 seconds as a
 soft ceiling, but treat that as an objective requiring an explicit catch-up or

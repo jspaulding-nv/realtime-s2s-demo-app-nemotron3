@@ -4,6 +4,30 @@
 
 The clearest conclusion is: Nemotron and the new staged design are promising, but the live-audience latency problem is not solved yet. The dominant remaining observable long-tail component is playback backlog, not a “server is still processing for three minutes after the sample” problem.
 
+## Operational addendum: July 24, 2026
+
+The July 22 snapshot below is preserved as the state known on that date. The
+targeted post-recovery Sample 02 gate has since passed on commit `55b59bd`:
+
+- 805/805 emitted, produced, sent, and received audio segments completed in
+  order;
+- all three guarded short-segment NMT recoveries passed target validation;
+- no incomplete ID, stage failure, cleanup error, connection loss, or timeout;
+- last audio arrived 0.308 seconds after input ended; and
+- translated audio was 1.08831x the source duration, leaving a 239.156-second
+  fixed 1.00x playback tail.
+
+This closes the targeted recovery gate but reinforces the audience-delay
+concern. It is a standalone canary, not a resumable matrix checkpoint. The
+current sequence is to relaunch FastAPI after the VM restart, pass a fresh
+60-second preflight, and run a clean three-sample matrix before browser,
+marked-phrase, and native-listener evaluation.
+
+The VM restart also confirmed the deployment boundary: all three
+Compose-managed NIMs returned to healthy under `unless-stopped`, while the
+separately launched FastAPI process required manual relaunch. See
+[the Sample 02 recovery canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
+
 ## What we have proven
 
 - All three pinned models run concurrently on the tested 96 GB RTX PRO 6000. The observed snapshot used about 32.2 GB, leaving roughly 65 GB free.
@@ -98,7 +122,7 @@ The final term is the dangerous one. Based on the sample traces, accumulated pla
 
 We have not yet measured an exact English punchline-to-Spanish-audible delay, so we should not claim a precise number. The existing queue statistics strongly suggest that it can be awkwardly long, however.
 
-## Remaining unknowns
+## Remaining unknowns as of July 22
 
 - The staged route has not run Sample 01 and Sample 02 yet; Sample 03 passed.
 - Actual browser playback queue depth under the staged route is unknown.
@@ -112,7 +136,7 @@ We have not yet measured an exact English punchline-to-Spanish-audible delay, so
   blindly retrying an unsafe payload.
 - A 48 GB RTX 6000 should fit these profiles on paper, but only the 96 GB RTX PRO 6000 has been proven.
 
-## Best next experiment
+## Best next experiment as proposed July 22
 
 The staged pipeline is now wired into `/ws/translate` behind a default-off
 feature flag, and the first full-sample safety canary passed. Next:
@@ -130,4 +154,6 @@ feature flag, and the first full-sample safety canary passed. Next:
 The detailed evidence is in [the staged pipeline report](STAGED_NMT_TTS_PIPELINE.md),
 [the Sample 03 canary report](LONG_FORM_03_STAGED_CANARY.md), and
 [the July 22 acceptance run](ACCEPTANCE_RUN_2026-07-22.md). The implementation
-is prepared for the existing [draft PR #3](https://github.com/jspaulding-nv/realtime-s2s-demo-app-nemotron3/pull/3); the final local snapshot still needs to be committed and pushed.
+was subsequently committed and pushed on `agent/staged-nmt-tts-pipeline` at
+`55b59bd` and is tracked in
+[draft PR #6](https://github.com/jspaulding-nv/realtime-s2s-demo-app-nemotron3/pull/6).

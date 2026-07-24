@@ -9,7 +9,10 @@ queues. A real-time one-minute English-to-Spanish preflight completed on July
 22, 2026. The first full-length operational canary also passed: all 1,888.1045
 seconds of *Long-form sample 03* completed through the staged WebSocket
 path with 646 contiguous translated-audio sequence IDs and no pipeline,
-cleanup, WebSocket, container, or integrity error.
+cleanup, WebSocket, container, or integrity error. The later post-recovery
+Sample 02 canary also passed with 805 contiguous IDs and three validated NMT
+recoveries. Both remain standalone canaries rather than a completed,
+provenance-frozen matrix.
 
 This document records the direct orchestrator milestone and its standalone
 smoke. The later feature-flagged browser integration is documented in
@@ -234,8 +237,10 @@ completion, no PCM after completion, and no failure, cleanup error, incomplete
 ID, container restart, or GPU OOM.
 
 This is preserved historical evidence. It predates the narrow NMT recovery,
-closed-export settling, and allowlisted failed-capture retention, so the
-current code requires a fresh preflight and sample matrix.
+closed-export settling, and allowlisted failed-capture retention. The final
+recovery snapshot was subsequently exercised by the standalone Sample 02
+canary, but the current code still requires a fresh post-reboot preflight and
+clean sample matrix.
 
 | Metric | Observed |
 |---|---:|
@@ -263,6 +268,26 @@ failure investigations, corrective policies, and promotion record. Raw event
 streams, logs, plots, and runtime manifests are intentionally excluded from
 the public repository.
 
+## Post-recovery Sample 02 canary
+
+Commit `55b59bd` subsequently completed a standalone real-time Sample 02
+canary through the hardened staged path. The run reached `closed` / `complete`
+with 805 emitted, produced, and completed segments; contiguous IDs 0–804; and
+no incomplete ID, failure, cleanup error, connection loss, or timeout. The
+narrow NMT recovery completed three times and preserved its original sequence
+and provenance each time.
+
+The queue peaks were NMT 4, TTS 4, and output 1. Backpressure blocked 17 NMT
+puts and 5 TTS puts without dropping work. Last translated audio arrived only
+0.308 seconds after input ended, but the translated PCM was 1.08831x the source
+duration and fixed 1.00x playback ended 239.156 seconds late. The result
+therefore closes the targeted recovery gate, not the audience-latency gate.
+
+See
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md)
+for the frozen image digests, full aggregate measurements, restart observation,
+and exact next-run boundary.
+
 ## Audience-delay interpretation
 
 First output arrived in roughly 5.1 seconds in both the short sample and full
@@ -287,9 +312,10 @@ tail is under one second.
 
 ## Remaining work
 
-1. Run a fresh staged WebSocket preflight, then Sample 02, then all three
-   samples from one clean provenance-frozen commit; Sample 03's earlier
-   operational gate remains historical evidence.
+1. Relaunch FastAPI after the VM restart, run a fresh staged WebSocket
+   preflight, and then run all three samples from one clean provenance-frozen
+   commit. The standalone Sample 02 and historical Sample 03 canaries are
+   evidence, not resumable matrix checkpoints.
 2. Use the browser's existing 1.00x/1.05x/1.10x controller to record actual
    Web Audio queue seconds.
 3. Add synchronized marked-phrase/joke measurements; service tail alone does
