@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -79,6 +80,100 @@ def write_summary(
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def write_v2_summary(
+    path: Path,
+    parents: list[tuple[int, list[tuple[int, float]]]],
+    *,
+    raw_marker: str = "PRIVATE_MARKER",
+) -> None:
+    events = []
+    keys = []
+    retry_total = 0
+    for parent_sequence_id, (parent_text_chars, children) in enumerate(parents):
+        events.append(
+            {
+                "stage": "nmt",
+                "event": "completed",
+                "sequence_id": parent_sequence_id,
+                "text_chars": parent_text_chars,
+                "session_id": raw_marker,
+                "raw_text": raw_marker,
+            }
+        )
+        subsequence_count = len(children)
+        for subsequence_id, (text_chars, duration_seconds) in enumerate(
+            children
+        ):
+            identity = {
+                "parent_sequence_id": parent_sequence_id,
+                "subsequence_id": subsequence_id,
+                "subsequence_count": subsequence_count,
+            }
+            keys.append(identity)
+            events.extend(
+                [
+                    {
+                        "stage": "tts",
+                        "event": "started",
+                        "sequence_id": parent_sequence_id,
+                        **identity,
+                        "text_chars": text_chars,
+                        "parent_text_chars": parent_text_chars,
+                        "session_id": raw_marker,
+                        "raw_text": raw_marker,
+                    },
+                    {
+                        "stage": "tts",
+                        "event": "completed",
+                        "sequence_id": parent_sequence_id,
+                        **identity,
+                        "audio_duration_ms": duration_seconds * 1_000,
+                        "audio_bytes": max(
+                            1,
+                            round(duration_seconds * 32_000),
+                        ),
+                        "retry_count": 0,
+                        "session_id": raw_marker,
+                    },
+                ]
+            )
+
+    parent_ids = list(range(len(parents)))
+    payload = {
+        "audio_path": raw_marker,
+        "backend_url": raw_marker,
+        "staged_integrity": {
+            "applicable": True,
+            "passed": True,
+            "errors": [],
+        },
+        "staged_pipeline": {
+            "telemetry_schema_version": 2,
+            "tts_subsegmentation_enabled": True,
+            "state": "closed",
+            "outcome": "complete",
+            "failure": None,
+            "cleanup_errors": [],
+            "incomplete_sequence_ids": [],
+            "incomplete_subsegment_keys": [],
+            "segments_emitted": len(parents),
+            "audio_segments_produced": len(keys),
+            "tts_subsegments_planned": len(keys),
+            "tts_subsegments_produced": len(keys),
+            "completed_sequence_ids": parent_ids,
+            "websocket_sent_sequence_ids": parent_ids,
+            "planned_subsegment_keys": keys,
+            "synthesized_subsegment_keys": keys,
+            "completed_subsegment_keys": keys,
+            "websocket_sent_subsegment_keys": keys,
+            "tts_retry_count": retry_total,
+            "session_id": raw_marker,
+            "events": events,
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def observations(
     sample_index: int,
     pairs: list[tuple[int, float]],
@@ -94,6 +189,25 @@ def observations(
     )
 
 
+def v2_observations(
+    sample_index: int,
+    parents: list[list[tuple[int, float]]],
+) -> tuple[TtsDurationObservation, ...]:
+    return tuple(
+        TtsDurationObservation(
+            sample_index=sample_index,
+            sequence_id=parent_sequence_id,
+            subsequence_id=subsequence_id,
+            subsequence_count=len(children),
+            text_chars=text_chars,
+            audio_duration_seconds=duration,
+            telemetry_schema_version=2,
+        )
+        for parent_sequence_id, children in enumerate(parents)
+        for subsequence_id, (text_chars, duration) in enumerate(children)
+    )
+
+
 def test_load_summary_pairs_structural_started_and_completed_events(tmp_path):
     path = tmp_path / "capture_summary.json"
     write_summary(path, [(10, 1.0), (20, 1.5), (30, 2.0)])
@@ -102,6 +216,75 @@ def test_load_summary_pairs_structural_started_and_completed_events(tmp_path):
 
     assert loaded == observations(2, [(10, 1.0), (20, 1.5), (30, 2.0)])
     assert "PRIVATE_MARKER" not in repr(loaded)
+
+
+def test_load_v2_summary_pairs_multiple_children_by_composite_identity(
+    tmp_path,
+):
+    path = tmp_path / "split_capture_summary.json"
+    parents = [
+        (51, [(20, 1.2), (30, 1.8)]),
+        (18, [(18, 1.1)]),
+    ]
+    write_v2_summary(path, parents)
+
+    loaded = load_summary_observations(path, sample_index=1)
+
+    assert loaded == v2_observations(
+        1,
+        [
+            [(20, 1.2), (30, 1.8)],
+            [(18, 1.1)],
+        ],
+    )
+    assert [item.composite_key for item in loaded] == [
+        (0, 0, 2),
+        (0, 1, 2),
+        (1, 0, 1),
+    ]
+    assert "PRIVATE_MARKER" not in repr(loaded)
+
+
+def test_load_v2_summary_rejects_noncontiguous_children(tmp_path):
+    path = tmp_path / "split_gap_summary.json"
+    write_v2_summary(
+        path,
+        [(40, [(18, 1.0), (21, 1.2)])],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    child_events = [
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if event.get("stage") == "tts"
+        and event.get("subsequence_id") == 1
+    ]
+    for event in child_events:
+        event["subsequence_id"] = 2
+        event["subsequence_count"] = 3
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not contiguous"):
+        load_summary_observations(path, sample_index=1)
+
+
+def test_load_v2_summary_rejects_parent_character_mismatch(tmp_path):
+    path = tmp_path / "split_parent_chars_summary.json"
+    write_v2_summary(
+        path,
+        [(40, [(18, 1.0), (21, 1.2)])],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    started = next(
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if event.get("stage") == "tts"
+        and event.get("event") == "started"
+    )
+    started["parent_text_chars"] = 41
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="parent_text_chars differ"):
+        load_summary_observations(path, sample_index=1)
 
 
 def test_load_summary_rejects_failed_integrity(tmp_path):
@@ -319,6 +502,64 @@ def test_analysis_is_deterministic_for_identical_structural_records():
     assert first["structural_records_sha256"] == second[
         "structural_records_sha256"
     ]
+
+
+def test_v1_structural_digest_preserves_the_legacy_record_shape():
+    sample = observations(
+        1,
+        [(10, 1.0), (20, 1.5), (30, 2.0), (40, 2.5)],
+    )
+
+    analysis = build_analysis([sample])
+
+    assert analysis["schema_version"] == 1
+    assert analysis["structural_records_sha256"] == (
+        "53cb26306fec31b9f14a9b34eb4e3971553dc521866f4224ed6811c62188ba25"
+    )
+    assert "structural_digest_includes_composite_identity" not in analysis[
+        "semantics"
+    ]
+
+
+def test_v2_structural_digest_includes_composite_identity():
+    sample = v2_observations(
+        1,
+        [
+            [(20, 1.2), (30, 1.8)],
+            [(18, 1.1)],
+        ],
+    )
+    expected_records = [
+        {
+            "sample_index": item.sample_index,
+            "parent_sequence_id": item.parent_sequence_id,
+            "subsequence_id": item.subsequence_id,
+            "subsequence_count": item.subsequence_count,
+            "text_chars": item.text_chars,
+            "audio_duration_seconds": item.audio_duration_seconds,
+        }
+        for item in sample
+    ]
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            expected_records,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    analysis = build_analysis([sample])
+
+    assert analysis["schema_version"] == 2
+    assert analysis["structural_records_sha256"] == expected_digest
+    assert expected_digest == (
+        "07aac68ed600f17fd9afa0291fc78d7a3f0ccb4f8a7da86d9dd7239b7b6a0de9"
+    )
+    assert analysis["semantics"][
+        "structural_digest_includes_composite_identity"
+    ] is True
+    assert "parent/subsequence composite identity" in render_markdown(analysis)
 
 
 def test_build_analysis_rejects_invalid_threshold_relationship():

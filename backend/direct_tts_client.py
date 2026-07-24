@@ -12,7 +12,7 @@ import riva.client
 
 from config import SUPPORTED_LANGUAGES, audio_config, riva_config
 from staged_models import SynthesizedSegment, TranslatedSegment
-from target_text_validation import validate_target_text
+from target_text_validation import TargetTextValidationError, validate_target_text
 
 
 class DirectTTSError(RuntimeError):
@@ -25,10 +25,20 @@ class DirectTTSError(RuntimeError):
         message: str,
         *,
         segment: Optional[Any] = None,
+        translation: Optional[TranslatedSegment] = None,
     ) -> None:
-        self.segment = segment
-        self.sequence_id = (
-            segment.sequence_id if segment is not None else None
+        if segment is not None and translation is not None:
+            raise ValueError("provide segment or translation, not both")
+        self.translation = translation
+        self.segment = translation.segment if translation is not None else segment
+        identity = translation if translation is not None else segment
+        self.sequence_id = identity.sequence_id if identity is not None else None
+        self.parent_sequence_id = self.sequence_id
+        self.subsequence_id = (
+            translation.subsequence_id if translation is not None else None
+        )
+        self.subsequence_count = (
+            translation.subsequence_count if translation is not None else None
         )
         super().__init__(message)
 
@@ -41,6 +51,7 @@ class DirectTTSCancelled(DirectTTSError):
         message: str,
         *,
         segment: Optional[Any] = None,
+        translation: Optional[TranslatedSegment] = None,
         retry_count: int = 0,
     ) -> None:
         if (
@@ -50,7 +61,11 @@ class DirectTTSCancelled(DirectTTSError):
         ):
             raise ValueError("retry_count must be zero or one")
         self.retry_count = retry_count
-        super().__init__(message, segment=segment)
+        super().__init__(
+            message,
+            segment=segment,
+            translation=translation,
+        )
 
 
 class DirectTTSRetryError(DirectTTSError):
@@ -70,17 +85,24 @@ class DirectTTSRetryError(DirectTTSError):
         self.retry_status_code = _grpc_status_name(retry_error)
         message = (
             "Direct TTS retry failed for segment "
-            f"{translation.sequence_id}; initial_status="
+            f"{_translation_label(translation)}; initial_status="
             f"{self.initial_status_code or 'unknown'}; retry_error="
             f"{self.retry_error_code}"
         )
         if self.retry_status_code:
             message += f"; retry_status={self.retry_status_code}"
-        super().__init__(message, segment=translation.segment)
+        super().__init__(message, translation=translation)
 
 
 def _default_clock_ms() -> float:
     return time.monotonic() * 1000.0
+
+
+def _translation_label(translation: TranslatedSegment) -> str:
+    return (
+        f"{translation.sequence_id} subsequence "
+        f"{translation.subsequence_id + 1}/{translation.subsequence_count}"
+    )
 
 
 class DirectTTSClient:
@@ -253,11 +275,21 @@ class DirectTTSClient:
         """
         if not isinstance(translation, TranslatedSegment):
             raise TypeError("translation must be a TranslatedSegment")
-        text = validate_target_text(
-            translation.text,
-            language=translation.language,
-            sequence_id=translation.sequence_id,
-        )
+        try:
+            text = validate_target_text(
+                translation.text,
+                language=translation.language,
+                sequence_id=translation.sequence_id,
+            )
+        except TargetTextValidationError as exc:
+            # Preserve composite attribution without changing the public
+            # validation exception type expected by callers.
+            exc.translation = translation
+            exc.segment = translation.segment
+            exc.parent_sequence_id = translation.sequence_id
+            exc.subsequence_id = translation.subsequence_id
+            exc.subsequence_count = translation.subsequence_count
+            raise
         voice_name = self._voice_for_language(translation.language)
 
         with self._lifecycle_lock:
@@ -286,7 +318,7 @@ class DirectTTSClient:
                         raise DirectTTSCancelled(
                             "Direct TTS client disconnected before synthesis "
                             "attempt",
-                            segment=translation.segment,
+                            translation=translation,
                             retry_count=retry_count,
                         )
                 try:
@@ -294,8 +326,8 @@ class DirectTTSClient:
                 except Exception as exc:
                     clock_error = DirectTTSError(
                         "Direct TTS synthesis failed for segment "
-                        f"{translation.sequence_id}: timing clock failed",
-                        segment=translation.segment,
+                        f"{_translation_label(translation)}: timing clock failed",
+                        translation=translation,
                     )
                     if initial_error is not None:
                         raise DirectTTSRetryError(
@@ -366,7 +398,7 @@ class DirectTTSClient:
                     _cancel_call(call)
                     raise DirectTTSCancelled(
                         "Direct TTS client disconnected before synthesis started",
-                        segment=translation.segment,
+                        translation=translation,
                         retry_count=retry_count,
                     )
                 self._active_call = call
@@ -377,7 +409,7 @@ class DirectTTSClient:
                     if not self._connected:
                         raise DirectTTSCancelled(
                             "Direct TTS client disconnected during synthesis",
-                            segment=translation.segment,
+                            translation=translation,
                             retry_count=retry_count,
                         )
                 audio = bytes(getattr(response, "audio", b""))
@@ -387,20 +419,20 @@ class DirectTTSClient:
                     raise DirectTTSError(
                         "Direct TTS response chunk exceeded the configured limit: "
                         f"{len(audio)} > {self.max_response_chunk_bytes} bytes",
-                        segment=translation.segment,
+                        translation=translation,
                     )
                 if len(audio) % frame_bytes:
                     raise DirectTTSError(
                         "Direct TTS returned a partial PCM frame "
                         f"({len(audio)} bytes for {frame_bytes}-byte frames)",
-                        segment=translation.segment,
+                        translation=translation,
                     )
                 total_audio_bytes += len(audio)
                 if total_audio_bytes > self.max_audio_bytes:
                     raise DirectTTSError(
                         "Direct TTS segment exceeded the configured audio limit: "
                         f"{total_audio_bytes} > {self.max_audio_bytes} bytes",
-                        segment=translation.segment,
+                        translation=translation,
                     )
                 if first_audio_ms is None:
                     first_audio_ms = self._clock_ms()
@@ -410,13 +442,13 @@ class DirectTTSClient:
                 if not self._connected:
                     raise DirectTTSCancelled(
                         "Direct TTS client disconnected before synthesis completed",
-                        segment=translation.segment,
+                        translation=translation,
                         retry_count=retry_count,
                     )
             if not chunks or first_audio_ms is None:
                 raise DirectTTSError(
                     "Direct TTS returned no audio",
-                    segment=translation.segment,
+                    translation=translation,
                 )
             completed_ms = self._clock_ms()
             return SynthesizedSegment(
@@ -440,7 +472,7 @@ class DirectTTSClient:
             if disconnected:
                 raise DirectTTSCancelled(
                     "Direct TTS synthesis was cancelled by client shutdown",
-                    segment=translation.segment,
+                    translation=translation,
                     retry_count=retry_count,
                 ) from exc
             status = _grpc_status_name(exc)
@@ -449,8 +481,8 @@ class DirectTTSClient:
                 diagnostic += f"/{status}"
             raise DirectTTSError(
                 "Direct TTS synthesis failed for segment "
-                f"{translation.segment.sequence_id}: {diagnostic}",
-                segment=translation.segment,
+                f"{_translation_label(translation)}: {diagnostic}",
+                translation=translation,
             ) from exc
         finally:
             with self._lifecycle_lock:

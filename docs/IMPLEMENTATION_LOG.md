@@ -834,6 +834,46 @@ The post-model Python backend, analysis, and harness suite passed 431 tests
 with one optional local-trace test skipped; the focused analyzer suite passed
 18 tests.
 
+## July 24, 2026: default-off post-NMT TTS subsegmentation
+
+The feature-flagged staged path now keeps one complete NMT parent and can split
+only its validated target text before TTS. Zero disables splitting; positive
+caps use punctuation, whitespace, and bounded hard-fallback rules with exact
+normalized reconstruction tests.
+
+Every enabled TTS child carries a stable
+`(parent_sequence_id, subsequence_id, subsequence_count)` identity. The bounded
+queues, single TTS worker, output relay, atomic retry, error attribution,
+WebSocket sends, and telemetry preserve that identity. Raw run evidence remains
+privacy-sensitive because it can include session IDs, timings, paths, and
+endpoints, so it stays under ignored result directories. The pipeline marks a
+parent complete only after its final child is dequeued; the WebSocket layer
+separately proves that every completed child was successfully sent before the
+capture is accepted as end-to-end complete.
+
+Enabled captures use telemetry schema v2 with distinct planned, synthesized,
+dequeued, and WebSocket-sent child lists. The batch gate checks every lifecycle
+stream and compares client/server PCM sizes frame by frame. Disabled captures
+remain schema v1, and older captures with no explicit version retain legacy
+`(sequence, 0, 1)` semantics. The duration analyzer preserves the published v1
+digest and generated files byte for byte while adding composite v2 pairing.
+
+`run_tts_subsegment_canary.sh` creates one shared five-minute prefix and runs
+the disabled, 40-, 45-, and 60-character policies sequentially. It manages
+only its own FastAPI process and leaves the pinned NIMs untouched. Formal
+five-minute results remain pending; implementation details and gates are in
+[Default-off post-NMT TTS subsegmentation](TTS_SUBSEGMENT_IMPLEMENTATION.md).
+
+A non-formal 60-second-per-arm live probe passed every integrity, provenance,
+terminal, and cleanup gate. Splitting reduced child-duration p95 by 64.5–71.0%
+but increased total generated audio and worsened adaptive queue p95 and
+listener tail in every enabled arm. The 60-character policy was least harmful
+but still did not beat the disabled control. First audio remained about
+15.5–15.7 seconds. See
+[Post-NMT TTS subsegmentation: 60-second live probe](TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md).
+The final local Python suite passed 514 tests with one optional local-trace
+test skipped.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -855,7 +895,7 @@ with one optional local-trace test skipped; the focused analyzer suite passed
 - [x] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
 - [x] Sweep no-drop playback capacity on the completed matched traces
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
-- [ ] Implement default-off composite-key post-NMT TTS subsegmentation
+- [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [ ] Run matched unsplit/40/45/60 short real-time canaries
 - [x] Keep unapproved private/internal container references out of external
   documentation

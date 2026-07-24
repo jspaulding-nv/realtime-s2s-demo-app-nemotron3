@@ -175,6 +175,755 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+_MISSING = object()
+_SUPPORTED_STAGED_TELEMETRY_SCHEMAS = {1, 2}
+_SUBSEGMENT_LIFECYCLE_EVENTS = (
+    ("target_splitter", "emitted"),
+    ("tts", "enqueued"),
+    ("tts", "started"),
+    ("tts", "first_audio"),
+    ("tts", "completed"),
+    ("output", "enqueued"),
+    ("output", "dequeued"),
+)
+
+
+def _is_terminal_output_dequeue(
+    event_name: tuple[Any, Any],
+    event: dict[str, Any],
+) -> bool:
+    """Return whether this is the identity-free COMPLETE queue dequeue.
+
+    The pipeline records ``output/dequeued`` for both AUDIO children and the
+    terminal COMPLETE event. Only AUDIO dequeues carry composite identity and
+    positive PCM bytes. Keep validating every other output dequeue as a child,
+    so an identity-free positive-audio event still fails closed.
+    """
+
+    audio_bytes = event.get("audio_bytes")
+    return (
+        event_name == ("output", "dequeued")
+        and event.get("sequence_id") is None
+        and event.get("parent_sequence_id") is None
+        and event.get("subsequence_id") is None
+        and event.get("subsequence_count") is None
+        and isinstance(audio_bytes, int)
+        and not isinstance(audio_bytes, bool)
+        and audio_bytes == 0
+    )
+
+
+def _staged_telemetry_schema_version(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> int | None:
+    """Return an explicitly valid version; a missing field is legacy v1."""
+    if value is _MISSING:
+        return 1
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value not in _SUPPORTED_STAGED_TELEMETRY_SCHEMAS
+    ):
+        errors.append(f"{field_name} must be 1 or 2")
+        return None
+    return value
+
+
+def _subsegment_key(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+    sequence_alias: Any = _MISSING,
+) -> tuple[int, int, int] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{field_name} must be an object")
+        return None
+    parent = value.get("parent_sequence_id")
+    subsequence_id = value.get("subsequence_id")
+    subsequence_count = value.get("subsequence_count")
+    if (
+        not isinstance(parent, int)
+        or isinstance(parent, bool)
+        or parent < 0
+    ):
+        errors.append(f"{field_name}.parent_sequence_id is invalid")
+        return None
+    if (
+        not isinstance(subsequence_id, int)
+        or isinstance(subsequence_id, bool)
+        or subsequence_id < 0
+    ):
+        errors.append(f"{field_name}.subsequence_id is invalid")
+        return None
+    if not _positive_int(subsequence_count):
+        errors.append(f"{field_name}.subsequence_count is invalid")
+        return None
+    if subsequence_id >= subsequence_count:
+        errors.append(
+            f"{field_name}.subsequence_id must be less than subsequence_count"
+        )
+        return None
+    if sequence_alias is not _MISSING and sequence_alias != parent:
+        errors.append(
+            f"{field_name}.sequence_id must equal parent_sequence_id"
+        )
+        return None
+    return parent, subsequence_id, subsequence_count
+
+
+def _subsegment_keys(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> list[tuple[int, int, int]] | None:
+    if not isinstance(value, list):
+        errors.append(f"{field_name} must be a list")
+        return None
+    keys: list[tuple[int, int, int]] = []
+    valid = True
+    for index, item in enumerate(value):
+        key = _subsegment_key(
+            item,
+            field_name=f"{field_name}[{index}]",
+            errors=errors,
+        )
+        if key is None:
+            valid = False
+        else:
+            keys.append(key)
+    return keys if valid else None
+
+
+def _validate_complete_subsegment_order(
+    keys: list[tuple[int, int, int]] | None,
+    completed_parent_ids: list[int] | None,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> None:
+    """Require lexical parent/child order with one stable count per parent."""
+    if keys is None or completed_parent_ids is None:
+        return
+    counts: dict[int, int] = {}
+    parent_order: list[int] = []
+    for parent, _subsequence_id, count in keys:
+        if parent not in counts:
+            counts[parent] = count
+            parent_order.append(parent)
+        elif counts[parent] != count:
+            errors.append(
+                f"{field_name} subsequence_count changed within parent {parent}"
+            )
+            return
+
+    expected: list[tuple[int, int, int]] = []
+    for parent in completed_parent_ids:
+        count = counts.get(parent)
+        if count is None:
+            errors.append(
+                f"{field_name} has no subsegments for completed parent {parent}"
+            )
+            return
+        expected.extend((parent, child, count) for child in range(count))
+
+    if parent_order != completed_parent_ids or keys != expected:
+        errors.append(
+            f"{field_name} must contain every parent in ordered contiguous "
+            "subsequence order"
+        )
+
+
+def _validate_staged_pipeline_integrity_v2(
+    staged_pipeline: dict[str, Any],
+    staged_config: dict[str, Any] | None,
+    websocket_receive_events: Any,
+    input_end_timestamp_ms: Any,
+    errors: list[str],
+) -> list[str]:
+    """Validate the explicit composite-child telemetry contract."""
+    if staged_pipeline.get("state") != "closed":
+        errors.append(
+            "staged state must be 'closed' "
+            f"(got {staged_pipeline.get('state')!r})"
+        )
+    if staged_pipeline.get("outcome") != "complete":
+        errors.append(
+            "staged outcome must be 'complete' "
+            f"(got {staged_pipeline.get('outcome')!r})"
+        )
+    if staged_pipeline.get("failure") is not None:
+        errors.append("staged failure must be null")
+    cleanup_errors = staged_pipeline.get("cleanup_errors")
+    if not isinstance(cleanup_errors, list):
+        errors.append("cleanup_errors must be a list")
+    elif cleanup_errors:
+        errors.append("cleanup_errors must be empty")
+
+    received_pcm_bytes: list[int] = []
+    if not isinstance(websocket_receive_events, list):
+        errors.append("websocket_receive_events must be a list")
+    else:
+        completed_orders: list[int] = []
+        completed_timestamps: list[float] = []
+        observed_orders: list[int] = []
+        valid_orders = True
+        for index, event in enumerate(websocket_receive_events):
+            if not isinstance(event, dict):
+                errors.append(
+                    f"websocket_receive_events[{index}] must be an object"
+                )
+                valid_orders = False
+                continue
+            order = event.get("order")
+            if (
+                not isinstance(order, int)
+                or isinstance(order, bool)
+                or order < 0
+            ):
+                errors.append(
+                    f"websocket_receive_events[{index}].order is invalid"
+                )
+                valid_orders = False
+                continue
+            observed_orders.append(order)
+            if event.get("frame_type") == "pcm":
+                audio_bytes = event.get("audio_bytes")
+                if not _positive_int(audio_bytes):
+                    errors.append(
+                        f"websocket_receive_events[{index}].audio_bytes is invalid"
+                    )
+                else:
+                    received_pcm_bytes.append(audio_bytes)
+            if (
+                event.get("frame_type") == "control"
+                and event.get("message_type") == "status"
+                and event.get("status") == "completed"
+            ):
+                completed_orders.append(order)
+                timestamp_ms = event.get("timestamp_ms")
+                if (
+                    not isinstance(timestamp_ms, (int, float))
+                    or isinstance(timestamp_ms, bool)
+                    or not math.isfinite(timestamp_ms)
+                    or timestamp_ms < 0
+                ):
+                    errors.append(
+                        f"websocket_receive_events[{index}].timestamp_ms is invalid"
+                    )
+                else:
+                    completed_timestamps.append(float(timestamp_ms))
+
+        if valid_orders and observed_orders != list(range(len(observed_orders))):
+            errors.append(
+                "websocket_receive_events order must be contiguous from zero"
+            )
+        if len(completed_orders) != 1:
+            errors.append(
+                "exactly one completed WebSocket terminal is required "
+                f"(got {len(completed_orders)})"
+            )
+        elif any(
+            isinstance(event, dict)
+            and event.get("frame_type") == "pcm"
+            and isinstance(event.get("order"), int)
+            and event["order"] > completed_orders[0]
+            for event in websocket_receive_events
+        ):
+            errors.append("PCM was received after the completed WebSocket terminal")
+        if (
+            not isinstance(input_end_timestamp_ms, (int, float))
+            or isinstance(input_end_timestamp_ms, bool)
+            or not math.isfinite(input_end_timestamp_ms)
+            or input_end_timestamp_ms <= 0
+        ):
+            errors.append("input_end_timestamp_ms must be positive and finite")
+        elif len(completed_timestamps) == 1 and (
+            completed_timestamps[0] < float(input_end_timestamp_ms)
+        ):
+            errors.append("completed WebSocket terminal arrived before end_input")
+
+    incomplete = _sequence_ids(
+        staged_pipeline.get("incomplete_sequence_ids"),
+        field_name="incomplete_sequence_ids",
+        errors=errors,
+    )
+    if incomplete:
+        errors.append(f"incomplete sequence IDs remain: {incomplete}")
+    completed = _sequence_ids(
+        staged_pipeline.get("completed_sequence_ids"),
+        field_name="completed_sequence_ids",
+        errors=errors,
+    )
+    websocket_sent = _sequence_ids(
+        staged_pipeline.get("websocket_sent_sequence_ids"),
+        field_name="websocket_sent_sequence_ids",
+        errors=errors,
+    )
+    if completed is not None:
+        expected_parents = list(range(len(completed)))
+        if completed != expected_parents:
+            errors.append(
+                "completed_sequence_ids must be contiguous and ordered from zero "
+                f"(got {completed})"
+            )
+    if (
+        completed is not None
+        and websocket_sent is not None
+        and websocket_sent != completed
+    ):
+        errors.append(
+            "websocket_sent_sequence_ids must exactly match completed_sequence_ids"
+        )
+
+    planned = _subsegment_keys(
+        staged_pipeline.get("planned_subsegment_keys"),
+        field_name="planned_subsegment_keys",
+        errors=errors,
+    )
+    synthesized = _subsegment_keys(
+        staged_pipeline.get("synthesized_subsegment_keys"),
+        field_name="synthesized_subsegment_keys",
+        errors=errors,
+    )
+    completed_subsegments = _subsegment_keys(
+        staged_pipeline.get("completed_subsegment_keys"),
+        field_name="completed_subsegment_keys",
+        errors=errors,
+    )
+    incomplete_subsegments = _subsegment_keys(
+        staged_pipeline.get("incomplete_subsegment_keys"),
+        field_name="incomplete_subsegment_keys",
+        errors=errors,
+    )
+    websocket_sent_subsegments = _subsegment_keys(
+        staged_pipeline.get("websocket_sent_subsegment_keys"),
+        field_name="websocket_sent_subsegment_keys",
+        errors=errors,
+    )
+    _validate_complete_subsegment_order(
+        planned,
+        completed,
+        field_name="planned_subsegment_keys",
+        errors=errors,
+    )
+    for field_name, observed in (
+        ("synthesized_subsegment_keys", synthesized),
+        ("completed_subsegment_keys", completed_subsegments),
+        ("websocket_sent_subsegment_keys", websocket_sent_subsegments),
+    ):
+        if planned is not None and observed is not None and observed != planned:
+            errors.append(f"{field_name} must exactly match planned_subsegment_keys")
+    if incomplete_subsegments:
+        errors.append(
+            "incomplete_subsegment_keys must be empty for a complete pipeline"
+        )
+
+    parent_count = len(completed) if completed is not None else None
+    child_count = len(planned) if planned is not None else None
+    segments_emitted = staged_pipeline.get("segments_emitted")
+    if (
+        parent_count is not None
+        and (
+            not isinstance(segments_emitted, int)
+            or isinstance(segments_emitted, bool)
+            or segments_emitted != parent_count
+        )
+    ):
+        errors.append(
+            "segments_emitted must equal the completed parent count "
+            f"({parent_count})"
+        )
+    for count_name in (
+        "tts_subsegments_planned",
+        "tts_subsegments_produced",
+        "audio_segments_produced",
+    ):
+        count = staged_pipeline.get(count_name)
+        if (
+            child_count is not None
+            and (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count != child_count
+            )
+        ):
+            errors.append(
+                f"{count_name} must equal the completed subsegment count "
+                f"({child_count})"
+            )
+
+    if staged_pipeline.get("tts_subsegmentation_enabled") is not True:
+        errors.append("schema-v2 telemetry requires tts_subsegmentation_enabled=true")
+    max_chars = None
+    min_chars = None
+    if staged_config is None:
+        errors.append("/api/config.stagedConfig must be an object for schema v2")
+    else:
+        max_chars = staged_config.get("ttsSubsegmentMaxChars")
+        min_chars = staged_config.get("ttsSubsegmentMinChars")
+        if not _positive_int(max_chars):
+            errors.append(
+                "/api/config.stagedConfig.ttsSubsegmentMaxChars must be "
+                "a positive integer for schema v2"
+            )
+            max_chars = None
+        if not _positive_int(min_chars):
+            errors.append(
+                "/api/config.stagedConfig.ttsSubsegmentMinChars must be "
+                "a positive integer"
+            )
+            min_chars = None
+    if (
+        max_chars is not None
+        and staged_pipeline.get("tts_subsegment_max_chars") != max_chars
+    ):
+        errors.append(
+            "staged tts_subsegment_max_chars must match "
+            "/api/config.stagedConfig.ttsSubsegmentMaxChars"
+        )
+    if (
+        min_chars is not None
+        and staged_pipeline.get("tts_subsegment_min_chars") != min_chars
+    ):
+        errors.append(
+            "staged tts_subsegment_min_chars must match "
+            "/api/config.stagedConfig.ttsSubsegmentMinChars"
+        )
+
+    websocket_events = staged_pipeline.get("websocket_send_events")
+    websocket_event_keys: list[tuple[int, int, int]] | None = []
+    websocket_event_audio_bytes: list[int] = []
+    if not isinstance(websocket_events, list):
+        errors.append("websocket_send_events must be a list")
+        websocket_event_keys = None
+    else:
+        valid_websocket_events = True
+        for index, event in enumerate(websocket_events):
+            if not isinstance(event, dict):
+                errors.append(f"websocket_send_events[{index}] must be an object")
+                valid_websocket_events = False
+                continue
+            key = _subsegment_key(
+                event,
+                field_name=f"websocket_send_events[{index}]",
+                errors=errors,
+                sequence_alias=event.get("sequence_id"),
+            )
+            if key is None:
+                valid_websocket_events = False
+            else:
+                websocket_event_keys.append(key)
+            audio_bytes = event.get("audio_bytes")
+            if not _positive_int(audio_bytes):
+                errors.append(
+                    f"websocket_send_events[{index}].audio_bytes is invalid"
+                )
+                valid_websocket_events = False
+            else:
+                websocket_event_audio_bytes.append(audio_bytes)
+            sent_ms = event.get("sent_monotonic_ms")
+            if (
+                not isinstance(sent_ms, (int, float))
+                or isinstance(sent_ms, bool)
+                or not math.isfinite(sent_ms)
+                or sent_ms < 0
+            ):
+                errors.append(
+                    f"websocket_send_events[{index}].sent_monotonic_ms is invalid"
+                )
+                valid_websocket_events = False
+        if not valid_websocket_events:
+            websocket_event_keys = None
+
+    if (
+        websocket_event_keys is not None
+        and websocket_sent_subsegments is not None
+        and websocket_event_keys != websocket_sent_subsegments
+    ):
+        errors.append(
+            "websocket_send_events composite order must exactly match "
+            "websocket_sent_subsegment_keys"
+        )
+    if isinstance(websocket_receive_events, list):
+        if len(received_pcm_bytes) != len(websocket_event_audio_bytes):
+            errors.append(
+                "WebSocket PCM receive count must exactly match successful "
+                "send count "
+                f"({len(received_pcm_bytes)} != "
+                f"{len(websocket_event_audio_bytes)})"
+            )
+        elif received_pcm_bytes != websocket_event_audio_bytes:
+            errors.append(
+                "WebSocket PCM received bytes must exactly match successful "
+                "send bytes frame-by-frame"
+            )
+
+    events = staged_pipeline.get("events")
+    if not isinstance(events, list):
+        errors.append("staged events must be a list")
+        events = []
+    parent_event_sequences: dict[tuple[str, str], list[int]] = {
+        ("segmenter", "emitted"): [],
+        ("nmt", "completed"): [],
+    }
+    child_event_records: dict[
+        tuple[str, str],
+        list[tuple[tuple[int, int, int], dict[str, Any], int]],
+    ] = {key: [] for key in _SUBSEGMENT_LIFECYCLE_EVENTS}
+    nmt_completed_chars: dict[int, int] = {}
+    nmt_event_retry_total = 0
+    tts_event_retry_total = 0
+    tts_retry_observed = False
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            errors.append(f"events[{index}] must be an object")
+            continue
+        event_name = (event.get("stage"), event.get("event"))
+        sequence_id = event.get("sequence_id")
+        if event_name in parent_event_sequences:
+            if (
+                not isinstance(sequence_id, int)
+                or isinstance(sequence_id, bool)
+                or sequence_id < 0
+            ):
+                errors.append(f"events[{index}].sequence_id is invalid")
+            else:
+                parent_event_sequences[event_name].append(sequence_id)
+                if event_name == ("nmt", "completed"):
+                    text_chars = event.get("text_chars")
+                    if not _positive_int(text_chars):
+                        errors.append(f"events[{index}].text_chars is invalid")
+                    elif sequence_id in nmt_completed_chars:
+                        errors.append(
+                            f"duplicate nmt/completed event for parent {sequence_id}"
+                        )
+                    else:
+                        nmt_completed_chars[sequence_id] = text_chars
+
+        if (
+            event_name in child_event_records
+            and not _is_terminal_output_dequeue(event_name, event)
+        ):
+            key = _subsegment_key(
+                event,
+                field_name=f"events[{index}]",
+                errors=errors,
+                sequence_alias=sequence_id,
+            )
+            if key is not None:
+                child_event_records[event_name].append((key, event, index))
+
+        if event_name in {
+            ("nmt", "completed"),
+            ("nmt", "error"),
+            ("tts", "completed"),
+            ("tts", "error"),
+        }:
+            retry_count = event.get("retry_count")
+            if (
+                not isinstance(retry_count, int)
+                or isinstance(retry_count, bool)
+                or retry_count not in {0, 1}
+            ):
+                errors.append(
+                    f"events[{index}].retry_count must be zero or one"
+                )
+            elif event_name == ("nmt", "completed"):
+                nmt_event_retry_total += retry_count
+            elif event_name == ("tts", "completed"):
+                tts_event_retry_total += retry_count
+                tts_retry_observed = tts_retry_observed or retry_count == 1
+            elif event_name == ("tts", "error"):
+                tts_retry_observed = tts_retry_observed or retry_count == 1
+
+        queue_depth = event.get("queue_depth")
+        queue_capacity = event.get("queue_capacity")
+        if queue_depth is None and queue_capacity is None:
+            continue
+        if (
+            not isinstance(queue_depth, int)
+            or isinstance(queue_depth, bool)
+            or queue_depth < 0
+        ):
+            errors.append(f"events[{index}].queue_depth is invalid")
+            continue
+        if not _positive_int(queue_capacity):
+            errors.append(f"events[{index}].queue_capacity is invalid")
+            continue
+        if queue_depth > queue_capacity:
+            errors.append(
+                f"events[{index}] queue depth {queue_depth} exceeds "
+                f"capacity {queue_capacity}"
+            )
+
+    if completed is not None:
+        for (stage, event_name), observed in parent_event_sequences.items():
+            if observed != completed:
+                errors.append(
+                    f"{stage}/{event_name} parent sequence order must exactly "
+                    "match completed_sequence_ids"
+                )
+    if planned is not None:
+        for (stage, event_name), records in child_event_records.items():
+            observed = [record[0] for record in records]
+            if observed != planned:
+                errors.append(
+                    f"{stage}/{event_name} composite order must exactly match "
+                    "planned_subsegment_keys"
+                )
+
+    child_char_maps: dict[
+        tuple[str, str], dict[tuple[int, int, int], int]
+    ] = {}
+    for event_name in (
+        ("target_splitter", "emitted"),
+        ("tts", "enqueued"),
+        ("tts", "started"),
+    ):
+        child_chars: dict[tuple[int, int, int], int] = {}
+        for key, event, index in child_event_records[event_name]:
+            text_chars = event.get("text_chars")
+            if not _positive_int(text_chars):
+                errors.append(f"events[{index}].text_chars is invalid")
+                continue
+            if max_chars is not None and text_chars > max_chars:
+                errors.append(
+                    f"events[{index}].text_chars exceeds configured "
+                    f"ttsSubsegmentMaxChars={max_chars}"
+                )
+            child_chars[key] = text_chars
+        child_char_maps[event_name] = child_chars
+    splitter_chars = child_char_maps[("target_splitter", "emitted")]
+    for event_name in (("tts", "enqueued"), ("tts", "started")):
+        if child_char_maps[event_name] != splitter_chars:
+            errors.append(
+                f"{event_name[0]}/{event_name[1]} text_chars must exactly "
+                "match target_splitter/emitted"
+            )
+    for event_name in (
+        ("target_splitter", "emitted"),
+        ("tts", "started"),
+    ):
+        for key, event, index in child_event_records[event_name]:
+            parent_chars = event.get("parent_text_chars")
+            expected_parent_chars = nmt_completed_chars.get(key[0])
+            if not _positive_int(parent_chars):
+                errors.append(
+                    f"events[{index}].parent_text_chars is invalid"
+                )
+            elif (
+                expected_parent_chars is None
+                or parent_chars != expected_parent_chars
+            ):
+                errors.append(
+                    f"events[{index}].parent_text_chars must match "
+                    "nmt/completed.text_chars"
+                )
+
+    lifecycle_audio_bytes: dict[tuple[str, str], list[int]] = {}
+    for event_name in (
+        ("tts", "completed"),
+        ("output", "enqueued"),
+        ("output", "dequeued"),
+    ):
+        values: list[int] = []
+        for _key, event, index in child_event_records[event_name]:
+            audio_bytes = event.get("audio_bytes")
+            if not _positive_int(audio_bytes):
+                errors.append(f"events[{index}].audio_bytes is invalid")
+            else:
+                values.append(audio_bytes)
+        lifecycle_audio_bytes[event_name] = values
+    tts_audio_bytes = lifecycle_audio_bytes[("tts", "completed")]
+    for event_name in (("output", "enqueued"), ("output", "dequeued")):
+        if lifecycle_audio_bytes[event_name] != tts_audio_bytes:
+            errors.append(
+                f"{event_name[0]}/{event_name[1]} audio_bytes must exactly "
+                "match tts/completed"
+            )
+    if websocket_event_audio_bytes != tts_audio_bytes:
+        errors.append(
+            "websocket_send_events audio_bytes must exactly match "
+            "tts/completed frame-by-frame"
+        )
+
+    nmt_retry_count = staged_pipeline.get("nmt_retry_count")
+    if (
+        not isinstance(nmt_retry_count, int)
+        or isinstance(nmt_retry_count, bool)
+        or nmt_retry_count < 0
+    ):
+        errors.append("nmt_retry_count must be a non-negative integer")
+    elif nmt_retry_count != nmt_event_retry_total:
+        errors.append(
+            "nmt_retry_count must equal the sum of nmt/completed event retries "
+            f"({nmt_retry_count} != {nmt_event_retry_total})"
+        )
+    tts_retry_count = staged_pipeline.get("tts_retry_count")
+    if (
+        not isinstance(tts_retry_count, int)
+        or isinstance(tts_retry_count, bool)
+        or tts_retry_count < 0
+    ):
+        errors.append("tts_retry_count must be a non-negative integer")
+    elif tts_retry_count != tts_event_retry_total:
+        errors.append(
+            "tts_retry_count must equal the sum of tts/completed event retries "
+            f"({tts_retry_count} != {tts_event_retry_total})"
+        )
+
+    if staged_config is not None:
+        tts_max_retries = staged_config.get("ttsMaxRetries")
+        if (
+            not isinstance(tts_max_retries, int)
+            or isinstance(tts_max_retries, bool)
+            or tts_max_retries not in {0, 1}
+        ):
+            errors.append(
+                "/api/config.stagedConfig.ttsMaxRetries must be zero or one"
+            )
+        elif tts_max_retries == 0 and tts_retry_observed:
+            errors.append(
+                "TTS retry telemetry is incompatible with "
+                "/api/config.stagedConfig.ttsMaxRetries=0"
+            )
+
+    max_depths = staged_pipeline.get("max_queue_depths")
+    if not isinstance(max_depths, dict):
+        errors.append("max_queue_depths must be an object")
+    elif staged_config is not None:
+        for queue_name, config_key in {
+            "nmt": "nmtQueueMaxSize",
+            "tts": "ttsQueueMaxSize",
+            "output": "outputQueueMaxSize",
+        }.items():
+            capacity = staged_config.get(config_key)
+            depth = max_depths.get(queue_name)
+            if not _positive_int(capacity):
+                errors.append(
+                    f"/api/config.stagedConfig.{config_key} must be a positive integer"
+                )
+                continue
+            if (
+                not isinstance(depth, int)
+                or isinstance(depth, bool)
+                or depth < 0
+            ):
+                errors.append(f"max_queue_depths.{queue_name} is invalid")
+                continue
+            if depth > capacity:
+                errors.append(
+                    f"max_queue_depths.{queue_name}={depth} exceeds configured "
+                    f"capacity {capacity}"
+                )
+    return errors
+
+
 def validate_staged_pipeline_integrity(
     staged_pipeline: Any,
     backend_config: dict,
@@ -190,6 +939,72 @@ def validate_staged_pipeline_integrity(
     errors: list[str] = []
     if not isinstance(staged_pipeline, dict):
         return ["/api/test/export.stagedPipeline must be a JSON object"]
+
+    staged_config = (
+        backend_config.get("stagedConfig")
+        if isinstance(backend_config, dict)
+        else None
+    )
+    if staged_config is not None and not isinstance(staged_config, dict):
+        errors.append("/api/config.stagedConfig must be an object")
+        staged_config = None
+    summary_schema = _staged_telemetry_schema_version(
+        staged_pipeline.get("telemetry_schema_version", _MISSING),
+        field_name="telemetry_schema_version",
+        errors=errors,
+    )
+    config_schema = _staged_telemetry_schema_version(
+        (
+            staged_config.get("telemetrySchemaVersion", _MISSING)
+            if staged_config is not None
+            else _MISSING
+        ),
+        field_name="/api/config.stagedConfig.telemetrySchemaVersion",
+        errors=errors,
+    )
+    if (
+        summary_schema is not None
+        and config_schema is not None
+        and summary_schema != config_schema
+    ):
+        errors.append(
+            "staged telemetry schema version must match "
+            "/api/config.stagedConfig.telemetrySchemaVersion "
+            f"({summary_schema} != {config_schema})"
+        )
+    if summary_schema == 2:
+        return _validate_staged_pipeline_integrity_v2(
+            staged_pipeline,
+            staged_config,
+            websocket_receive_events,
+            input_end_timestamp_ms,
+            errors,
+        )
+
+    configured_cap = (
+        staged_config.get("ttsSubsegmentMaxChars", 0)
+        if staged_config is not None
+        else 0
+    )
+    if (
+        not isinstance(configured_cap, int)
+        or isinstance(configured_cap, bool)
+        or configured_cap < 0
+    ):
+        errors.append(
+            "/api/config.stagedConfig.ttsSubsegmentMaxChars must be "
+            "a non-negative integer"
+        )
+    elif configured_cap != 0:
+        errors.append(
+            "schema-v1 telemetry requires "
+            "/api/config.stagedConfig.ttsSubsegmentMaxChars=0"
+        )
+    enabled = staged_pipeline.get("tts_subsegmentation_enabled", False)
+    if enabled is not False:
+        errors.append(
+            "schema-v1 telemetry requires tts_subsegmentation_enabled=false"
+        )
 
     if staged_pipeline.get("state") != "closed":
         errors.append(
@@ -394,12 +1209,10 @@ def validate_staged_pipeline_integrity(
                     f"({len(received_pcm_bytes)} != "
                     f"{len(websocket_event_audio_bytes)})"
                 )
-            elif sum(received_pcm_bytes) != sum(websocket_event_audio_bytes):
+            elif received_pcm_bytes != websocket_event_audio_bytes:
                 errors.append(
                     "WebSocket PCM received bytes must exactly match successful "
-                    "send bytes "
-                    f"({sum(received_pcm_bytes)} != "
-                    f"{sum(websocket_event_audio_bytes)})"
+                    "send bytes frame-by-frame"
                 )
 
     events = staged_pipeline.get("events")

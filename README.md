@@ -149,7 +149,7 @@ realtime-s2s-demo-app/
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - Node.js 20.19+ or 22.12+
 - Docker with NVIDIA Container Toolkit and a visible CDI GPU device
 - An NGC Personal Key with access to the NGC Catalog
@@ -300,6 +300,14 @@ npm install
 npm run dev
 ```
 
+### Tests
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+PYTHONPATH=backend:. python3 -m pytest -p no:cacheprovider -q \
+  backend/tests tests
+```
+
 ## Configuration
 
 ### Riva Server
@@ -325,6 +333,8 @@ STAGED_NMT_RPC_TIMEOUT_SECONDS=15
 STAGED_TTS_RPC_TIMEOUT_SECONDS=60
 STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
 STAGED_TTS_MAX_RETRIES=1
+STAGED_TTS_SUBSEGMENT_MAX_CHARS=0
+STAGED_TTS_SUBSEGMENT_MIN_CHARS=12
 STAGED_CLOSE_TIMEOUT_SECONDS=10
 S2S_PIPELINE_MODE=monolithic
 ```
@@ -584,6 +594,8 @@ The model selects a strict 40-character starting cap, while identifying 45 and
 are offline sizing results, not evidence that splitting improves live delay;
 see the measured tradeoffs and required composite sequence contract in
 [Post-NMT TTS subsegment capacity model](docs/TTS_SUBSEGMENT_CAPACITY_MODEL.md).
+The default-off implementation and automated matched canary procedure are in
+[Post-NMT TTS subsegment implementation](docs/TTS_SUBSEGMENT_IMPLEMENTATION.md).
 
 Detailed guides:
 
@@ -598,6 +610,8 @@ Detailed guides:
 - [Atomic TTS recovery and privacy-safe short-segment replay](docs/TTS_SHORT_SEGMENT_RECOVERY.md)
 - [July 24 staged recovery three-sample matrix](docs/STAGED_RECOVERY_MATRIX_2026-07-24.md)
 - [Post-NMT TTS subsegment capacity model](docs/TTS_SUBSEGMENT_CAPACITY_MODEL.md)
+- [Default-off post-NMT TTS subsegmentation and matched canary](docs/TTS_SUBSEGMENT_IMPLEMENTATION.md)
+- [Post-NMT TTS subsegmentation 60-second live probe](docs/TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

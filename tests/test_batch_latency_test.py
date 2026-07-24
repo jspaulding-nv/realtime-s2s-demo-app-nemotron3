@@ -128,6 +128,207 @@ def successful_websocket_receive_events():
     ]
 
 
+def staged_config_v2(max_chars=40):
+    config = staged_config()
+    config["stagedConfig"].update(
+        {
+            "telemetrySchemaVersion": 2,
+            "ttsSubsegmentMaxChars": max_chars,
+            "ttsSubsegmentMinChars": 12,
+        }
+    )
+    return config
+
+
+def successful_staged_export_v2():
+    parent_specs = {
+        0: {
+            "parent_text_chars": 39,
+            "children": [
+                (0, 2, 20, 3200),
+                (1, 2, 18, 4800),
+            ],
+        },
+        1: {
+            "parent_text_chars": 30,
+            "children": [(0, 1, 30, 4000)],
+        },
+    }
+    events = []
+    keys = []
+    audio_bytes = []
+    for parent_sequence_id, spec in parent_specs.items():
+        events.extend(
+            [
+                {
+                    "stage": "segmenter",
+                    "event": "emitted",
+                    "sequence_id": parent_sequence_id,
+                },
+                {
+                    "stage": "nmt",
+                    "event": "completed",
+                    "sequence_id": parent_sequence_id,
+                    "text_chars": spec["parent_text_chars"],
+                    "retry_count": 0,
+                },
+            ]
+        )
+        for subsequence_id, subsequence_count, text_chars, pcm_bytes in spec[
+            "children"
+        ]:
+            identity = {
+                "sequence_id": parent_sequence_id,
+                "parent_sequence_id": parent_sequence_id,
+                "subsequence_id": subsequence_id,
+                "subsequence_count": subsequence_count,
+            }
+            key = {
+                name: identity[name]
+                for name in (
+                    "parent_sequence_id",
+                    "subsequence_id",
+                    "subsequence_count",
+                )
+            }
+            keys.append(key)
+            audio_bytes.append(pcm_bytes)
+            events.extend(
+                [
+                    {
+                        **identity,
+                        "stage": "target_splitter",
+                        "event": "emitted",
+                        "text_chars": text_chars,
+                        "parent_text_chars": spec["parent_text_chars"],
+                    },
+                    {
+                        **identity,
+                        "stage": "tts",
+                        "event": "enqueued",
+                        "text_chars": text_chars,
+                    },
+                    {
+                        **identity,
+                        "stage": "tts",
+                        "event": "started",
+                        "text_chars": text_chars,
+                        "parent_text_chars": spec["parent_text_chars"],
+                    },
+                    {
+                        **identity,
+                        "stage": "tts",
+                        "event": "first_audio",
+                    },
+                    {
+                        **identity,
+                        "stage": "tts",
+                        "event": "completed",
+                        "audio_bytes": pcm_bytes,
+                        "retry_count": 0,
+                    },
+                    {
+                        **identity,
+                        "stage": "output",
+                        "event": "enqueued",
+                        "audio_bytes": pcm_bytes,
+                    },
+                    {
+                        **identity,
+                        "stage": "output",
+                        "event": "dequeued",
+                        "audio_bytes": pcm_bytes,
+                    },
+                ]
+            )
+
+    # StagedPipelineSession.next_output() uses output/dequeued for both AUDIO
+    # children and the sole identity-free COMPLETE terminal.
+    events.append(
+        {
+            "stage": "output",
+            "event": "dequeued",
+            "sequence_id": None,
+            "subsequence_id": None,
+            "subsequence_count": None,
+            "queue_depth": 0,
+            "queue_capacity": 5,
+            "text_chars": 0,
+            "audio_bytes": 0,
+            "audio_duration_ms": 0.0,
+        }
+    )
+
+    completed = list(parent_specs)
+    return {
+        "telemetry_schema_version": 2,
+        "tts_subsegmentation_enabled": True,
+        "tts_subsegment_max_chars": 40,
+        "tts_subsegment_min_chars": 12,
+        "session_id": "session-v2",
+        "state": "closed",
+        "outcome": "complete",
+        "segments_emitted": len(completed),
+        "tts_subsegments_planned": len(keys),
+        "tts_subsegments_produced": len(keys),
+        "audio_segments_produced": len(keys),
+        "nmt_retry_count": 0,
+        "tts_retry_count": 0,
+        "completed_sequence_ids": completed,
+        "incomplete_sequence_ids": [],
+        "planned_subsegment_keys": [dict(key) for key in keys],
+        "synthesized_subsegment_keys": [dict(key) for key in keys],
+        "completed_subsegment_keys": [dict(key) for key in keys],
+        "incomplete_subsegment_keys": [],
+        "failure": None,
+        "cleanup_errors": [],
+        "max_queue_depths": {"nmt": 2, "tts": 4, "output": 2},
+        "blocked_put_counts": {"nmt": 0, "tts": 0, "output": 0},
+        "events": events,
+        "websocket_sent_sequence_ids": completed,
+        "websocket_sent_subsegment_keys": [dict(key) for key in keys],
+        "websocket_send_events": [
+            {
+                "sequence_id": key["parent_sequence_id"],
+                **key,
+                "sent_monotonic_ms": 1000.0 + index,
+                "audio_bytes": pcm_bytes,
+            }
+            for index, (key, pcm_bytes) in enumerate(zip(keys, audio_bytes))
+        ],
+    }
+
+
+def successful_websocket_receive_events_v2():
+    return [
+        {
+            "order": 0,
+            "timestamp_ms": 1.0,
+            "frame_type": "control",
+            "message_type": "status",
+            "status": "connected",
+            "audio_bytes": 0,
+        },
+        *[
+            {
+                "order": index,
+                "timestamp_ms": 1.0 + index,
+                "frame_type": "pcm",
+                "audio_bytes": audio_bytes,
+            }
+            for index, audio_bytes in enumerate((3200, 4800, 4000), start=1)
+        ],
+        {
+            "order": 4,
+            "timestamp_ms": 5.0,
+            "frame_type": "control",
+            "message_type": "status",
+            "status": "completed",
+            "audio_bytes": 0,
+        },
+    ]
+
+
 def test_generate_summary_records_capture_integrity(tmp_path):
     config = staged_config()
     staged_pipeline = successful_staged_export()
@@ -258,6 +459,203 @@ def test_staged_integrity_accepts_complete_ordered_bounded_export():
     )
 
     assert errors == []
+
+
+def test_staged_integrity_accepts_schema_v2_composite_child_lifecycle():
+    errors = validate_staged_pipeline_integrity(
+        successful_staged_export_v2(),
+        staged_config_v2(),
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_rejects_identity_free_positive_audio_dequeue():
+    export = successful_staged_export_v2()
+    terminal_dequeue = export["events"][-1]
+    terminal_dequeue["audio_bytes"] = 3200
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v2(),
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any(
+        "parent_sequence_id is invalid" in error for error in errors
+    )
+
+
+def test_staged_integrity_treats_missing_schema_version_as_legacy_v1():
+    export = successful_staged_export()
+    config = staged_config()
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_rejects_schema_config_disagreement():
+    config = staged_config_v2()
+    config["stagedConfig"]["telemetrySchemaVersion"] = 1
+
+    errors = validate_staged_pipeline_integrity(
+        successful_staged_export_v2(),
+        config,
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any("schema version must match" in error for error in errors)
+
+
+def test_staged_integrity_rejects_unknown_schema_version():
+    export = successful_staged_export()
+    export["telemetry_schema_version"] = 3
+    config = staged_config()
+    config["stagedConfig"]["telemetrySchemaVersion"] = 3
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events(),
+        2.75,
+    )
+
+    assert sum("must be 1 or 2" in error for error in errors) == 2
+
+
+def test_staged_integrity_requires_explicit_v2_websocket_composite_key():
+    export = successful_staged_export_v2()
+    del export["websocket_send_events"][0]["subsequence_count"]
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v2(),
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any(
+        "websocket_send_events[0].subsequence_count is invalid" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_rejects_gapped_or_reordered_composite_lifecycle():
+    export = successful_staged_export_v2()
+    output_indices = [
+        index
+        for index, event in enumerate(export["events"])
+        if event["stage"] == "output" and event["event"] == "dequeued"
+    ]
+    first, second = output_indices[:2]
+    export["events"][first], export["events"][second] = (
+        export["events"][second],
+        export["events"][first],
+    )
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v2(),
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any(
+        "output/dequeued composite order" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_rejects_child_over_configured_cap():
+    export = successful_staged_export_v2()
+    for event in export["events"]:
+        if (
+            event["stage"] in {"target_splitter", "tts"}
+            and event["event"] in {"emitted", "enqueued", "started"}
+            and event.get("parent_sequence_id") == 0
+            and event.get("subsequence_id") == 0
+        ):
+            event["text_chars"] = 41
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v2(max_chars=40),
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any("text_chars exceeds configured" in error for error in errors)
+
+
+def test_staged_integrity_rejects_parent_character_provenance_mismatch():
+    export = successful_staged_export_v2()
+    started = next(
+        event
+        for event in export["events"]
+        if event["stage"] == "tts" and event["event"] == "started"
+    )
+    started["parent_text_chars"] += 1
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v2(),
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any(
+        "parent_text_chars must match" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_rejects_equal_total_reordered_pcm_frame_sizes():
+    received = successful_websocket_receive_events_v2()
+    received[1]["audio_bytes"], received[2]["audio_bytes"] = (
+        received[2]["audio_bytes"],
+        received[1]["audio_bytes"],
+    )
+    assert sum(
+        event["audio_bytes"]
+        for event in received
+        if event["frame_type"] == "pcm"
+    ) == 12_000
+
+    errors = validate_staged_pipeline_integrity(
+        successful_staged_export_v2(),
+        staged_config_v2(),
+        received,
+        4.5,
+    )
+
+    assert any("frame-by-frame" in error for error in errors)
+
+
+def test_staged_integrity_rejects_schema_v2_with_disabled_cap():
+    config = staged_config_v2(max_chars=40)
+    config["stagedConfig"]["ttsSubsegmentMaxChars"] = 0
+
+    errors = validate_staged_pipeline_integrity(
+        successful_staged_export_v2(),
+        config,
+        successful_websocket_receive_events_v2(),
+        4.5,
+    )
+
+    assert any(
+        "ttsSubsegmentMaxChars must be a positive integer" in error
+        for error in errors
+    )
 
 
 def test_staged_integrity_accepts_and_reconciles_one_shot_nmt_recovery():

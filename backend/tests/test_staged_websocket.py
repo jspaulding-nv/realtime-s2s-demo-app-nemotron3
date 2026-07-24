@@ -13,15 +13,21 @@ from websocket_handler import SessionManager, SessionStatus, TranslationSession
 
 
 class FakeStagedPipeline:
-    def __init__(self, *, start_error=None):
+    def __init__(self, *, start_error=None, subsegmentation_enabled=False):
         self.outputs = asyncio.Queue()
         self.start_error = start_error
+        self.config = SimpleNamespace(
+            tts_subsegment_max_chars=(
+                40 if subsegmentation_enabled else 0
+            )
+        )
         self.started = False
         self.closed = False
         self.close_calls = 0
         self.audio_chunks = []
         self.finish_calls = 0
         self.dequeued_audio_sequence_ids = []
+        self.dequeued_audio_subsegment_keys = []
 
     async def start(self):
         if self.start_error is not None:
@@ -37,7 +43,19 @@ class FakeStagedPipeline:
     async def next_output(self):
         output = await self.outputs.get()
         if output.kind is StagedOutputEventKind.AUDIO:
-            self.dequeued_audio_sequence_ids.append(output.segment.sequence_id)
+            subsequence_id = getattr(output.segment, "subsequence_id", 0)
+            subsequence_count = getattr(output.segment, "subsequence_count", 1)
+            self.dequeued_audio_subsegment_keys.append(
+                (
+                    output.segment.sequence_id,
+                    subsequence_id,
+                    subsequence_count,
+                )
+            )
+            if subsequence_id == subsequence_count - 1:
+                self.dequeued_audio_sequence_ids.append(
+                    output.segment.sequence_id
+                )
         return output
 
     async def aclose(self):
@@ -45,7 +63,10 @@ class FakeStagedPipeline:
         self.closed = True
 
     def summary(self, include_events=False):
-        return {
+        result = {
+            "telemetry_schema_version": (
+                2 if self.config.tts_subsegment_max_chars > 0 else 1
+            ),
             "state": "closed" if self.closed else "running",
             "outcome": "complete",
             "cleanup_errors": [],
@@ -57,6 +78,20 @@ class FakeStagedPipeline:
                 else None
             ),
         }
+        if self.config.tts_subsegment_max_chars > 0:
+            result["completed_subsegment_keys"] = [
+                {
+                    "parent_sequence_id": parent_sequence_id,
+                    "subsequence_id": subsequence_id,
+                    "subsequence_count": subsequence_count,
+                }
+                for (
+                    parent_sequence_id,
+                    subsequence_id,
+                    subsequence_count,
+                ) in self.dequeued_audio_subsegment_keys
+            ]
+        return result
 
 
 class WorkerFailureInputRacePipeline(FakeStagedPipeline):
@@ -140,6 +175,23 @@ async def _wait_until(predicate, timeout=1.0):
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("condition was not met before timeout")
         await asyncio.sleep(0)
+
+
+def composite_audio(
+    parent_sequence_id,
+    subsequence_id,
+    subsequence_count,
+    audio,
+):
+    return SimpleNamespace(
+        kind=StagedOutputEventKind.AUDIO,
+        segment=SimpleNamespace(
+            audio=audio,
+            sequence_id=parent_sequence_id,
+            subsequence_id=subsequence_id,
+            subsequence_count=subsequence_count,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -290,6 +342,174 @@ async def test_multiple_audio_segments_are_fifo_and_delay_completion(
         event["sequence_id"] for event in telemetry["websocket_send_events"]
     ] == [0, 1]
     assert telemetry["events"] == [{"stage": "fake", "event": "captured"}]
+
+
+@pytest.mark.asyncio
+async def test_subsegments_send_fifo_and_count_parent_only_on_final_child(
+    mock_websocket,
+):
+    pipeline = FakeStagedPipeline(subsegmentation_enabled=True)
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    for subsequence_id, audio in enumerate((b"first", b"second", b"third")):
+        await pipeline.outputs.put(
+            composite_audio(7, subsequence_id, 3, audio)
+        )
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+    await _wait_until(lambda: pipeline.closed)
+
+    expected_keys = [(7, 0, 3), (7, 1, 3), (7, 2, 3)]
+    expected_payloads = [
+        {
+            "parent_sequence_id": parent_sequence_id,
+            "subsequence_id": subsequence_id,
+            "subsequence_count": subsequence_count,
+        }
+        for (
+            parent_sequence_id,
+            subsequence_id,
+            subsequence_count,
+        ) in expected_keys
+    ]
+    assert [
+        call.args[0] for call in mock_websocket.send_bytes.await_args_list
+    ] == [b"first", b"second", b"third"]
+    assert pipeline.dequeued_audio_subsegment_keys == expected_keys
+    assert pipeline.dequeued_audio_sequence_ids == [7]
+    assert session._staged_audio_subsegment_keys_sent == expected_keys
+    assert session._staged_audio_sequence_ids_sent == [7]
+
+    snapshot = session.staged_telemetry_snapshot()
+    assert snapshot["telemetry_schema_version"] == 2
+    assert snapshot["completed_sequence_ids"] == [7]
+    assert snapshot["completed_subsegment_keys"] == expected_payloads
+    assert snapshot["websocket_sent_sequence_ids"] == [7]
+    assert snapshot["websocket_sent_subsegment_keys"] == expected_payloads
+    assert [
+        (
+            event["parent_sequence_id"],
+            event["subsequence_id"],
+            event["subsequence_count"],
+        )
+        for event in snapshot["websocket_send_events"]
+    ] == expected_keys
+
+
+@pytest.mark.asyncio
+async def test_new_staged_generation_resets_subsegment_send_evidence(
+    mock_websocket,
+):
+    first = FakeStagedPipeline(subsegmentation_enabled=True)
+    second = FakeStagedPipeline(subsegmentation_enabled=True)
+    pipelines = iter((first, second))
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: next(pipelines),
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await first.outputs.put(composite_audio(0, 0, 2, b"first"))
+    await first.outputs.put(composite_audio(0, 1, 2, b"second"))
+    await first.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+    assert session.staged_telemetry_snapshot()[
+        "websocket_sent_subsegment_keys"
+    ] == [
+        {
+            "parent_sequence_id": 0,
+            "subsequence_id": 0,
+            "subsequence_count": 2,
+        },
+        {
+            "parent_sequence_id": 0,
+            "subsequence_id": 1,
+            "subsequence_count": 2,
+        },
+    ]
+
+    await session.start_stream("es-US")
+
+    assert session.status is SessionStatus.LISTENING
+    assert session._staged_audio_sequence_ids_sent == []
+    assert session._staged_audio_subsegment_keys_sent == []
+    active_snapshot = session.staged_telemetry_snapshot()
+    assert active_snapshot["completed_sequence_ids"] == []
+    assert active_snapshot["completed_subsegment_keys"] == []
+    assert active_snapshot["websocket_sent_sequence_ids"] == []
+    assert active_snapshot["websocket_sent_subsegment_keys"] == []
+    assert active_snapshot["websocket_send_events"] == []
+    await session.stop_stream()
+
+
+@pytest.mark.asyncio
+async def test_subsegment_summary_mismatch_replaces_completion_with_error(
+    mock_websocket,
+):
+    class MismatchedSubsegmentPipeline(FakeStagedPipeline):
+        def summary(self, include_events=False):
+            result = super().summary(include_events=include_events)
+            result["completed_subsegment_keys"] = [
+                {
+                    "parent_sequence_id": 0,
+                    "subsequence_id": 1,
+                    "subsequence_count": 2,
+                }
+            ]
+            return result
+
+    pipeline = MismatchedSubsegmentPipeline(
+        subsegmentation_enabled=True
+    )
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(composite_audio(0, 0, 1, b"only child"))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+
+    assert mock_websocket.send_json.await_args_list[-1].args[0] == {
+        "type": "error",
+        "message": (
+            "Staged cleanup failed: WebSocket-sent subsegment keys "
+            "did not match dequeued pipeline output"
+        ),
+    }
+    assert not any(
+        call.args[0].get("status") == "completed"
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "status"
+    )
+    snapshot = session.staged_telemetry_snapshot()
+    assert snapshot["websocket_sent_subsegment_keys"] == [
+        {
+            "parent_sequence_id": 0,
+            "subsequence_id": 0,
+            "subsequence_count": 1,
+        }
+    ]
+    assert snapshot["completed_subsegment_keys"] != snapshot[
+        "websocket_sent_subsegment_keys"
+    ]
 
 
 @pytest.mark.asyncio

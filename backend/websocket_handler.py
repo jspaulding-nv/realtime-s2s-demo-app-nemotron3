@@ -82,6 +82,9 @@ class TranslationSession:
     _staged_generation: int = 0
     _staged_terminal_generation: int = -1
     _staged_audio_sequence_ids_sent: list[int] = field(default_factory=list)
+    _staged_audio_subsegment_keys_sent: list[tuple[int, int, int]] = field(
+        default_factory=list
+    )
     _staged_websocket_send_events: list[dict] = field(default_factory=list)
     _last_staged_summary: Optional[dict] = None
 
@@ -313,6 +316,7 @@ class TranslationSession:
         self._staged_generation += 1
         generation = self._staged_generation
         self._staged_audio_sequence_ids_sent = []
+        self._staged_audio_subsegment_keys_sent = []
         self._staged_websocket_send_events = []
         try:
             pipeline = factory(target_language)
@@ -345,6 +349,16 @@ class TranslationSession:
                         generation,
                         audio,
                         output.segment.sequence_id,
+                        getattr(output.segment, "subsequence_id", 0),
+                        getattr(output.segment, "subsequence_count", 1),
+                        include_composite=(
+                            getattr(
+                                getattr(pipeline, "config", None),
+                                "tts_subsegment_max_chars",
+                                0,
+                            )
+                            > 0
+                        ),
                     )
                     if sent is None:
                         return
@@ -438,6 +452,24 @@ class TranslationSession:
                 ),
                 True,
             )
+        if snapshot.get("telemetry_schema_version") == 2:
+            completed_subsegments = snapshot.get(
+                "completed_subsegment_keys"
+            )
+            sent_subsegments = _subsegment_key_payloads(
+                self._staged_audio_subsegment_keys_sent
+            )
+            if (
+                completed_subsegments is None
+                or list(completed_subsegments) != sent_subsegments
+            ):
+                return (
+                    (
+                        "WebSocket-sent subsegment keys did not match "
+                        "dequeued pipeline output"
+                    ),
+                    True,
+                )
         return "", True
 
     def _ensure_staged_cleanup_task(self, pipeline: Any) -> asyncio.Task:
@@ -469,6 +501,10 @@ class TranslationSession:
         generation: int,
         audio: bytes,
         sequence_id: int,
+        subsequence_id: int = 0,
+        subsequence_count: int = 1,
+        *,
+        include_composite: bool = False,
     ) -> Optional[bool]:
         """Send current-generation PCM before any terminal message.
 
@@ -477,6 +513,11 @@ class TranslationSession:
         socket backpressure. ``None`` means a newer generation or a terminal
         owner already won; ``False`` means the socket write failed.
         """
+        _validate_subsegment_key(
+            sequence_id,
+            subsequence_id,
+            subsequence_count,
+        )
         async with self._send_lock:
             async with self._lock:
                 if (
@@ -488,14 +529,24 @@ class TranslationSession:
             if not await self._send_audio_unlocked(audio):
                 return False
             timing_logger.log_audio_sent_to_client(len(audio))
-            self._staged_audio_sequence_ids_sent.append(sequence_id)
-            self._staged_websocket_send_events.append(
-                {
-                    "sequence_id": sequence_id,
-                    "sent_monotonic_ms": time.monotonic_ns() / 1_000_000,
-                    "audio_bytes": len(audio),
-                }
-            )
+            key = (sequence_id, subsequence_id, subsequence_count)
+            self._staged_audio_subsegment_keys_sent.append(key)
+            if subsequence_id == subsequence_count - 1:
+                self._staged_audio_sequence_ids_sent.append(sequence_id)
+            event = {
+                "sequence_id": sequence_id,
+                "sent_monotonic_ms": time.monotonic_ns() / 1_000_000,
+                "audio_bytes": len(audio),
+            }
+            if include_composite:
+                event.update(
+                    {
+                        "parent_sequence_id": sequence_id,
+                        "subsequence_id": subsequence_id,
+                        "subsequence_count": subsequence_count,
+                    }
+                )
+            self._staged_websocket_send_events.append(event)
             return True
 
     async def _send_staged_json(
@@ -672,6 +723,12 @@ class TranslationSession:
         snapshot["websocket_sent_sequence_ids"] = list(
             self._staged_audio_sequence_ids_sent
         )
+        if snapshot.get("telemetry_schema_version") == 2:
+            snapshot["websocket_sent_subsegment_keys"] = (
+                _subsegment_key_payloads(
+                    self._staged_audio_subsegment_keys_sent
+                )
+            )
         snapshot["websocket_send_events"] = copy.deepcopy(
             self._staged_websocket_send_events
         )
@@ -700,6 +757,7 @@ class TranslationSession:
             return False
         self._last_staged_summary = None
         self._staged_audio_sequence_ids_sent = []
+        self._staged_audio_subsegment_keys_sent = []
         self._staged_websocket_send_events = []
         return True
 
@@ -932,6 +990,39 @@ class TranslationSession:
                 generation,
                 {"type": "level", "rms": rms},
             )
+
+
+def _subsegment_key_payloads(
+    keys: list[tuple[int, int, int]],
+) -> list[dict]:
+    return [
+        {
+            "parent_sequence_id": parent_sequence_id,
+            "subsequence_id": subsequence_id,
+            "subsequence_count": subsequence_count,
+        }
+        for parent_sequence_id, subsequence_id, subsequence_count in keys
+    ]
+
+
+def _validate_subsegment_key(
+    parent_sequence_id: int,
+    subsequence_id: int,
+    subsequence_count: int,
+) -> None:
+    for name, value in (
+        ("parent_sequence_id", parent_sequence_id),
+        ("subsequence_id", subsequence_id),
+        ("subsequence_count", subsequence_count),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+    if parent_sequence_id < 0:
+        raise ValueError("parent_sequence_id must be non-negative")
+    if subsequence_count <= 0:
+        raise ValueError("subsequence_count must be positive")
+    if subsequence_id < 0 or subsequence_id >= subsequence_count:
+        raise ValueError("subsequence_id is outside subsequence_count")
 
 
 class SessionManager:

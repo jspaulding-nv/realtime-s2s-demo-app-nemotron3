@@ -13,7 +13,7 @@ import asyncio
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -28,6 +28,7 @@ from staged_models import (
     TextSegment,
     TranslatedSegment,
 )
+from target_text_splitter import split_target_text
 
 
 class StagedPipelineState(str, Enum):
@@ -50,15 +51,95 @@ class StagedModelTimeoutError(StagedPipelineError):
         self,
         *,
         stage: str,
-        segment: TextSegment,
+        segment: Optional[TextSegment] = None,
+        translation: Optional[TranslatedSegment] = None,
         timeout_s: float,
         retry_count: int = 0,
     ) -> None:
-        self.segment = segment
-        self.retry_count = retry_count if retry_count in {0, 1} else 0
+        if segment is not None and translation is not None:
+            raise ValueError("provide segment or translation, not both")
+        if translation is None and not isinstance(segment, TextSegment):
+            raise ValueError("a segment or translation is required")
+        if translation is not None and not isinstance(
+            translation, TranslatedSegment
+        ):
+            raise ValueError("translation must be a TranslatedSegment")
+        self.translation = translation
+        self.segment = translation.segment if translation is not None else segment
+        self.sequence_id = self.segment.sequence_id
+        self.parent_sequence_id = self.sequence_id
+        self.subsequence_id = (
+            translation.subsequence_id if translation is not None else None
+        )
+        self.subsequence_count = (
+            translation.subsequence_count if translation is not None else None
+        )
+        self.retry_count = (
+            retry_count
+            if isinstance(retry_count, int)
+            and not isinstance(retry_count, bool)
+            and retry_count in {0, 1}
+            else 0
+        )
+        identity = f"sequence {self.sequence_id}"
+        if translation is not None:
+            identity += (
+                f" subsequence {translation.subsequence_id + 1}/"
+                f"{translation.subsequence_count}"
+            )
         super().__init__(
             f"{stage.upper()} model RPC exceeded {timeout_s:.3f} seconds "
-            f"for sequence {segment.sequence_id}"
+            f"for {identity}"
+        )
+
+
+class StagedAttributedModelError(StagedPipelineError):
+    """Retain composite identity for a model exception without metadata."""
+
+    def __init__(
+        self,
+        exc: Exception,
+        translation: TranslatedSegment,
+    ) -> None:
+        self.translation = translation
+        self.segment = translation.segment
+        self.sequence_id = translation.sequence_id
+        self.parent_sequence_id = translation.sequence_id
+        self.subsequence_id = translation.subsequence_id
+        self.subsequence_count = translation.subsequence_count
+        retry_count = getattr(exc, "retry_count", 0)
+        self.retry_count = (
+            retry_count
+            if isinstance(retry_count, int)
+            and not isinstance(retry_count, bool)
+            and retry_count in {0, 1}
+            else 0
+        )
+        self.original_error_code = type(exc).__name__
+        super().__init__(str(exc) or self.original_error_code)
+
+
+class StagedTargetSplitError(StagedPipelineError):
+    """Privacy-safe target-split failure with parent attribution."""
+
+    failure_stage = "target_splitter"
+    retry_count = 0
+
+    def __init__(
+        self,
+        exc: Exception,
+        translation: TranslatedSegment,
+    ) -> None:
+        self.translation = translation
+        self.segment = translation.segment
+        self.sequence_id = translation.sequence_id
+        self.parent_sequence_id = translation.sequence_id
+        self.subsequence_id = None
+        self.subsequence_count = None
+        self.original_error_code = type(exc).__name__
+        super().__init__(
+            "target-text splitting failed for sequence "
+            f"{translation.sequence_id}: {self.original_error_code}"
         )
 
 
@@ -154,10 +235,18 @@ class StagedPipelineSession:
         self._audio_segments_produced = 0
         self._fillers_discarded = 0
         self._emitted_sequence_ids: list[int] = []
-        self._synthesized_sequence_ids: list[int] = []
+        self._planned_subsegment_keys: list[Tuple[int, int, int]] = []
+        self._synthesized_subsegment_keys: list[Tuple[int, int, int]] = []
+        self._consumed_subsegment_keys: list[Tuple[int, int, int]] = []
         self._consumed_sequence_ids: list[int] = []
+        self._parent_translation_char_counts: Dict[int, int] = {}
         self._expected_nmt_sequence = 0
         self._expected_tts_sequence = 0
+        self._expected_tts_subsequence = 0
+        self._expected_tts_subsequence_count: Optional[int] = None
+        self._expected_output_sequence = 0
+        self._expected_output_subsequence = 0
+        self._expected_output_subsequence_count: Optional[int] = None
         self._last_asr_observation_ms: Optional[float] = None
 
     @property
@@ -249,7 +338,10 @@ class StagedPipelineSession:
             raise StagedPipelineError("output queue contained an invalid item")
         if output.kind is StagedOutputEventKind.AUDIO:
             self._queue_slots["output"].release()
-            self._consumed_sequence_ids.append(output.segment.sequence_id)
+            self._advance_output_cursor(output.segment)
+            self._consumed_subsegment_keys.append(output.segment.order_key)
+            if output.segment.is_final_subsequence:
+                self._consumed_sequence_ids.append(output.segment.sequence_id)
         segment = output.segment
         self._record(
             stage="output",
@@ -284,7 +376,14 @@ class StagedPipelineSession:
         )
 
     def summary(self, *, include_events: bool = False) -> Dict[str, Any]:
+        consumed_subsegment_keys = set(self._consumed_subsegment_keys)
         result: Dict[str, Any] = {
+            "telemetry_schema_version": (
+                2 if self.config.tts_subsegment_max_chars > 0 else 1
+            ),
+            "tts_subsegmentation_enabled": (
+                self.config.tts_subsegment_max_chars > 0
+            ),
             "session_id": self.session_id,
             "state": self._state.value,
             "outcome": self._outcome,
@@ -323,6 +422,45 @@ class StagedPipelineSession:
             "blocked_put_counts": dict(self._blocked_put_counts),
             "telemetry_event_count": len(self._telemetry),
         }
+        if self.config.tts_subsegment_max_chars > 0:
+            result.update(
+                {
+                    "tts_subsegment_max_chars": (
+                        self.config.tts_subsegment_max_chars
+                    ),
+                    "tts_subsegment_min_chars": (
+                        self.config.tts_subsegment_min_chars
+                    ),
+                    "tts_subsegments_planned": len(
+                        self._planned_subsegment_keys
+                    ),
+                    "tts_subsegments_produced": (
+                        len(self._synthesized_subsegment_keys)
+                    ),
+                    "planned_subsegment_keys": _subsequence_key_payloads(
+                        self._planned_subsegment_keys
+                    ),
+                    "synthesized_subsegment_keys": (
+                        _subsequence_key_payloads(
+                            self._synthesized_subsegment_keys
+                        )
+                    ),
+                    "completed_subsegment_keys": (
+                        _subsequence_key_payloads(
+                            self._consumed_subsegment_keys
+                        )
+                    ),
+                    "incomplete_subsegment_keys": (
+                        _subsequence_key_payloads(
+                            [
+                                key
+                                for key in self._planned_subsegment_keys
+                                if key not in consumed_subsegment_keys
+                            ]
+                        )
+                    ),
+                }
+            )
         if include_events:
             result["events"] = [event.to_dict() for event in self._telemetry]
         return result
@@ -402,7 +540,10 @@ class StagedPipelineSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._fail(stage, exc)
+            await self._fail(
+                getattr(exc, "failure_stage", stage),
+                exc,
+            )
 
     async def _consume_asr(self) -> None:
         segmenter_outcomes = []
@@ -555,19 +696,51 @@ class StagedPipelineSession:
                     raise StagedPipelineError("NMT returned an invalid segment type")
                 if translation.sequence_id != segment.sequence_id:
                     raise StagedPipelineError("NMT changed the segment sequence ID")
+                if (
+                    translation.subsequence_id != 0
+                    or translation.subsequence_count != 1
+                ):
+                    contract_error = StagedPipelineError(
+                        "NMT returned a non-parent composite identity"
+                    )
+                    contract_error.segment = segment
+                    contract_error.sequence_id = segment.sequence_id
+                    raise contract_error
                 self._expected_nmt_sequence += 1
                 self._record(
                     stage="nmt",
                     event="completed",
-                    segment=translation,
+                    # NMT remains a parent-level stage even when its target
+                    # text is subsequently divided into TTS children.
+                    segment=translation.segment,
                     monotonic_ms=translation.completed_monotonic_ms,
                     text_chars=len(translation.text),
                     processing_duration_ms=translation.processing_duration_ms,
                     retry_count=translation.retry_count,
                 )
-                await self._enqueue(
-                    self._tts_queue, translation, "tts", "enqueued"
-                )
+                self._parent_translation_char_counts[
+                    translation.sequence_id
+                ] = len(translation.text)
+                tts_translations = self._tts_translations(translation)
+                if self.config.tts_subsegment_max_chars > 0:
+                    self._planned_subsegment_keys.extend(
+                        child.order_key for child in tts_translations
+                    )
+                for tts_translation in tts_translations:
+                    if self.config.tts_subsegment_max_chars > 0:
+                        self._record(
+                            stage="target_splitter",
+                            event="emitted",
+                            segment=tts_translation,
+                            text_chars=len(tts_translation.text),
+                            parent_text_chars=len(translation.text),
+                        )
+                    await self._enqueue(
+                        self._tts_queue,
+                        tts_translation,
+                        "tts",
+                        "enqueued",
+                    )
             finally:
                 self._nmt_queue.task_done()
 
@@ -577,18 +750,32 @@ class StagedPipelineSession:
             self._queue_slots["tts"].release()
             try:
                 if item.payload is _DRAIN:
+                    if (
+                        self._expected_tts_sequence
+                        != self._expected_nmt_sequence
+                        or self._expected_tts_subsequence != 0
+                    ):
+                        raise StagedPipelineError(
+                            "TTS drain arrived before every translated "
+                            "subsequence completed"
+                        )
                     self._record(stage="tts", event="complete")
                     await self._emit_terminal(
                         StagedOutputEvent(kind=StagedOutputEventKind.COMPLETE)
                     )
                     return
                 translation = item.payload
-                if translation.sequence_id != self._expected_tts_sequence:
-                    raise StagedPipelineError(
-                        "TTS input sequence mismatch: "
-                        f"expected {self._expected_tts_sequence}, "
-                        f"received {translation.sequence_id}"
-                    )
+                try:
+                    self._validate_tts_cursor(translation)
+                except Exception as exc:
+                    if isinstance(translation, TranslatedSegment):
+                        attributed = _retain_translation_identity(
+                            exc,
+                            translation,
+                        )
+                        if attributed is not exc:
+                            raise attributed from exc
+                    raise
                 residence_ms = max(
                     0.0, self._clock_ms() - item.enqueued_monotonic_ms
                 )
@@ -600,6 +787,9 @@ class StagedPipelineSession:
                     queue_capacity=self._tts_queue.maxsize,
                     queue_residence_ms=residence_ms,
                     text_chars=len(translation.text),
+                    parent_text_chars=self._parent_translation_chars(
+                        translation
+                    ),
                 )
                 timeout_retry_count = 0
 
@@ -626,15 +816,37 @@ class StagedPipelineSession:
                 except asyncio.TimeoutError as exc:
                     raise StagedModelTimeoutError(
                         stage="tts",
-                        segment=translation.segment,
+                        translation=translation,
                         timeout_s=self.config.tts_rpc_timeout_s,
                         retry_count=timeout_retry_count,
                     ) from exc
+                except Exception as exc:
+                    attributed = _retain_translation_identity(
+                        exc,
+                        translation,
+                    )
+                    if attributed is exc:
+                        raise
+                    raise attributed from exc
                 if not isinstance(synthesized, SynthesizedSegment):
-                    raise StagedPipelineError("TTS returned an invalid segment type")
-                if synthesized.sequence_id != translation.sequence_id:
-                    raise StagedPipelineError("TTS changed the segment sequence ID")
-                self._expected_tts_sequence += 1
+                    contract_error = StagedPipelineError(
+                        "TTS returned an invalid segment type"
+                    )
+                    _retain_translation_identity(
+                        contract_error,
+                        translation,
+                    )
+                    raise contract_error
+                if synthesized.order_key != translation.order_key:
+                    contract_error = StagedPipelineError(
+                        "TTS changed the segment composite identity"
+                    )
+                    _retain_translation_identity(
+                        contract_error,
+                        translation,
+                    )
+                    raise contract_error
+                self._advance_tts_cursor(translation)
                 self._record(
                     stage="tts",
                     event="first_audio",
@@ -652,6 +864,9 @@ class StagedPipelineSession:
                     processing_duration_ms=synthesized.processing_duration_ms,
                     retry_count=synthesized.retry_count,
                 )
+                self._synthesized_subsegment_keys.append(
+                    synthesized.order_key
+                )
                 await self._enqueue(
                     self._output_queue,
                     StagedOutputEvent(
@@ -661,9 +876,125 @@ class StagedPipelineSession:
                     "enqueued",
                 )
                 self._audio_segments_produced += 1
-                self._synthesized_sequence_ids.append(synthesized.sequence_id)
             finally:
                 self._tts_queue.task_done()
+
+    def _tts_translations(
+        self,
+        translation: TranslatedSegment,
+    ) -> Tuple[TranslatedSegment, ...]:
+        max_chars = self.config.tts_subsegment_max_chars
+        if max_chars == 0:
+            return (translation,)
+        try:
+            chunks = split_target_text(
+                translation.text,
+                max_chars=max_chars,
+                min_chars=self.config.tts_subsegment_min_chars,
+            )
+            count = len(chunks)
+            if count <= 0:
+                raise StagedPipelineError(
+                    "target-text splitter returned no TTS subsequences"
+                )
+            return tuple(
+                replace(
+                    translation,
+                    text=chunk.text,
+                    subsequence_id=index,
+                    subsequence_count=count,
+                )
+                for index, chunk in enumerate(chunks)
+            )
+        except Exception as exc:
+            raise StagedTargetSplitError(exc, translation) from exc
+
+    def _parent_translation_chars(
+        self,
+        translation: TranslatedSegment,
+    ) -> Optional[int]:
+        if self.config.tts_subsegment_max_chars == 0:
+            return None
+        return self._parent_translation_char_counts.get(
+            translation.sequence_id
+        )
+
+    def _validate_tts_cursor(self, translation: TranslatedSegment) -> None:
+        if not isinstance(translation, TranslatedSegment):
+            raise StagedPipelineError(
+                "TTS queue contained an invalid translated segment"
+            )
+        self._validate_subsequence_cursor(
+            stage="TTS",
+            sequence_id=translation.sequence_id,
+            subsequence_id=translation.subsequence_id,
+            subsequence_count=translation.subsequence_count,
+            expected_sequence=self._expected_tts_sequence,
+            expected_subsequence=self._expected_tts_subsequence,
+            expected_count=self._expected_tts_subsequence_count,
+        )
+        if self._expected_tts_subsequence == 0:
+            self._expected_tts_subsequence_count = (
+                translation.subsequence_count
+            )
+
+    def _advance_tts_cursor(self, translation: TranslatedSegment) -> None:
+        (
+            self._expected_tts_sequence,
+            self._expected_tts_subsequence,
+            self._expected_tts_subsequence_count,
+        ) = _advanced_subsequence_cursor(translation)
+
+    def _advance_output_cursor(self, segment: SynthesizedSegment) -> None:
+        self._validate_subsequence_cursor(
+            stage="output",
+            sequence_id=segment.sequence_id,
+            subsequence_id=segment.subsequence_id,
+            subsequence_count=segment.subsequence_count,
+            expected_sequence=self._expected_output_sequence,
+            expected_subsequence=self._expected_output_subsequence,
+            expected_count=self._expected_output_subsequence_count,
+        )
+        if self._expected_output_subsequence == 0:
+            self._expected_output_subsequence_count = (
+                segment.subsequence_count
+            )
+        (
+            self._expected_output_sequence,
+            self._expected_output_subsequence,
+            self._expected_output_subsequence_count,
+        ) = _advanced_subsequence_cursor(segment)
+
+    @staticmethod
+    def _validate_subsequence_cursor(
+        *,
+        stage: str,
+        sequence_id: int,
+        subsequence_id: int,
+        subsequence_count: int,
+        expected_sequence: int,
+        expected_subsequence: int,
+        expected_count: Optional[int],
+    ) -> None:
+        if (
+            sequence_id != expected_sequence
+            or subsequence_id != expected_subsequence
+        ):
+            raise StagedPipelineError(
+                f"{stage} input composite identity mismatch: expected "
+                f"({expected_sequence}, {expected_subsequence}), received "
+                f"({sequence_id}, {subsequence_id})"
+            )
+        if (
+            expected_subsequence > 0
+            and expected_count is not None
+            and subsequence_count != expected_count
+        ):
+            raise StagedPipelineError(
+                f"{stage} subsequence_count changed within parent "
+                f"{sequence_id}: expected {expected_count}, received "
+                f"{subsequence_count}"
+            )
 
     async def _call_blocking(
         self,
@@ -720,12 +1051,11 @@ class StagedPipelineSession:
             self._max_queue_depths[queue_name] = max(
                 self._max_queue_depths[queue_name], depth
             )
-        segment = _source_segment(payload)
         audio = payload.segment if isinstance(payload, StagedOutputEvent) else None
         self._record(
             stage=queue_name,
             event=event,
-            segment=segment,
+            segment=payload,
             queue_depth=depth,
             queue_capacity=(
                 self.config.output_queue_maxsize
@@ -759,8 +1089,19 @@ class StagedPipelineSession:
             self._failure = (stage, message)
             self._outcome = "failed"
             self._state = StagedPipelineState.FAILED
-            failure_segment = getattr(exc, "segment", None)
-            if not isinstance(failure_segment, TextSegment):
+            failure_translation = getattr(exc, "translation", None)
+            failure_segment = (
+                failure_translation
+                if isinstance(failure_translation, TranslatedSegment)
+                and getattr(exc, "subsequence_id", None) is not None
+                else None
+            )
+            if failure_segment is None:
+                failure_segment = getattr(exc, "segment", None)
+            if not isinstance(
+                failure_segment,
+                (TextSegment, TranslatedSegment),
+            ):
                 failure_segment = None
             retry_count = getattr(exc, "retry_count", 0)
             if (
@@ -774,7 +1115,11 @@ class StagedPipelineSession:
                 event="error",
                 segment=failure_segment,
                 retry_count=retry_count,
-                error_code=type(exc).__name__,
+                error_code=getattr(
+                    exc,
+                    "original_error_code",
+                    type(exc).__name__,
+                ),
             )
             current = asyncio.current_task()
             for task in self._tasks:
@@ -868,6 +1213,7 @@ class StagedPipelineSession:
         processing_duration_ms: float = 0.0,
         blocked_put_ms: float = 0.0,
         text_chars: int = 0,
+        parent_text_chars: Optional[int] = None,
         audio_bytes: int = 0,
         audio_duration_ms: float = 0.0,
         retry_count: int = 0,
@@ -875,12 +1221,23 @@ class StagedPipelineSession:
         monotonic_ms: Optional[float] = None,
     ) -> None:
         source = _source_segment(segment)
+        subsequence = (
+            _subsequence_identity(segment)
+            if self.config.tts_subsegment_max_chars > 0
+            else None
+        )
         record = PipelineEvent(
             session_id=self.session_id,
             stage=stage,
             event=event,
             monotonic_ms=(self._clock_ms() if monotonic_ms is None else monotonic_ms),
             sequence_id=source.sequence_id if source is not None else None,
+            subsequence_id=(
+                subsequence[1] if subsequence is not None else None
+            ),
+            subsequence_count=(
+                subsequence[2] if subsequence is not None else None
+            ),
             asr_final_id=asr_final_id,
             contributing_final_ids=(
                 source.contributing_final_ids
@@ -900,6 +1257,7 @@ class StagedPipelineSession:
             processing_duration_ms=processing_duration_ms,
             blocked_put_ms=blocked_put_ms,
             text_chars=text_chars,
+            parent_text_chars=parent_text_chars,
             audio_bytes=audio_bytes,
             audio_duration_ms=audio_duration_ms,
             retry_count=retry_count,
@@ -926,6 +1284,63 @@ def _source_segment(value: Any) -> Optional[TextSegment]:
     if isinstance(value, StagedOutputEvent) and value.segment is not None:
         return value.segment.translation.segment
     return None
+
+
+def _subsequence_identity(
+    value: Any,
+) -> Optional[Tuple[int, int, int]]:
+    if isinstance(value, TranslatedSegment):
+        return value.order_key
+    if isinstance(value, SynthesizedSegment):
+        return value.order_key
+    if isinstance(value, StagedOutputEvent) and value.segment is not None:
+        return value.segment.order_key
+    return None
+
+
+def _advanced_subsequence_cursor(
+    value: Any,
+) -> Tuple[int, int, Optional[int]]:
+    if value.subsequence_id + 1 < value.subsequence_count:
+        return (
+            value.sequence_id,
+            value.subsequence_id + 1,
+            value.subsequence_count,
+        )
+    return (value.sequence_id + 1, 0, None)
+
+
+def _subsequence_key_payloads(
+    keys: list[Tuple[int, int, int]],
+) -> list[Dict[str, int]]:
+    return [
+        {
+            "parent_sequence_id": parent_sequence_id,
+            "subsequence_id": subsequence_id,
+            "subsequence_count": subsequence_count,
+        }
+        for parent_sequence_id, subsequence_id, subsequence_count in keys
+    ]
+
+
+def _retain_translation_identity(
+    exc: Exception,
+    translation: TranslatedSegment,
+) -> Exception:
+    attributes = {
+        "translation": translation,
+        "segment": translation.segment,
+        "sequence_id": translation.sequence_id,
+        "parent_sequence_id": translation.sequence_id,
+        "subsequence_id": translation.subsequence_id,
+        "subsequence_count": translation.subsequence_count,
+    }
+    try:
+        for name, value in attributes.items():
+            setattr(exc, name, value)
+    except Exception:
+        return StagedAttributedModelError(exc, translation)
+    return exc
 
 
 def _text_chars(value: Any) -> int:

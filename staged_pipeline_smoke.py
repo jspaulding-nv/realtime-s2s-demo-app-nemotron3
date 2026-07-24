@@ -109,6 +109,12 @@ def _resolved_config() -> StagedPipelineConfig:
         tts_rpc_timeout_s=staged_pipeline_config.tts_rpc_timeout_s,
         tts_max_segment_audio_s=staged_pipeline_config.tts_max_segment_audio_s,
         tts_max_retries=staged_pipeline_config.tts_max_retries,
+        tts_subsegment_max_chars=(
+            staged_pipeline_config.tts_subsegment_max_chars
+        ),
+        tts_subsegment_min_chars=(
+            staged_pipeline_config.tts_subsegment_min_chars
+        ),
         close_timeout_s=staged_pipeline_config.close_timeout_s,
     )
 
@@ -197,7 +203,10 @@ async def run(args: argparse.Namespace) -> int:
             if not args.quiet:
                 source = synthesized.translation.segment
                 print(
-                    f"SEGMENT {source.sequence_id} [{source.reason.value}] "
+                    f"SEGMENT {source.sequence_id}."
+                    f"{synthesized.subsequence_id + 1}/"
+                    f"{synthesized.subsequence_count} "
+                    f"[{source.reason.value}] "
                     f"{len(synthesized.audio)} bytes / "
                     f"{synthesized.audio_duration_ms / 1_000:.3f}s"
                 )
@@ -248,10 +257,16 @@ async def run(args: argparse.Namespace) -> int:
         * audio_config.bytes_per_sample
     )
     telemetry = session.telemetry
+    parent_reason_by_sequence = {
+        report["translation"]["segment"]["sequence_id"]: (
+            report["translation"]["segment"]["reason"]
+        )
+        for report in segment_reports
+    }
     segment_reason_counts = {
         reason: sum(
-            report["translation"]["segment"]["reason"] == reason
-            for report in segment_reports
+            parent_reason == reason
+            for parent_reason in parent_reason_by_sequence.values()
         )
         for reason in ("punctuation", "length", "age", "final_flush")
     }
@@ -283,7 +298,11 @@ async def run(args: argparse.Namespace) -> int:
         ),
     }
     summary = {
-        "schema_version": 1,
+        "schema_version": (
+            2
+            if staged_pipeline_config.tts_subsegment_max_chars > 0
+            else 1
+        ),
         "success": failure is None,
         "error": str(failure) if failure is not None else None,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -318,7 +337,8 @@ async def run(args: argparse.Namespace) -> int:
         "source_language": args.source_language,
         "target_language": args.target_language,
         "eou_ms": riva_config.endpointing_history_ms,
-        "segment_count": len(segment_reports),
+        "segment_count": len(parent_reason_by_sequence),
+        "tts_subsegment_count": len(segment_reports),
         "segment_reason_counts": segment_reason_counts,
         "pcm_bytes": len(pcm),
         "stage_metrics": stage_metrics,

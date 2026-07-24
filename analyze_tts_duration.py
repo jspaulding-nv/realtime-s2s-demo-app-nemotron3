@@ -28,12 +28,17 @@ class TtsDurationObservation:
     sequence_id: int
     text_chars: int
     audio_duration_seconds: float
+    subsequence_id: int = 0
+    subsequence_count: int = 1
+    telemetry_schema_version: int = 1
 
     def __post_init__(self) -> None:
         for name, value, allow_zero in (
             ("sample_index", self.sample_index, False),
             ("sequence_id", self.sequence_id, True),
             ("text_chars", self.text_chars, False),
+            ("subsequence_id", self.subsequence_id, True),
+            ("subsequence_count", self.subsequence_count, False),
         ):
             if (
                 not isinstance(value, int)
@@ -51,6 +56,35 @@ class TtsDurationObservation:
             raise ValueError(
                 "audio_duration_seconds must be positive and finite"
             )
+        if self.subsequence_id >= self.subsequence_count:
+            raise ValueError(
+                "subsequence_id must be within the subsequence_count range"
+            )
+        if (
+            not isinstance(self.telemetry_schema_version, int)
+            or isinstance(self.telemetry_schema_version, bool)
+            or self.telemetry_schema_version not in {1, 2}
+        ):
+            raise ValueError("telemetry_schema_version must be one or two")
+        if self.telemetry_schema_version == 1 and (
+            self.subsequence_id != 0 or self.subsequence_count != 1
+        ):
+            raise ValueError(
+                "version-one observations must use the legacy (0, 1) "
+                "subsequence identity"
+            )
+
+    @property
+    def parent_sequence_id(self) -> int:
+        return self.sequence_id
+
+    @property
+    def composite_key(self) -> tuple[int, int, int]:
+        return (
+            self.parent_sequence_id,
+            self.subsequence_id,
+            self.subsequence_count,
+        )
 
 
 @dataclass(frozen=True)
@@ -142,6 +176,319 @@ def _require_sequence_ids(
         )
 
 
+def _event_composite_key(
+    event: dict[str, Any],
+    *,
+    label: str,
+) -> tuple[int, int, int]:
+    sequence_id = _require_nonnegative_int(
+        event.get("sequence_id"),
+        field="sequence_id",
+        label=label,
+    )
+    parent_sequence_id = _require_nonnegative_int(
+        event.get("parent_sequence_id"),
+        field="parent_sequence_id",
+        label=label,
+    )
+    if sequence_id != parent_sequence_id:
+        raise ValueError(
+            f"{label}: parent_sequence_id does not match sequence_id"
+        )
+    subsequence_id = _require_nonnegative_int(
+        event.get("subsequence_id"),
+        field="subsequence_id",
+        label=label,
+    )
+    subsequence_count = _require_positive_int(
+        event.get("subsequence_count"),
+        field="subsequence_count",
+        label=label,
+    )
+    if subsequence_id >= subsequence_count:
+        raise ValueError(
+            f"{label}: subsequence_id is outside subsequence_count"
+        )
+    return (parent_sequence_id, subsequence_id, subsequence_count)
+
+
+def _summary_composite_key(
+    value: Any,
+    *,
+    field: str,
+    label: str,
+) -> tuple[int, int, int]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: {field} entries must be objects")
+    parent_sequence_id = _require_nonnegative_int(
+        value.get("parent_sequence_id"),
+        field=f"{field}.parent_sequence_id",
+        label=label,
+    )
+    subsequence_id = _require_nonnegative_int(
+        value.get("subsequence_id"),
+        field=f"{field}.subsequence_id",
+        label=label,
+    )
+    subsequence_count = _require_positive_int(
+        value.get("subsequence_count"),
+        field=f"{field}.subsequence_count",
+        label=label,
+    )
+    if subsequence_id >= subsequence_count:
+        raise ValueError(
+            f"{label}: {field}.subsequence_id is outside subsequence_count"
+        )
+    return (parent_sequence_id, subsequence_id, subsequence_count)
+
+
+def _require_composite_keys(
+    value: Any,
+    *,
+    field: str,
+    expected: Sequence[tuple[int, int, int]],
+    label: str,
+) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"{label}: {field} must be a list")
+    parsed = [
+        _summary_composite_key(item, field=field, label=label)
+        for item in value
+    ]
+    if parsed != list(expected):
+        raise ValueError(
+            f"{label}: {field} does not match the complete ordered "
+            "subsequence list"
+        )
+
+
+def _parent_ids_from_contiguous_composite_keys(
+    keys: Sequence[tuple[int, int, int]],
+    *,
+    label: str,
+) -> list[int]:
+    if not keys:
+        raise ValueError(f"{label}: no TTS subsequences were observed")
+
+    expected_parent = 0
+    expected_subsequence = 0
+    expected_count: int | None = None
+    for parent, subsequence, count in keys:
+        if parent != expected_parent or subsequence != expected_subsequence:
+            raise ValueError(
+                f"{label}: TTS composite identities are not contiguous "
+                "from parent zero"
+            )
+        if expected_subsequence == 0:
+            expected_count = count
+        elif count != expected_count:
+            raise ValueError(
+                f"{label}: subsequence_count changed within a parent"
+            )
+
+        if subsequence + 1 == count:
+            expected_parent += 1
+            expected_subsequence = 0
+            expected_count = None
+        else:
+            expected_subsequence += 1
+
+    if expected_subsequence != 0:
+        raise ValueError(
+            f"{label}: final parent has an incomplete subsequence list"
+        )
+    return list(range(expected_parent))
+
+
+def _load_v2_summary_observations(
+    staged: dict[str, Any],
+    events: list[Any],
+    *,
+    sample_index: int,
+    label: str,
+) -> tuple[TtsDurationObservation, ...]:
+    """Load strict parent/child telemetry from a schema-v2 capture."""
+
+    if staged.get("tts_subsegmentation_enabled") is not True:
+        raise ValueError(
+            f"{label}: schema-v2 telemetry must enable TTS subsegmentation"
+        )
+
+    nmt_completed_chars: dict[int, int] = {}
+    nmt_completed_order: list[int] = []
+    started: dict[tuple[int, int, int], tuple[int, int]] = {}
+    started_order: list[tuple[int, int, int]] = []
+    completed: dict[tuple[int, int, int], tuple[float, int]] = {}
+    completed_order: list[tuple[int, int, int]] = []
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("stage") == "nmt" and event.get("event") == "completed":
+            sequence_id = _require_nonnegative_int(
+                event.get("sequence_id"),
+                field="sequence_id",
+                label=label,
+            )
+            if sequence_id in nmt_completed_chars:
+                raise ValueError(
+                    f"{label}: duplicate NMT completed event for a parent"
+                )
+            nmt_completed_chars[sequence_id] = _require_positive_int(
+                event.get("text_chars"),
+                field="text_chars",
+                label=label,
+            )
+            nmt_completed_order.append(sequence_id)
+            continue
+        if event.get("stage") != "tts":
+            continue
+        event_name = event.get("event")
+        if event_name not in {"started", "completed"}:
+            continue
+
+        key = _event_composite_key(event, label=label)
+        if event_name == "started":
+            if key in started:
+                raise ValueError(
+                    f"{label}: duplicate TTS started event for a subsequence"
+                )
+            started[key] = (
+                _require_positive_int(
+                    event.get("text_chars"),
+                    field="text_chars",
+                    label=label,
+                ),
+                _require_positive_int(
+                    event.get("parent_text_chars"),
+                    field="parent_text_chars",
+                    label=label,
+                ),
+            )
+            started_order.append(key)
+            continue
+
+        if key in completed:
+            raise ValueError(
+                f"{label}: duplicate TTS completed event for a subsequence"
+            )
+        audio_duration_ms = _require_positive_finite(
+            event.get("audio_duration_ms"),
+            field="audio_duration_ms",
+            label=label,
+        )
+        _require_positive_int(
+            event.get("audio_bytes"),
+            field="audio_bytes",
+            label=label,
+        )
+        retry_count = _require_nonnegative_int(
+            event.get("retry_count"),
+            field="retry_count",
+            label=label,
+        )
+        if retry_count not in {0, 1}:
+            raise ValueError(f"{label}: retry_count must be zero or one")
+        completed[key] = (audio_duration_ms / 1_000.0, retry_count)
+        completed_order.append(key)
+
+    if not started or set(started) != set(completed):
+        raise ValueError(
+            f"{label}: TTS started/completed composite sets do not match"
+        )
+    if completed_order != started_order:
+        raise ValueError(
+            f"{label}: TTS started/completed composite order does not match"
+        )
+
+    parent_ids = _parent_ids_from_contiguous_composite_keys(
+        started_order,
+        label=label,
+    )
+    if nmt_completed_order != parent_ids:
+        raise ValueError(
+            f"{label}: NMT parent IDs do not match the ordered TTS parents"
+        )
+    if any(
+        started[key][1] != nmt_completed_chars[key[0]]
+        for key in started_order
+    ):
+        raise ValueError(
+            f"{label}: TTS parent_text_chars differ from NMT parent counts"
+        )
+
+    parent_count = len(parent_ids)
+    child_count = len(started_order)
+    for field, expected_count in (
+        ("segments_emitted", parent_count),
+        ("audio_segments_produced", child_count),
+        ("tts_subsegments_planned", child_count),
+        ("tts_subsegments_produced", child_count),
+    ):
+        count = _require_nonnegative_int(
+            staged.get(field),
+            field=field,
+            label=label,
+        )
+        if count != expected_count:
+            raise ValueError(
+                f"{label}: {field} does not match paired TTS events"
+            )
+
+    for field in (
+        "completed_sequence_ids",
+        "websocket_sent_sequence_ids",
+    ):
+        _require_sequence_ids(
+            staged.get(field),
+            field=field,
+            expected=parent_ids,
+            label=label,
+        )
+    for field in (
+        "planned_subsegment_keys",
+        "synthesized_subsegment_keys",
+        "completed_subsegment_keys",
+        "websocket_sent_subsegment_keys",
+    ):
+        _require_composite_keys(
+            staged.get(field),
+            field=field,
+            expected=started_order,
+            label=label,
+        )
+    _require_composite_keys(
+        staged.get("incomplete_subsegment_keys"),
+        field="incomplete_subsegment_keys",
+        expected=(),
+        label=label,
+    )
+
+    tts_retry_count = _require_nonnegative_int(
+        staged.get("tts_retry_count"),
+        field="tts_retry_count",
+        label=label,
+    )
+    if tts_retry_count != sum(item[1] for item in completed.values()):
+        raise ValueError(
+            f"{label}: tts_retry_count does not match completed events"
+        )
+
+    return tuple(
+        TtsDurationObservation(
+            sample_index=sample_index,
+            sequence_id=parent_sequence_id,
+            subsequence_id=subsequence_id,
+            subsequence_count=subsequence_count,
+            text_chars=started[key][0],
+            audio_duration_seconds=completed[key][0],
+            telemetry_schema_version=2,
+        )
+        for key in started_order
+        for parent_sequence_id, subsequence_id, subsequence_count in (key,)
+    )
+
+
 def load_summary_observations(
     path: Path,
     *,
@@ -184,6 +531,23 @@ def load_summary_observations(
     events = staged.get("events")
     if not isinstance(events, list):
         raise ValueError(f"{label}: staged events must be a list")
+
+    telemetry_schema_version = staged.get("telemetry_schema_version", 1)
+    if (
+        not isinstance(telemetry_schema_version, int)
+        or isinstance(telemetry_schema_version, bool)
+        or telemetry_schema_version not in {1, 2}
+    ):
+        raise ValueError(
+            f"{label}: telemetry_schema_version must be one or two"
+        )
+    if telemetry_schema_version == 2:
+        return _load_v2_summary_observations(
+            staged,
+            events,
+            sample_index=sample_index,
+            label=label,
+        )
 
     nmt_completed_chars: dict[int, int] = {}
     started: dict[int, int] = {}
@@ -665,16 +1029,40 @@ def _candidate_payload(
 
 def _structural_sha256(
     observations: Sequence[TtsDurationObservation],
+    *,
+    schema_version: int | None = None,
 ) -> str:
-    records = [
-        {
-            "sample_index": item.sample_index,
-            "sequence_id": item.sequence_id,
-            "text_chars": item.text_chars,
-            "audio_duration_seconds": item.audio_duration_seconds,
-        }
-        for item in observations
-    ]
+    resolved_schema_version = (
+        _analysis_schema_version(observations)
+        if schema_version is None
+        else schema_version
+    )
+    if resolved_schema_version == 1:
+        # This exact record shape produced the published v1 matrix digest.
+        # Do not add even default composite fields to this branch.
+        records = [
+            {
+                "sample_index": item.sample_index,
+                "sequence_id": item.sequence_id,
+                "text_chars": item.text_chars,
+                "audio_duration_seconds": item.audio_duration_seconds,
+            }
+            for item in observations
+        ]
+    elif resolved_schema_version == 2:
+        records = [
+            {
+                "sample_index": item.sample_index,
+                "parent_sequence_id": item.parent_sequence_id,
+                "subsequence_id": item.subsequence_id,
+                "subsequence_count": item.subsequence_count,
+                "text_chars": item.text_chars,
+                "audio_duration_seconds": item.audio_duration_seconds,
+            }
+            for item in observations
+        ]
+    else:
+        raise ValueError("structural digest schema version must be one or two")
     encoded = json.dumps(
         records,
         sort_keys=True,
@@ -682,6 +1070,16 @@ def _structural_sha256(
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _analysis_schema_version(
+    observations: Sequence[TtsDurationObservation],
+) -> int:
+    return (
+        2
+        if any(item.telemetry_schema_version == 2 for item in observations)
+        else 1
+    )
 
 
 def _round_floats(value: Any, digits: int = 6) -> Any:
@@ -721,10 +1119,24 @@ def _normalize_observation_samples(
             raise ValueError(
                 "observation sample_index must match its neutral sample ordinal"
             )
-        sequence_ids = [item.sequence_id for item in sample]
-        if sequence_ids != list(range(len(sample))):
+        sample_versions = {
+            item.telemetry_schema_version for item in sample
+        }
+        if len(sample_versions) != 1:
             raise ValueError(
-                "observation sequence IDs must be contiguous from zero"
+                "one sample cannot mix telemetry schema versions"
+            )
+        sample_version = next(iter(sample_versions))
+        if sample_version == 1:
+            sequence_ids = [item.sequence_id for item in sample]
+            if sequence_ids != list(range(len(sample))):
+                raise ValueError(
+                    "observation sequence IDs must be contiguous from zero"
+                )
+        else:
+            _parent_ids_from_contiguous_composite_keys(
+                [item.composite_key for item in sample],
+                label=f"sample_{expected_sample_index:02d}",
             )
         samples.append(sample)
     return samples
@@ -752,6 +1164,7 @@ def build_analysis(
     )
 
     all_observations = tuple(item for sample in samples for item in sample)
+    analysis_schema_version = _analysis_schema_version(all_observations)
     aggregate_model = fit_duration_model(all_observations)
     sample_models = [fit_duration_model(sample) for sample in samples]
     all_models = [aggregate_model, *sample_models]
@@ -875,8 +1288,35 @@ def build_analysis(
             ),
         }
 
+    semantics = {
+        "tts_started_text_chars_are_paired_with_same_sequence_completed_audio_duration": True,
+        "nmt_completed_and_tts_started_text_chars_must_match": True,
+        "malformed_duplicate_incomplete_or_failed_sequences_are_rejected": True,
+        "model_center_line": "ordinary least squares with intercept",
+        "p95_envelope": "center line plus nearest-rank p95 residual",
+        "max_envelope": "center line plus largest residual observed in this matrix",
+        "recommendation_must_pass_aggregate_and_every_sample_model": True,
+        "recommendation_must_pass_leave_one_sample_out_envelope_when_available": True,
+        "recommendation_must_remain_within_observed_character_range": True,
+        "recommendation_is_rounded_down_to_configured_character_grid": True,
+        "original_chunks_at_or_below_cap_are_not_a_split_simulation": True,
+        "punctuation_and_word_boundary_behavior_is_not_modeled": True,
+        "fitted_envelopes_are_experimental_estimates_not_hard_guarantees": True,
+        "minimum_call_counts_assume_ideal_character_packing": True,
+        "ols_intercept_counterfactual_is_not_a_measured_split_result": True,
+    }
+    if analysis_schema_version == 2:
+        semantics.update(
+            {
+                "tts_events_are_paired_by_parent_and_subsequence_identity": True,
+                "subsequences_must_be_contiguous_with_constant_parent_count": True,
+                "tts_parent_text_chars_must_match_nmt_parent_text_chars": True,
+                "structural_digest_includes_composite_identity": True,
+            }
+        )
+
     analysis = {
-        "schema_version": 1,
+        "schema_version": analysis_schema_version,
         "source_format": "completed staged-pipeline summary JSON",
         "privacy": {
             "contains_transcript_text": False,
@@ -886,28 +1326,15 @@ def build_analysis(
             "contains_session_ids": False,
             "sample_labels_are_neutral_ordinals": True,
         },
-        "semantics": {
-            "tts_started_text_chars_are_paired_with_same_sequence_completed_audio_duration": True,
-            "nmt_completed_and_tts_started_text_chars_must_match": True,
-            "malformed_duplicate_incomplete_or_failed_sequences_are_rejected": True,
-            "model_center_line": "ordinary least squares with intercept",
-            "p95_envelope": "center line plus nearest-rank p95 residual",
-            "max_envelope": "center line plus largest residual observed in this matrix",
-            "recommendation_must_pass_aggregate_and_every_sample_model": True,
-            "recommendation_must_pass_leave_one_sample_out_envelope_when_available": True,
-            "recommendation_must_remain_within_observed_character_range": True,
-            "recommendation_is_rounded_down_to_configured_character_grid": True,
-            "original_chunks_at_or_below_cap_are_not_a_split_simulation": True,
-            "punctuation_and_word_boundary_behavior_is_not_modeled": True,
-            "fitted_envelopes_are_experimental_estimates_not_hard_guarantees": True,
-            "minimum_call_counts_assume_ideal_character_packing": True,
-            "ols_intercept_counterfactual_is_not_a_measured_split_result": True,
-        },
+        "semantics": semantics,
         "targets": {
             "p95_audio_duration_seconds": float(target_p95_seconds),
             "observed_max_residual_envelope_seconds": float(target_max_seconds),
         },
-        "structural_records_sha256": _structural_sha256(all_observations),
+        "structural_records_sha256": _structural_sha256(
+            all_observations,
+            schema_version=analysis_schema_version,
+        ),
         "aggregate": {
             "observed_distribution": _distribution(all_observations),
             "model": _model_payload(
@@ -975,15 +1402,25 @@ def render_markdown(analysis: dict[str, Any]) -> str:
         candidate["cap_chars"]
         for candidate in analysis["capacity_candidates"]
     ]
-    lines = [
-        "# Privacy-safe TTS duration model",
-        "",
-        (
+    if analysis.get("schema_version") == 2:
+        pairing_description = (
+            "This analysis pairs translated character counts from TTS-start "
+            "telemetry with synthesized PCM duration from the matching "
+            "parent/subsequence composite identity. It copies no transcript, "
+            "audio, filename, endpoint, or session identifier."
+        )
+    else:
+        # Preserve the published v1 Markdown byte-for-byte.
+        pairing_description = (
             "This analysis pairs translated character counts from TTS-start "
             "telemetry with synthesized PCM duration from the matching "
             "completed sequence. It copies no transcript, audio, filename, "
             "endpoint, or session identifier."
-        ),
+        )
+    lines = [
+        "# Privacy-safe TTS duration model",
+        "",
+        pairing_description,
         "",
     ]
     if cap is None:

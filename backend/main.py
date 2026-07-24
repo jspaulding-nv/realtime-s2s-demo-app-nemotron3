@@ -119,6 +119,11 @@ async def get_config():
             },
         },
         "stagedConfig": {
+            "telemetrySchemaVersion": (
+                2
+                if staged_pipeline_config.tts_subsegment_max_chars > 0
+                else 1
+            ),
             "segmentMaxChars": staged_pipeline_config.segment_max_chars,
             "segmentMaxAgeMs": staged_pipeline_config.segment_max_age_ms,
             "asrEventQueueMaxSize": (
@@ -133,6 +138,12 @@ async def get_config():
                 staged_pipeline_config.tts_max_segment_audio_s
             ),
             "ttsMaxRetries": staged_pipeline_config.tts_max_retries,
+            "ttsSubsegmentMaxChars": (
+                staged_pipeline_config.tts_subsegment_max_chars
+            ),
+            "ttsSubsegmentMinChars": (
+                staged_pipeline_config.tts_subsegment_min_chars
+            ),
             "closeTimeoutSeconds": staged_pipeline_config.close_timeout_s,
         },
     }

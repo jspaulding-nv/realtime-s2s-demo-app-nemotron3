@@ -142,6 +142,11 @@ async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
         },
     }
     assert config_response.json()["stagedConfig"] == {
+        "telemetrySchemaVersion": (
+            2
+            if staged_pipeline_config.tts_subsegment_max_chars > 0
+            else 1
+        ),
         "segmentMaxChars": staged_pipeline_config.segment_max_chars,
         "segmentMaxAgeMs": staged_pipeline_config.segment_max_age_ms,
         "asrEventQueueMaxSize": staged_pipeline_config.asr_event_queue_maxsize,
@@ -154,6 +159,12 @@ async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
             staged_pipeline_config.tts_max_segment_audio_s
         ),
         "ttsMaxRetries": staged_pipeline_config.tts_max_retries,
+        "ttsSubsegmentMaxChars": (
+            staged_pipeline_config.tts_subsegment_max_chars
+        ),
+        "ttsSubsegmentMinChars": (
+            staged_pipeline_config.tts_subsegment_min_chars
+        ),
         "closeTimeoutSeconds": staged_pipeline_config.close_timeout_s,
     }
 
@@ -170,6 +181,22 @@ async def test_staged_lifespan_does_not_open_monolithic_connection():
 
     monolithic_client.connect.assert_not_called()
     monolithic_client.disconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_config_reports_schema_v2_only_for_enabled_tts_subsegmentation(
+    client: AsyncClient,
+):
+    with (
+        patch("main.staged_pipeline_config.tts_subsegment_max_chars", 40),
+        patch("main.staged_pipeline_config.tts_subsegment_min_chars", 12),
+    ):
+        response = await client.get("/api/config")
+
+    staged = response.json()["stagedConfig"]
+    assert staged["telemetrySchemaVersion"] == 2
+    assert staged["ttsSubsegmentMaxChars"] == 40
+    assert staged["ttsSubsegmentMinChars"] == 12
 
 
 @pytest.mark.asyncio

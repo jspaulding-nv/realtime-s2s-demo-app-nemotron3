@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -100,6 +101,7 @@ class FakeNMTClient:
         self.fail_sequence = fail_sequence
         self.retry_count = retry_count
         self.sequences = []
+        self.translations = []
         self.starts = {}
         self.ends = {}
         self.disconnect_count = 0
@@ -126,7 +128,7 @@ class FakeNMTClient:
             self.sequences.append(segment.sequence_id)
         self.ends[segment.sequence_id] = time.monotonic()
         completed = now_ms()
-        return TranslatedSegment(
+        translation = TranslatedSegment(
             segment=segment,
             text=f"ES: {segment.text}",
             language=target_language,
@@ -134,15 +136,39 @@ class FakeNMTClient:
             completed_monotonic_ms=completed,
             retry_count=self.retry_count,
         )
+        self.translations.append(translation)
+        return translation
+
+
+class ChildIdentityNMT(FakeNMTClient):
+    def translate_segment(self, segment, target_language):
+        translation = super().translate_segment(segment, target_language)
+        return replace(
+            translation,
+            subsequence_id=0,
+            subsequence_count=2,
+        )
 
 
 class FakeTTSClient:
-    def __init__(self, delay_s=0, fail_sequence=None, retry_count=0):
+    def __init__(
+        self,
+        delay_s=0,
+        fail_sequence=None,
+        retry_count=0,
+        *,
+        fail_order_key=None,
+        retry_order_key=None,
+    ):
         self.connected = True
         self.delay_s = delay_s
         self.fail_sequence = fail_sequence
+        self.fail_order_key = fail_order_key
         self.retry_count = retry_count
+        self.retry_order_key = retry_order_key
         self.sequences = []
+        self.order_keys = []
+        self.translations = []
         self.starts = {}
         self.ends = {}
         self.disconnect_count = 0
@@ -160,10 +186,15 @@ class FakeTTSClient:
 
     def synthesize(self, translation):
         sequence_id = translation.sequence_id
+        self.order_keys.append(translation.order_key)
+        self.translations.append(translation)
         self.starts[sequence_id] = time.monotonic()
         if self.delay_s:
             time.sleep(self.delay_s)
-        if sequence_id == self.fail_sequence:
+        if (
+            sequence_id == self.fail_sequence
+            or translation.order_key == self.fail_order_key
+        ):
             raise RuntimeError("synthetic TTS failure")
         self.sequences.append(sequence_id)
         self.ends[sequence_id] = time.monotonic()
@@ -178,7 +209,12 @@ class FakeTTSClient:
             started_monotonic_ms=completed - self.delay_s * 1_000,
             first_audio_monotonic_ms=completed - self.delay_s * 500,
             completed_monotonic_ms=completed,
-            retry_count=self.retry_count,
+            retry_count=(
+                self.retry_count
+                if self.retry_order_key is None
+                or translation.order_key == self.retry_order_key
+                else 0
+            ),
         )
 
 
@@ -197,6 +233,19 @@ class ExhaustedRetryTTS(FakeTTSClient):
         raise SyntheticTTSRetryError(translation)
 
 
+class ExhaustedChildRetryTTS(FakeTTSClient):
+    def __init__(self, failing_order_key):
+        super().__init__()
+        self.failing_order_key = failing_order_key
+
+    def synthesize(self, translation):
+        if translation.order_key == self.failing_order_key:
+            self.order_keys.append(translation.order_key)
+            self.translations.append(translation)
+            raise SyntheticTTSRetryError(translation)
+        return super().synthesize(translation)
+
+
 class BlockingRetryTTS(FakeTTSClient):
     def __init__(self):
         super().__init__()
@@ -209,6 +258,28 @@ class BlockingRetryTTS(FakeTTSClient):
         self.started.set()
         self.cancelled.wait(timeout=2)
         raise RuntimeError("synthetic timed-out retry cancelled")
+
+    def disconnect(self):
+        super().disconnect()
+        self.cancelled.set()
+
+
+class BlockingChildRetryTTS(FakeTTSClient):
+    def __init__(self, blocking_order_key):
+        super().__init__()
+        self.blocking_order_key = blocking_order_key
+        self.active_retry_count = 1
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def synthesize(self, translation):
+        if translation.order_key != self.blocking_order_key:
+            return super().synthesize(translation)
+        self.order_keys.append(translation.order_key)
+        self.translations.append(translation)
+        self.started.set()
+        self.cancelled.wait(timeout=2)
+        raise RuntimeError("synthetic timed-out child retry cancelled")
 
     def disconnect(self):
         super().disconnect()
@@ -337,6 +408,215 @@ async def test_ordered_natural_drain_flushes_residual_and_overlaps_nmt_tts():
 
 
 @pytest.mark.asyncio
+async def test_default_off_preserves_one_call_and_parent_translation_identity():
+    nmt = FakeNMTClient()
+    tts = FakeTTSClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "A compact parent."), COMPLETE]),
+        nmt_client=nmt,
+        tts_client=tts,
+        config=config(tts_subsegment_max_chars=0),
+        session_id="subsegment-default-off",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO,
+        StagedOutputEventKind.COMPLETE,
+    ]
+    assert nmt.sequences == [0]
+    assert tts.sequences == [0]
+    assert tts.order_keys == [(0, 0, 1)]
+    assert tts.translations[0] is nmt.translations[0]
+    summary = session.summary(include_events=True)
+    assert summary["telemetry_schema_version"] == 1
+    assert summary["tts_subsegmentation_enabled"] is False
+    assert "planned_subsegment_keys" not in summary
+    assert all(
+        event["subsequence_id"] is None
+        and event["subsequence_count"] is None
+        for event in summary["events"]
+    )
+    await session.aclose()
+
+
+@pytest.mark.parametrize("max_chars", [0, 20])
+@pytest.mark.asyncio
+async def test_nmt_cannot_inject_a_child_identity(max_chars):
+    tts = FakeTTSClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "Parent."), COMPLETE]),
+        nmt_client=ChildIdentityNMT(),
+        tts_client=tts,
+        config=config(
+            tts_subsegment_max_chars=max_chars,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id=f"nmt-child-identity-{max_chars}",
+    )
+
+    await session.start()
+    session.finish_input()
+    terminal = await session.next_output(timeout_s=2)
+
+    assert terminal.kind is StagedOutputEventKind.ERROR
+    assert terminal.stage == "nmt"
+    assert tts.order_keys == []
+    error = next(
+        event
+        for event in session.telemetry
+        if event.stage == "nmt" and event.event == "error"
+    )
+    assert error.sequence_id == 0
+    assert error.subsequence_id is None
+    assert error.subsequence_count is None
+    assert session.summary()["completed_sequence_ids"] == []
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_multiple_parents_emit_all_children_in_composite_fifo_order():
+    tts = FakeTTSClient()
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [
+                final(0, "First parent has enough translated words."),
+                final(1, "Second parent also has several translated words."),
+                COMPLETE,
+            ]
+        ),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            tts_subsegment_max_chars=20,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id="multi-parent-subsegments",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    audio = [output.segment for output in outputs[:-1]]
+    expected_keys = [
+        (0, 0, 4),
+        (0, 1, 4),
+        (0, 2, 4),
+        (0, 3, 4),
+        (1, 0, 4),
+        (1, 1, 4),
+        (1, 2, 4),
+        (1, 3, 4),
+    ]
+    assert [segment.order_key for segment in audio] == expected_keys
+    assert tts.order_keys == expected_keys
+    assert [segment.translation.text for segment in audio] == [
+        "ES:",
+        "First parent has",
+        "enough translated",
+        "words.",
+        "ES:",
+        "Second parent also",
+        "has several",
+        "translated words.",
+    ]
+    assert outputs[-1].kind is StagedOutputEventKind.COMPLETE
+
+    summary = session.summary(include_events=True)
+    expected_payloads = [
+        {
+            "parent_sequence_id": parent,
+            "subsequence_id": child,
+            "subsequence_count": count,
+        }
+        for parent, child, count in expected_keys
+    ]
+    assert summary["telemetry_schema_version"] == 2
+    assert summary["tts_subsegmentation_enabled"] is True
+    assert summary["tts_subsegments_planned"] == 8
+    assert summary["tts_subsegments_produced"] == 8
+    assert summary["planned_subsegment_keys"] == expected_payloads
+    assert summary["synthesized_subsegment_keys"] == expected_payloads
+    assert summary["completed_subsegment_keys"] == expected_payloads
+    assert summary["incomplete_subsegment_keys"] == []
+    assert summary["completed_sequence_ids"] == [0, 1]
+    assert summary["incomplete_sequence_ids"] == []
+    split_events = [
+        event
+        for event in summary["events"]
+        if event["stage"] == "target_splitter"
+        and event["event"] == "emitted"
+    ]
+    assert [
+        (
+            event["parent_sequence_id"],
+            event["subsequence_id"],
+            event["subsequence_count"],
+        )
+        for event in split_events
+    ] == expected_keys
+    assert all(event["text_chars"] <= 20 for event in split_events)
+    assert {
+        event["parent_text_chars"]
+        for event in split_events
+        if event["sequence_id"] == 0
+    } == {len("ES: First parent has enough translated words.")}
+    assert {
+        event["parent_text_chars"]
+        for event in split_events
+        if event["sequence_id"] == 1
+    } == {len("ES: Second parent also has several translated words.")}
+    assert all("text" not in event for event in summary["events"])
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parent_completes_only_when_its_final_child_is_dequeued():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [
+                final(
+                    0,
+                    "This parent has several words and a final clause.",
+                ),
+                COMPLETE,
+            ]
+        ),
+        nmt_client=FakeNMTClient(),
+        tts_client=FakeTTSClient(),
+        config=config(
+            tts_subsegment_max_chars=20,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id="parent-completes-on-final-child",
+    )
+
+    await session.start()
+    session.finish_input()
+
+    for subsequence_id in range(4):
+        output = await session.next_output(timeout_s=2)
+        assert output.kind is StagedOutputEventKind.AUDIO
+        assert output.segment.order_key == (0, subsequence_id, 4)
+        summary = session.summary()
+        assert len(summary["completed_subsegment_keys"]) == subsequence_id + 1
+        if subsequence_id < 3:
+            assert summary["completed_sequence_ids"] == []
+            assert summary["incomplete_sequence_ids"] == [0]
+        else:
+            assert summary["completed_sequence_ids"] == [0]
+            assert summary["incomplete_sequence_ids"] == []
+
+    terminal = await session.next_output(timeout_s=2)
+    assert terminal.kind is StagedOutputEventKind.COMPLETE
+    await session.aclose()
+
+
+@pytest.mark.asyncio
 async def test_nmt_recovery_retry_is_observable_without_changing_order_or_tts_count():
     nmt = FakeNMTClient(retry_count=1)
     tts = FakeTTSClient()
@@ -413,6 +693,56 @@ async def test_atomic_tts_retry_is_observable_without_duplicate_audio():
 
 
 @pytest.mark.asyncio
+async def test_child_retry_is_attributed_without_duplicate_composite_output():
+    retry_key = (0, 1, 4)
+    tts = FakeTTSClient(retry_count=1, retry_order_key=retry_key)
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [
+                final(
+                    0,
+                    "This parent has several words and a final clause.",
+                ),
+                COMPLETE,
+            ]
+        ),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            tts_subsegment_max_chars=20,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id="child-retry",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    expected_keys = [(0, index, 4) for index in range(4)]
+    assert [output.segment.order_key for output in outputs[:-1]] == expected_keys
+    assert tts.order_keys == expected_keys
+    completed = [
+        event
+        for event in session.telemetry
+        if event.stage == "tts" and event.event == "completed"
+    ]
+    assert [event.retry_count for event in completed] == [0, 1, 0, 0]
+    retried = completed[1]
+    assert (
+        retried.parent_sequence_id,
+        retried.subsequence_id,
+        retried.subsequence_count,
+    ) == retry_key
+    summary = session.summary()
+    assert summary["tts_retry_count"] == 1
+    assert summary["audio_segments_produced"] == 4
+    assert summary["completed_sequence_ids"] == [0]
+    assert summary["incomplete_subsegment_keys"] == []
+    await session.aclose()
+
+
+@pytest.mark.asyncio
 async def test_exhausted_tts_retry_records_sequence_and_retry_without_audio():
     session = StagedPipelineSession(
         asr_client=FakeASRClient([final(0, "Peace."), COMPLETE]),
@@ -438,6 +768,69 @@ async def test_exhausted_tts_retry_records_sequence_and_retry_without_audio():
     summary = session.summary()
     assert summary["tts_retry_count"] == 0
     assert summary["audio_segments_produced"] == 0
+    assert summary["completed_sequence_ids"] == []
+    assert summary["incomplete_sequence_ids"] == [0]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_failure_keeps_composite_attribution_and_parent_plan():
+    failing_key = (0, 1, 4)
+    tts = ExhaustedChildRetryTTS(failing_key)
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [
+                final(
+                    0,
+                    "This parent has several words and a final clause.",
+                ),
+                COMPLETE,
+            ]
+        ),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            tts_subsegment_max_chars=20,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id="child-retry-failed",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO,
+        StagedOutputEventKind.ERROR,
+    ]
+    assert outputs[0].segment.order_key == (0, 0, 4)
+    error = next(
+        event
+        for event in session.telemetry
+        if event.stage == "tts" and event.event == "error"
+    )
+    assert (
+        error.parent_sequence_id,
+        error.subsequence_id,
+        error.subsequence_count,
+    ) == failing_key
+    assert error.retry_count == 1
+    assert error.error_code == "SyntheticTTSRetryError"
+
+    summary = session.summary()
+    all_keys = [
+        {
+            "parent_sequence_id": 0,
+            "subsequence_id": index,
+            "subsequence_count": 4,
+        }
+        for index in range(4)
+    ]
+    assert summary["planned_subsegment_keys"] == all_keys
+    assert summary["synthesized_subsegment_keys"] == all_keys[:1]
+    assert summary["completed_subsegment_keys"] == all_keys[:1]
+    assert summary["incomplete_subsegment_keys"] == all_keys[1:]
     assert summary["completed_sequence_ids"] == []
     assert summary["incomplete_sequence_ids"] == [0]
     await session.aclose()
@@ -471,6 +864,60 @@ async def test_tts_timeout_preserves_active_sequence_and_retry_attribution():
     assert timeout_error.retry_count == 1
     assert timeout_error.error_code == "StagedModelTimeoutError"
     assert session.summary()["incomplete_sequence_ids"] == [0]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_timeout_preserves_composite_and_retry_attribution():
+    blocking_key = (0, 1, 4)
+    tts = BlockingChildRetryTTS(blocking_key)
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(
+            [
+                final(
+                    0,
+                    "This parent has several words and a final clause.",
+                ),
+                COMPLETE,
+            ]
+        ),
+        nmt_client=FakeNMTClient(),
+        tts_client=tts,
+        config=config(
+            tts_rpc_timeout_s=0.03,
+            tts_subsegment_max_chars=20,
+            tts_subsegment_min_chars=1,
+        ),
+        session_id="child-retry-timeout",
+    )
+
+    await session.start()
+    session.finish_input()
+    outputs = await drain(session)
+
+    assert [output.kind for output in outputs] == [
+        StagedOutputEventKind.AUDIO,
+        StagedOutputEventKind.ERROR,
+    ]
+    assert tts.started.is_set()
+    assert tts.cancelled.is_set()
+    error = next(
+        event
+        for event in session.telemetry
+        if event.stage == "tts" and event.event == "error"
+    )
+    assert (
+        error.parent_sequence_id,
+        error.subsequence_id,
+        error.subsequence_count,
+    ) == blocking_key
+    assert error.retry_count == 1
+    assert error.error_code == "StagedModelTimeoutError"
+    summary = session.summary()
+    assert summary["tts_subsegments_planned"] == 4
+    assert summary["tts_subsegments_produced"] == 1
+    assert summary["completed_sequence_ids"] == []
+    assert summary["incomplete_sequence_ids"] == [0]
     await session.aclose()
 
 
@@ -1047,9 +1494,24 @@ async def test_cancelled_output_waiter_cannot_consume_and_lose_queue_item():
         {"nmt_queue_maxsize": 1.5},
         {"nmt_rpc_timeout_s": float("nan")},
         {"tts_rpc_timeout_s": float("inf")},
+        {"tts_subsegment_max_chars": -1},
+        {"tts_subsegment_max_chars": True},
+        {"tts_subsegment_max_chars": 1.5},
+        {"tts_subsegment_min_chars": 0},
+        {"tts_subsegment_min_chars": True},
         {"close_timeout_s": True},
     ],
 )
 def test_staged_config_rejects_invalid_runtime_types(overrides):
     with pytest.raises(ValueError):
         config(**overrides)
+
+
+def test_staged_config_allows_minimum_packing_preference_above_cap():
+    resolved = config(
+        tts_subsegment_max_chars=5,
+        tts_subsegment_min_chars=12,
+    )
+
+    assert resolved.tts_subsegment_max_chars == 5
+    assert resolved.tts_subsegment_min_chars == 12

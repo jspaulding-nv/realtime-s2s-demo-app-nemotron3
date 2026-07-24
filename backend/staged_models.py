@@ -138,6 +138,8 @@ class TranslatedSegment:
     completed_monotonic_ms: float
     source_override_applied: bool = False
     retry_count: int = 0
+    subsequence_id: int = 0
+    subsequence_count: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.segment, TextSegment):
@@ -154,6 +156,10 @@ class TranslatedSegment:
             or self.retry_count not in {0, 1}
         ):
             raise ValueError("retry_count must be zero or one")
+        _validate_subsequence_identity(
+            self.subsequence_id,
+            self.subsequence_count,
+        )
         _validate_nonnegative_finite(
             "started_monotonic_ms", self.started_monotonic_ms
         )
@@ -166,6 +172,22 @@ class TranslatedSegment:
     @property
     def sequence_id(self) -> int:
         return self.segment.sequence_id
+
+    @property
+    def parent_sequence_id(self) -> int:
+        return self.sequence_id
+
+    @property
+    def order_key(self) -> Tuple[int, int, int]:
+        return (
+            self.parent_sequence_id,
+            self.subsequence_id,
+            self.subsequence_count,
+        )
+
+    @property
+    def is_final_subsequence(self) -> bool:
+        return self.subsequence_id == self.subsequence_count - 1
 
     @property
     def processing_duration_ms(self) -> float:
@@ -181,6 +203,9 @@ class TranslatedSegment:
             "processing_duration_ms": self.processing_duration_ms,
             "source_override_applied": self.source_override_applied,
             "retry_count": self.retry_count,
+            "parent_sequence_id": self.parent_sequence_id,
+            "subsequence_id": self.subsequence_id,
+            "subsequence_count": self.subsequence_count,
         }
 
 
@@ -230,6 +255,26 @@ class SynthesizedSegment:
     @property
     def sequence_id(self) -> int:
         return self.translation.sequence_id
+
+    @property
+    def parent_sequence_id(self) -> int:
+        return self.translation.parent_sequence_id
+
+    @property
+    def subsequence_id(self) -> int:
+        return self.translation.subsequence_id
+
+    @property
+    def subsequence_count(self) -> int:
+        return self.translation.subsequence_count
+
+    @property
+    def order_key(self) -> Tuple[int, int, int]:
+        return self.translation.order_key
+
+    @property
+    def is_final_subsequence(self) -> bool:
+        return self.translation.is_final_subsequence
 
     @property
     def processing_duration_ms(self) -> float:
@@ -328,6 +373,8 @@ class PipelineEvent:
     event: str
     monotonic_ms: float
     sequence_id: Optional[int] = None
+    subsequence_id: Optional[int] = None
+    subsequence_count: Optional[int] = None
     asr_final_id: Optional[int] = None
     contributing_final_ids: Tuple[int, ...] = ()
     emission_reason: Optional[EmissionReason] = None
@@ -339,6 +386,7 @@ class PipelineEvent:
     processing_duration_ms: float = 0.0
     blocked_put_ms: float = 0.0
     text_chars: int = 0
+    parent_text_chars: Optional[int] = None
     audio_bytes: int = 0
     audio_duration_ms: float = 0.0
     retry_count: int = 0
@@ -352,6 +400,19 @@ class PipelineEvent:
         _validate_nonnegative_finite("monotonic_ms", self.monotonic_ms)
         if self.sequence_id is not None and self.sequence_id < 0:
             raise ValueError("sequence_id must be non-negative")
+        if (self.subsequence_id is None) != (self.subsequence_count is None):
+            raise ValueError(
+                "subsequence_id and subsequence_count must be provided together"
+            )
+        if self.subsequence_id is not None:
+            if self.sequence_id is None:
+                raise ValueError(
+                    "subsequence identity requires a parent sequence_id"
+                )
+            _validate_subsequence_identity(
+                self.subsequence_id,
+                self.subsequence_count,
+            )
         if self.asr_final_id is not None and self.asr_final_id < 0:
             raise ValueError("asr_final_id must be non-negative")
         if any(final_id < 0 for final_id in self.contributing_final_ids):
@@ -375,6 +436,12 @@ class PipelineEvent:
             raise ValueError("queue_depth cannot exceed queue_capacity")
         if min(self.text_chars, self.audio_bytes, self.retry_count) < 0:
             raise ValueError("event counters must be non-negative")
+        if self.parent_text_chars is not None and (
+            not isinstance(self.parent_text_chars, int)
+            or isinstance(self.parent_text_chars, bool)
+            or self.parent_text_chars <= 0
+        ):
+            raise ValueError("parent_text_chars must be a positive integer")
         _validate_nonnegative_finite("audio_duration_ms", self.audio_duration_ms)
         _validate_nonnegative_finite(
             "queue_residence_ms", self.queue_residence_ms
@@ -387,9 +454,15 @@ class PipelineEvent:
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
+        if self.subsequence_id is not None:
+            payload["parent_sequence_id"] = self.sequence_id
         if self.emission_reason is not None:
             payload["emission_reason"] = self.emission_reason.value
         return payload
+
+    @property
+    def parent_sequence_id(self) -> Optional[int]:
+        return self.sequence_id
 
 
 def _validate_source_range(
@@ -406,6 +479,24 @@ def _validate_source_range(
         and source_end_ms < source_start_ms
     ):
         raise ValueError("source_end_ms cannot precede source_start_ms")
+
+
+def _validate_subsequence_identity(
+    subsequence_id: int,
+    subsequence_count: int,
+) -> None:
+    for name, value in (
+        ("subsequence_id", subsequence_id),
+        ("subsequence_count", subsequence_count),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+    if subsequence_count <= 0:
+        raise ValueError("subsequence_count must be positive")
+    if subsequence_id < 0 or subsequence_id >= subsequence_count:
+        raise ValueError(
+            "subsequence_id must be within the subsequence_count range"
+        )
 
 
 def _validate_finite(name: str, value: float) -> None:

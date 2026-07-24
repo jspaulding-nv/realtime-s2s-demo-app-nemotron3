@@ -75,3 +75,4 @@ docs/results/raw/
 
 # Development notes
 *.txt
+!requirements-dev.txt

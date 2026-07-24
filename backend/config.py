@@ -83,6 +83,14 @@ class StagedPipelineConfig:
         os.getenv("STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS", "60")
     )
     tts_max_retries: int = int(os.getenv("STAGED_TTS_MAX_RETRIES", "1"))
+    # Zero preserves the existing one-parent/one-TTS-call path. Positive
+    # values opt into post-NMT target-text subsegmentation.
+    tts_subsegment_max_chars: int = int(
+        os.getenv("STAGED_TTS_SUBSEGMENT_MAX_CHARS", "0")
+    )
+    tts_subsegment_min_chars: int = int(
+        os.getenv("STAGED_TTS_SUBSEGMENT_MIN_CHARS", "12")
+    )
     close_timeout_s: float = float(
         os.getenv("STAGED_CLOSE_TIMEOUT_SECONDS", "10")
     )
@@ -112,6 +120,22 @@ class StagedPipelineConfig:
             or self.tts_max_retries not in {0, 1}
         ):
             raise ValueError("tts_max_retries must be zero or one")
+        if (
+            not isinstance(self.tts_subsegment_max_chars, int)
+            or isinstance(self.tts_subsegment_max_chars, bool)
+            or self.tts_subsegment_max_chars < 0
+        ):
+            raise ValueError(
+                "tts_subsegment_max_chars must be a non-negative integer"
+            )
+        if (
+            not isinstance(self.tts_subsegment_min_chars, int)
+            or isinstance(self.tts_subsegment_min_chars, bool)
+            or self.tts_subsegment_min_chars <= 0
+        ):
+            raise ValueError(
+                "tts_subsegment_min_chars must be a positive integer"
+            )
         for name in (
             "nmt_rpc_timeout_s",
             "tts_rpc_timeout_s",
