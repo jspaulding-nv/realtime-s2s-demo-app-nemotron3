@@ -675,6 +675,7 @@ Detailed guides:
 - [Atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md)
 - [Atomic TTS response-cadence five-minute canary](docs/TTS_RESPONSE_CHUNK_5MIN_CANARY_2026-07-24.md)
 - [Default-off incremental TTS publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md)
+- [Incremental TTS publication 60-second formal canary](docs/STREAMING_TTS_60S_CANARY_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

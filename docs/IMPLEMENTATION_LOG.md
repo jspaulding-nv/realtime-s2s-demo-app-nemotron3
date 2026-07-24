@@ -918,6 +918,35 @@ Node.js 12 runtime is below the repository's declared Node.js 20.19 minimum;
 the schema-v3 wire contract remains ordinary ordered binary PCM and required
 no frontend source change.
 
+The first clean schema-v3 canary from `9505679` then reproduced the known
+two-character Magpie `UNKNOWN` after two 100 ms frames had committed. The
+adapter correctly refused to retry or replay that prefix and failed closed,
+but the run demonstrated that the diagnosed tiny-target shape needs atomic
+retry safety even when normal parents publish incrementally.
+
+Commit `57c7ffa` added a default four-character atomic fallback inside schema
+3. Tiny validated targets keep PCM private through iterator completion and the
+one allowed `UNKNOWN` retry, then reframe the successful attempt through the
+same bounded frame publisher. Longer targets retain true incremental delivery.
+Fallback identity now reconciles across adapter completion, pipeline events,
+output barriers, WebSocket completion, batch validation, latency analysis, and
+the matched canary comparator. Direct incremental-benefit metrics exclude
+fallback parents; audience-facing metrics retain them. Older schema-v3
+artifacts normalize omitted fallback fields to zero/empty.
+
+The post-fix suite passed 605 tests with one optional local-trace test skipped.
+The clean 60-second rerun completed all 16 parents in both arms. Schema 3
+selected parent 7 as its only atomic fallback and completed all 448 PCM frames
+without retry or failure. Across the 15 true-incremental parents, first PCM
+reached the WebSocket 35.5 ms p50 / 48.6 ms p95 after the first TTS response
+and led full-response completion by 347.5 ms p50 / 1.054 s p95.
+
+The atomic and schema-3 arms generated 52.199 and 43.886 seconds of speech,
+respectively, a 15.93% workload difference. Queue and tail deltas therefore
+remain confounded. First audio also remained about 15.1-15.5 seconds. This is
+an operational/direct-publication pass, not an audience-delay pass. See
+[Incremental TTS publication: 60-second formal canary](STREAMING_TTS_60S_CANARY_2026-07-24.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
