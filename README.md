@@ -613,8 +613,14 @@ CANARY_DURATION_SECONDS=300 \
 The runner verifies the pinned model containers, retains only numeric
 response-cadence data in the staged sidecar, and writes a privacy-safe
 `streaming_latency_analysis.md`. The diagnostic remains atomic: it does not
-forward partial PCM. See
-[Atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md).
+forward partial PCM. The formal five-minute gate found 2,123 incremental PCM
+responses across 74/74 multi-response requests. Current atomic buffering held
+the first available PCM for another 0.430 seconds at p50 and 1.633 seconds at
+p95, so the next experiment will publish frame-aligned PCM under a default-off
+schema 3. This improves local responsiveness but does not by itself bound the
+listener queue. See the
+[atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md)
+and [five-minute canary](docs/TTS_RESPONSE_CHUNK_5MIN_CANARY_2026-07-24.md).
 
 Detailed guides:
 
@@ -633,6 +639,7 @@ Detailed guides:
 - [Post-NMT TTS subsegmentation 60-second live probe](docs/TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md)
 - [Post-NMT TTS subsegmentation five-minute matched canary](docs/TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md)
 - [Atomic TTS response-chunk diagnostic](docs/TTS_RESPONSE_CHUNK_DIAGNOSTIC.md)
+- [Atomic TTS response-cadence five-minute canary](docs/TTS_RESPONSE_CHUNK_5MIN_CANARY_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

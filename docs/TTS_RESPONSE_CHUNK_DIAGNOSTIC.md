@@ -135,19 +135,21 @@ final. These numbers are therefore not word-accurate joke markers. The batch
 harness also sends 300 ms frames, so source alignment includes up to one frame
 of quantization plus scheduling and transport effects.
 
-## Promotion gate and next implementation
+## Five-minute promotion gate
 
-Run the same diagnostic over the matched five-minute control. Proceed with a
-default-off incremental publication experiment only if the longer run
-continues to show:
+The formal five-minute control passed. All 74 TTS requests returned multiple
+PCM responses, producing 2,123 responses in total. The first response arrived
+before the current atomic WebSocket send by 0.430 seconds at p50, 1.633 seconds
+at p95, and 2.387 seconds at maximum. Exact response-byte and lifecycle
+integrity passed with zero NMT/TTS retries or cleanup errors, and all three
+pinned services remained ready after the run.
 
-- multiple responses for most TTS requests;
-- materially earlier first responses than RPC completion;
-- exact response-byte reconciliation; and
-- no retry, lifecycle, or service-health regression.
+The detailed results, audience interpretation, reproducibility contract, and
+measurement boundaries are in the
+[five-minute response-cadence canary](TTS_RESPONSE_CHUNK_5MIN_CANARY_2026-07-24.md).
 
-If promoted to an experiment, use a new schema 3 rather than overloading
-schema-2 TTS subsequences:
+This promotes a default-off implementation experiment, not the staged route
+itself. Use a new schema 3 rather than overloading schema-2 TTS subsequences:
 
 1. Reframe variable Riva responses into frame-aligned 100 ms PCM blocks.
 2. Identify each block as `(parent_sequence_id, audio_frame_id)`.
