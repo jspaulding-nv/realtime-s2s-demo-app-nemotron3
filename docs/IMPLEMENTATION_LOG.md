@@ -860,8 +860,8 @@ digest and generated files byte for byte while adding composite v2 pairing.
 
 `run_tts_subsegment_canary.sh` creates one shared five-minute prefix and runs
 the disabled, 40-, 45-, and 60-character policies sequentially. It manages
-only its own FastAPI process and leaves the pinned NIMs untouched. Formal
-five-minute results remain pending; implementation details and gates are in
+only its own FastAPI process and leaves the pinned NIMs untouched.
+Implementation details and gates are in
 [Default-off post-NMT TTS subsegmentation](TTS_SUBSEGMENT_IMPLEMENTATION.md).
 
 A non-formal 60-second-per-arm live probe passed every integrity, provenance,
@@ -873,6 +873,16 @@ but still did not beat the disabled control. First audio remained about
 [Post-NMT TTS subsegmentation: 60-second live probe](TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md).
 The final local Python suite passed 514 tests with one optional local-trace
 test skipped.
+
+The formal five-minute matrix then ran from clean commit `4367931`. All four
+arms used the same 1,000 input chunks and 74 upstream NMT parents, passed
+immutable image provenance and matched-design checks, completed without a
+retry or dropped chunk, and left all three pinned NIMs healthy. The disabled
+control had a 19.339-second adaptive queue p95 and 30.510-second adaptive tail.
+Every split cap was worse: cap 60, the least harmful, increased adaptive queue
+p95 by 12.0% and tail by 8.1%. Splitting also left first audio effectively
+unchanged at about 15.5 seconds. The feature therefore stays disabled. See
+[Post-NMT TTS subsegmentation: five-minute matched canary](TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md).
 
 ## Handoff checklist
 
@@ -896,6 +906,6 @@ test skipped.
 - [x] Sweep no-drop playback capacity on the completed matched traces
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
-- [ ] Run matched unsplit/40/45/60 short real-time canaries
+- [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries
 - [x] Keep unapproved private/internal container references out of external
   documentation

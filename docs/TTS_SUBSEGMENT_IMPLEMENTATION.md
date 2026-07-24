@@ -194,6 +194,11 @@ The comparison does not select a winner by default. Automatic selection
 requires a complete, explicit set of promotion thresholds, and every candidate
 still requires native-language review.
 
+The completed five-minute matrix rejected every enabled cap because smaller
+delivery bursts came with greater synthesized duration and listener backlog.
+Keep the feature disabled; see
+[Post-NMT TTS subsegmentation: five-minute matched canary](TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md).
+
 Useful overrides:
 
 ```bash

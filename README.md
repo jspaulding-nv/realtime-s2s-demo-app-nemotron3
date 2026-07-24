@@ -612,6 +612,7 @@ Detailed guides:
 - [Post-NMT TTS subsegment capacity model](docs/TTS_SUBSEGMENT_CAPACITY_MODEL.md)
 - [Default-off post-NMT TTS subsegmentation and matched canary](docs/TTS_SUBSEGMENT_IMPLEMENTATION.md)
 - [Post-NMT TTS subsegmentation 60-second live probe](docs/TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md)
+- [Post-NMT TTS subsegmentation five-minute matched canary](docs/TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)
