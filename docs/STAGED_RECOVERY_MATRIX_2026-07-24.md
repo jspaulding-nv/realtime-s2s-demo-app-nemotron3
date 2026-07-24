@@ -201,9 +201,45 @@ The long continuous 1.10x intervals also make native-Spanish quality review a
 required gate. Tail reduction alone is not sufficient evidence that sustained
 accelerated speech is acceptable.
 
+## Post-NMT TTS duration sizing
+
+A new transcript-free analyzer paired `tts.started.text_chars` with the
+matching `tts.completed.audio_duration_ms` for all 2,027 matrix sequences.
+The aggregate fit is:
+
+```text
+audio seconds = 0.488769 + 0.056789 * translated characters
+R² = 0.853396
+```
+
+Leave-one-sample-out residual validation places the 4-second-p95 character
+limit at 44 and the 8-second observed-max-residual limit at 46. Requiring the
+aggregate, every per-sample fit, and the cross-sample envelope to pass within
+the observed character range, then rounding down to a five-character
+configuration grid, selects 40 characters as the strict experimental cap.
+
+This is not a production recommendation. Ideal packing at 40 characters would
+increase TTS calls by at least 71.8%. Multiplying those extra calls by the
+0.488769-second fitted intercept yields a 10.7% captured-output counterfactual.
+That is not a measured split result, but it exposes the core risk: smaller TTS
+bursts can improve delivery granularity while extra request-boundary pause or
+audio worsens accumulated delay.
+
+The short live comparison must therefore retain an unsplit control and test
+40-, 45-, and 60-character post-NMT caps. Forty-five characters is essentially
+on the cross-sample boundary at 4.002-second p95 and 7.941-second max envelope;
+60 characters lowers minimum call amplification to 34.0% but has fitted
+envelopes of 4.854 and 8.793 seconds.
+
+The checked-in analyzer, exact structural digest, model tables, composite child
+sequence contract, and reproduction command are in
+[Post-NMT TTS subsegment capacity model](TTS_SUBSEGMENT_CAPACITY_MODEL.md).
+Generated JSON and Markdown remain with the ignored raw matrix.
+
 ## Software validation
 
-- Full Python backend, analysis, and harness suite: 413 passed, 1 skipped.
+- Full Python backend, analysis, and harness suite: 431 passed, 1 skipped.
+- TTS-duration analyzer focused suite: 18 passed.
 - Capacity-analyzer focused suite: 24 passed, 1 optional local-trace test
   skipped.
 - The analyzer's default JSON and Markdown were compared byte-for-byte with
@@ -214,31 +250,32 @@ accelerated speech is acceptable.
 
 ## Recommended next experiment
 
-Do not immediately spend another full matrix on the unchanged policy. Use the
-three completed arrival traces first:
+Do not immediately spend another full matrix on the unchanged policy:
 
-1. Use the checked-in deterministic constant-rate and media-duration sweep to
-   reproduce the capacity result. Extend the experiment to adaptive maximum
-   rates through 1.12x and 1.15x. Treat values above 1.10x as exploratory until
-   listening quality is reviewed.
-2. Report queue p50/p95/peak, time above 10 seconds, tail, rate exposure, and
-   longest continuous accelerated interval for every candidate. Reject any
-   policy that drops translated chunks.
-3. Instrument leading, trailing, and internal low-energy PCM duration without
+1. Implement a default-off post-NMT splitter. Keep one complete NMT parent for
+   translation context and identify TTS children by parent sequence,
+   subsequence ID, and subsequence count.
+2. Extend TTS/output/WebSocket telemetry and integrity validation so every
+   child is ordered, unique, byte-accounted, and terminal-safe. Preserve the
+   existing atomic retry independently for each child.
+3. Run matched real-time five-minute canaries with splitting disabled and caps
+   of 40, 45, and 60 characters. Keep the pinned models, 800 ms EOU, upstream
+   segmentation, queues, retry bound, and playback policy unchanged.
+4. Report actual subsegment duration p50/p95/max, call count, output/input
+   ratio, queue p50/p95/peak, time above 10 seconds, tail, failures, and
+   playback-rate exposure. Reject any policy that drops or reorders PCM.
+5. Instrument leading, trailing, and internal low-energy PCM duration without
    retaining generated audio. This determines whether bounded pause
    compression can remove delay with less quality impact than faster speech.
-4. Test smaller atomic segmentation bounds, beginning with 160 and 120
-   characters while retaining 800 ms EOU and the existing age fallback.
-   Recheck translation quality and short-segment safety before any full run.
-5. Confirm server-side prosody support before implementation. The pinned
+6. Confirm server-side prosody support before implementation. The pinned
    staged client's direct TTS request exposes no rate field; any supported
    control must be added explicitly to configuration, provenance, telemetry,
    duration validation, and listening-quality tests.
-6. Add synchronized source-event and translated-audible markers, then measure
+7. Add synchronized source-event and translated-audible markers, then measure
    semantic event delay. This is the direct test for the live-joke scenario.
-7. Cross-check the selected candidate in actual browser Web Audio and obtain
+8. Cross-check the selected candidate in actual browser Web Audio and obtain
    native-Spanish review at 1.05x, 1.10x, and any higher exploratory rate.
-8. Only then repeat the live three-sample matrix. Use three repeats per sample
+9. Only then repeat the live three-sample matrix. Use three repeats per sample
    after a candidate approaches the 5-10 second queue objective.
 
 If 10 seconds must become a hard bound, the product policy must explicitly

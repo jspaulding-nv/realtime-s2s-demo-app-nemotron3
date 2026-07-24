@@ -806,6 +806,34 @@ The post-sweep full Python suite passed 413 tests with one optional local-trace
 test skipped. Independent review matched the rolling-rate implementation
 against a brute-force calculation over 10,000 randomized cases.
 
+## July 24, 2026: privacy-safe TTS duration capacity model
+
+The completed matrix retained character counts on TTS-start telemetry and PCM
+duration on matching TTS-completed events. A new deterministic
+`analyze_tts_duration.py` joins those fields by sequence ID only after
+validating clean staged outcome, contiguous and paired sequences, parent
+counts, WebSocket parent IDs, and retry totals. Its output excludes transcript,
+audio, paths, filenames, endpoints, and session IDs.
+
+The 2,027 structural records fit
+`audio_seconds = 0.488769 + 0.056789 * translated_characters`, with
+`R² = 0.853396`. Leave-one-sample-out residuals yielded a 44-character
+4-second-p95 limit and a 46-character 8-second observed-max-residual limit.
+Requiring aggregate, per-sample, and cross-sample constraints to pass within
+the observed character range on a five-character grid selected 40 characters.
+
+Call amplification prevents treating that cap as automatically beneficial.
+Ideal packing would increase calls by at least 71.8%, 58.3%, and 34.0% for
+40-, 45-, and 60-character caps. The aggregate intercept counterfactual
+corresponds to 10.7%, 8.7%, and 5.1% extra captured output. These are risk
+estimates, not live split results. A default-off composite child sequence
+contract and matched unsplit/40/45/60 five-minute canary are required before
+another full matrix. See
+[Post-NMT TTS subsegment capacity model](TTS_SUBSEGMENT_CAPACITY_MODEL.md).
+The post-model Python backend, analysis, and harness suite passed 431 tests
+with one optional local-trace test skipped; the focused analyzer suite passed
+18 tests.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -826,5 +854,8 @@ against a brute-force calculation over 10,000 randomized cases.
 - [x] Pass one complete post-recovery staged Sample 02 canary
 - [x] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
 - [x] Sweep no-drop playback capacity on the completed matched traces
+- [x] Fit and document a privacy-safe post-NMT TTS character/duration model
+- [ ] Implement default-off composite-key post-NMT TTS subsegmentation
+- [ ] Run matched unsplit/40/45/60 short real-time canaries
 - [x] Keep unapproved private/internal container references out of external
   documentation

@@ -27,6 +27,7 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - A resumable one-command harness for sequential matched-policy runs across all three samples
 - Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
+- A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -60,6 +61,15 @@ reported a successful retry. The subsequent clean three-sample matrix completed
 without a TTS fault or retry. That matrix validates long-form compatibility
 with the recovery enabled; the targeted probe, not the matrix, is the evidence
 that directly exercised successful TTS recovery.
+
+Transcript-free structural telemetry from the clean matrix produced 2,027
+character-count/PCM-duration pairs. A leave-one-sample-out model places the
+4-second-p95 and 8-second observed-max-residual limits at 44 and 46 translated
+characters. The strict five-character grid therefore starts at 40 characters,
+but this is not yet a production setting: the same fit predicts substantial
+call amplification and possible fixed-duration overhead. The next live canary
+must compare unsplit, 40-, 45-, and 60-character post-NMT TTS policies while
+measuring both burst size and total output expansion.
 
 ## Architecture
 
@@ -131,6 +141,7 @@ realtime-s2s-demo-app/
 ├── direct_asr_bridge_smoke.py # Opt-in bounded DirectASRStream smoke
 ├── staged_pipeline_smoke.py # Opt-in direct ASR -> NMT -> TTS preflight
 ├── diagnose_short_segment.py # Privacy-safe isolated/context replay
+├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
 └── README.md
@@ -559,6 +570,21 @@ Sanitized aggregate replay findings are retained in
 [`NEMOTRON_TEST_RESULTS.md`](NEMOTRON_TEST_RESULTS.md); raw reports remain in
 ignored local output directories.
 
+The completed staged matrix can also size a post-NMT TTS subsegment experiment
+without copying translated text:
+
+```bash
+python3 analyze_tts_duration.py \
+  --input-dir \
+    experiment_results/post-tts-recovery-matrix-20260724T054450Z-636f478/repeat-01
+```
+
+The model selects a strict 40-character starting cap, while identifying 45 and
+60 characters as near-boundary and lower-call-amplification candidates. Those
+are offline sizing results, not evidence that splitting improves live delay;
+see the measured tradeoffs and required composite sequence contract in
+[Post-NMT TTS subsegment capacity model](docs/TTS_SUBSEGMENT_CAPACITY_MODEL.md).
+
 Detailed guides:
 
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
@@ -571,6 +597,7 @@ Detailed guides:
 - [Narrow NMT short-segment recovery and failed-capture evidence](docs/NMT_SHORT_SEGMENT_RECOVERY.md)
 - [Atomic TTS recovery and privacy-safe short-segment replay](docs/TTS_SHORT_SEGMENT_RECOVERY.md)
 - [July 24 staged recovery three-sample matrix](docs/STAGED_RECOVERY_MATRIX_2026-07-24.md)
+- [Post-NMT TTS subsegment capacity model](docs/TTS_SUBSEGMENT_CAPACITY_MODEL.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)
