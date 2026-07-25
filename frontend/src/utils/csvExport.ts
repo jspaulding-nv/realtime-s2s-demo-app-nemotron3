@@ -45,6 +45,17 @@ export function exportTimingDataAsCSV(
     'scheduled_end_context_sec',
     'projected_scheduled_start_client_ms',
     'source_end_to_projected_scheduled_start_ms',
+    'playback_clock_session_id',
+    'clock_sample_sequence',
+    'clock_sample_reason',
+    'clock_sample_performance_client_ms',
+    'clock_sample_performance_before_client_ms',
+    'clock_sample_performance_after_client_ms',
+    'clock_sample_context_sec',
+    'clock_sample_output_context_sec',
+    'clock_sample_output_performance_client_ms',
+    'clock_sample_basis',
+    'clock_sample_queue_end_context_sec',
   ].join(',');
   const rows: string[] = [header];
 
@@ -97,6 +108,17 @@ export function exportTimingDataAsCSV(
         e.scheduledEndContextSec?.toFixed(6) ?? '',
         e.projectedScheduledStartClientMs?.toFixed(3) ?? '',
         e.sourceEndToProjectedScheduledStartMs?.toFixed(3) ?? '',
+        e.playbackClockSessionId ?? '',
+        e.clockSampleSequence ?? '',
+        e.clockSampleReason ?? '',
+        e.clockSamplePerformanceClientMs?.toFixed(3) ?? '',
+        e.clockSamplePerformanceBeforeClientMs?.toFixed(3) ?? '',
+        e.clockSamplePerformanceAfterClientMs?.toFixed(3) ?? '',
+        e.clockSampleContextSec?.toFixed(6) ?? '',
+        e.clockSampleOutputContextSec?.toFixed(6) ?? '',
+        e.clockSampleOutputPerformanceClientMs?.toFixed(3) ?? '',
+        e.clockSampleBasis ?? '',
+        e.clockSampleQueueEndContextSec?.toFixed(6) ?? '',
       ].join(','),
     );
   }
@@ -112,7 +134,8 @@ export function exportTimingDataAsCSV(
         e.audio_bytes_len,
         '', '', '', '', '', '', '',
         '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-        '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '',
       ].join(','),
     );
   }

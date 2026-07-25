@@ -15,6 +15,7 @@ const mockTrackerStartTest = vi.fn();
 const mockLogChunkSent = vi.fn();
 const mockLogAudioReceived = vi.fn();
 const mockLogAudioParentComplete = vi.fn();
+const mockLogPlaybackClockSample = vi.fn();
 const mockGetPlaybackMetrics = vi.fn<() => PlaybackMetrics>(() => ({
   queueDepthSeconds: 0,
   peakQueueDepthSeconds: 0,
@@ -34,12 +35,19 @@ let playbackInstances: Array<{
   getPlaybackPosition: ReturnType<typeof vi.fn>;
   getPlaybackMetrics: ReturnType<typeof vi.fn>;
 }>;
+let playbackOptions: Array<{
+  initialMuted?: boolean;
+  adaptivePlayback?: boolean;
+  onSchedule?: (event: unknown) => void;
+  onClockSample?: (event: unknown) => void;
+}>;
 
 vi.mock('../hooks/useAudioPlayback', () => ({
   useAudioPlayback: vi.fn((opts?: {
     initialMuted?: boolean;
     adaptivePlayback?: boolean;
     onSchedule?: (event: unknown) => void;
+    onClockSample?: (event: unknown) => void;
   }) => {
     const instance = {
       isPlaying: false,
@@ -51,6 +59,7 @@ vi.mock('../hooks/useAudioPlayback', () => ({
       getPlaybackPosition: mockGetPlaybackPosition,
       getPlaybackMetrics: mockGetPlaybackMetrics,
     };
+    playbackOptions.push(opts ?? {});
     playbackInstances.push(instance);
     return instance;
   }),
@@ -86,6 +95,7 @@ vi.mock('../hooks/useTimingTracker', () => ({
     logAudioReceived: mockLogAudioReceived,
     logAudioParentComplete: mockLogAudioParentComplete,
     logPlaybackScheduled: vi.fn(),
+    logPlaybackClockSample: mockLogPlaybackClockSample,
     logPlaybackQueueSample: vi.fn(),
     getEvents: vi.fn(() => []),
     getSendCount: vi.fn(() => 0),
@@ -138,6 +148,7 @@ describe('TestDashboard', () => {
     vi.clearAllMocks();
     mockFetch.mockImplementation(defaultFetch);
     playbackInstances = [];
+    playbackOptions = [];
   });
 
   // --- Existing tests ---
@@ -299,6 +310,18 @@ describe('TestDashboard', () => {
       adaptivePlayback: true,
       onSchedule: expect.any(Function),
     }));
+  });
+
+  it('routes output playback clock samples into the timing tracker', () => {
+    render(<TestDashboard />);
+    const clockEvent = { clockSampleSequence: 7 };
+
+    expect(playbackOptions).toHaveLength(2);
+    expect(playbackOptions[0].onClockSample).toBeUndefined();
+    expect(playbackOptions[1].onClockSample).toBeTypeOf('function');
+
+    playbackOptions[1].onClockSample?.(clockEvent);
+    expect(mockLogPlaybackClockSample).toHaveBeenCalledWith(clockEvent);
   });
 
   it('opts only the test transport into audio metadata v1 and records observations', async () => {
@@ -593,7 +616,7 @@ describe('TestDashboard', () => {
       expect(sendMessage).not.toHaveBeenCalledWith({ type: 'stop_stream' });
 
       mockGetPlaybackMetrics.mockReturnValue({
-        queueDepthSeconds: 0,
+        queueDepthSeconds: 0.05,
         peakQueueDepthSeconds: 12,
         playbackRate: 1.1,
         playbackMode: 'urgent',
@@ -603,17 +626,27 @@ describe('TestDashboard', () => {
         aboveLimit: false,
         limitExceededCount: 1,
       });
+      act(() => notifyStatus?.('completed', 'Riva output complete'));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1_000);
       });
       expect(disconnect).not.toHaveBeenCalled();
       expect(sendMessage).not.toHaveBeenCalledWith({ type: 'stop_stream' });
 
-      act(() => notifyStatus?.('completed', 'Riva output complete'));
+      mockGetPlaybackMetrics.mockReturnValue({
+        queueDepthSeconds: 0,
+        peakQueueDepthSeconds: 12,
+        playbackRate: 1.1,
+        playbackMode: 'normal',
+        totalSourceDurationSeconds: 60,
+        totalScheduledDurationSeconds: 55,
+        aboveTarget: false,
+        aboveLimit: false,
+        limitExceededCount: 1,
+      });
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1_000);
       });
-
       expect(sendMessage).toHaveBeenCalledWith({ type: 'stop_stream' });
       expect(disconnect).toHaveBeenCalledTimes(1);
       expect(screen.getByText('Export CSV')).toBeInTheDocument();

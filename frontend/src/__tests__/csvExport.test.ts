@@ -44,6 +44,17 @@ describe('exportTimingDataAsCSV', () => {
     'scheduled_end_context_sec',
     'projected_scheduled_start_client_ms',
     'source_end_to_projected_scheduled_start_ms',
+    'playback_clock_session_id',
+    'clock_sample_sequence',
+    'clock_sample_reason',
+    'clock_sample_performance_client_ms',
+    'clock_sample_performance_before_client_ms',
+    'clock_sample_performance_after_client_ms',
+    'clock_sample_context_sec',
+    'clock_sample_output_context_sec',
+    'clock_sample_output_performance_client_ms',
+    'clock_sample_basis',
+    'clock_sample_queue_end_context_sec',
   ].join(',');
   let capturedCsvText: string;
   let mockAnchor: {
@@ -81,6 +92,48 @@ describe('exportTimingDataAsCSV', () => {
 
     URL.createObjectURL = vi.fn(() => 'blob:mock-url');
     URL.revokeObjectURL = vi.fn();
+  });
+
+  it('exports browser clock evidence with conservative brackets', () => {
+    const clientEvents: ClientTimingEvent[] = [{
+      stage: 'playback_clock_sample',
+      timestamp: 234.25,
+      chunkIndex: -1,
+      sourcePositionSec: 0,
+      audioBytes: 0,
+      playbackClockSessionId: 7,
+      clockSampleSequence: 3,
+      clockSampleReason: 'interval',
+      clockSamplePerformanceClientMs: 1234.25,
+      clockSamplePerformanceBeforeClientMs: 1234.2,
+      clockSamplePerformanceAfterClientMs: 1234.3,
+      clockSampleContextSec: 2.5,
+      clockSampleOutputContextSec: 2.48,
+      clockSampleOutputPerformanceClientMs: 1214.1,
+      clockSampleBasis: 'get_output_timestamp',
+      clockSampleQueueEndContextSec: 5.75,
+    }];
+
+    exportTimingDataAsCSV(clientEvents, []);
+
+    const headers = capturedCsvText.split('\n')[0].split(',');
+    const fields = capturedCsvText.split('\n')[1].split(',');
+    const row = Object.fromEntries(
+      headers.map((header, index) => [header, fields[index]]),
+    );
+    expect(row).toMatchObject({
+      playback_clock_session_id: '7',
+      clock_sample_sequence: '3',
+      clock_sample_reason: 'interval',
+      clock_sample_performance_client_ms: '1234.250',
+      clock_sample_performance_before_client_ms: '1234.200',
+      clock_sample_performance_after_client_ms: '1234.300',
+      clock_sample_context_sec: '2.500000',
+      clock_sample_output_context_sec: '2.480000',
+      clock_sample_output_performance_client_ms: '1214.100',
+      clock_sample_basis: 'get_output_timestamp',
+      clock_sample_queue_end_context_sec: '5.750000',
+    });
   });
 
   afterEach(() => {

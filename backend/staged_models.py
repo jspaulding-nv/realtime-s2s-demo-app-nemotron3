@@ -6,6 +6,20 @@ from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
 
+ASR_TIMING_BASIS_WORD_OFFSETS = "word_offsets"
+ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS = "incomplete_word_offsets"
+ASR_TIMING_BASIS_AUDIO_PROCESSED_END_ONLY = "audio_processed_end_only"
+ASR_TIMING_BASIS_UNAVAILABLE = "unavailable"
+ASR_TIMING_BASES = frozenset(
+    {
+        ASR_TIMING_BASIS_WORD_OFFSETS,
+        ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS,
+        ASR_TIMING_BASIS_AUDIO_PROCESSED_END_ONLY,
+        ASR_TIMING_BASIS_UNAVAILABLE,
+    }
+)
+
+
 class EmissionReason(str, Enum):
     """Why buffered ASR text became a translation segment."""
 
@@ -47,6 +61,10 @@ class ASRTranscript:
     source_start_ms: Optional[float] = None
     source_end_ms: Optional[float] = None
     detected_languages: Tuple[str, ...] = ()
+    word_count: int = 0
+    first_word_start_ms: Optional[float] = None
+    last_word_end_ms: Optional[float] = None
+    timing_basis: str = "unavailable"
 
     def __post_init__(self) -> None:
         _validate_nonnegative_finite(
@@ -56,6 +74,12 @@ class ASRTranscript:
         _validate_finite("stability", self.stability)
         _validate_finite("confidence", self.confidence)
         _validate_source_range(self.source_start_ms, self.source_end_ms)
+        _validate_asr_timing_diagnostics(
+            word_count=self.word_count,
+            first_word_start_ms=self.first_word_start_ms,
+            last_word_end_ms=self.last_word_end_ms,
+            timing_basis=self.timing_basis,
+        )
 
 
 @dataclass(frozen=True)
@@ -67,6 +91,11 @@ class AsrFinal:
     received_monotonic_ms: float
     source_start_ms: Optional[float] = None
     source_end_ms: Optional[float] = None
+    audio_processed_s: float = 0.0
+    word_count: int = 0
+    first_word_start_ms: Optional[float] = None
+    last_word_end_ms: Optional[float] = None
+    timing_basis: str = "unavailable"
 
     def __post_init__(self) -> None:
         if self.final_id < 0:
@@ -74,7 +103,14 @@ class AsrFinal:
         _validate_nonnegative_finite(
             "received_monotonic_ms", self.received_monotonic_ms
         )
+        _validate_nonnegative_finite("audio_processed_s", self.audio_processed_s)
         _validate_source_range(self.source_start_ms, self.source_end_ms)
+        _validate_asr_timing_diagnostics(
+            word_count=self.word_count,
+            first_word_start_ms=self.first_word_start_ms,
+            last_word_end_ms=self.last_word_end_ms,
+            timing_basis=self.timing_basis,
+        )
 
     @classmethod
     def from_transcript(
@@ -90,6 +126,11 @@ class AsrFinal:
             received_monotonic_ms=transcript.received_monotonic_ms,
             source_start_ms=transcript.source_start_ms,
             source_end_ms=transcript.source_end_ms,
+            audio_processed_s=transcript.audio_processed_s,
+            word_count=transcript.word_count,
+            first_word_start_ms=transcript.first_word_start_ms,
+            last_word_end_ms=transcript.last_word_end_ms,
+            timing_basis=transcript.timing_basis,
         )
 
 
@@ -904,6 +945,56 @@ def _validate_source_range(
         and source_end_ms < source_start_ms
     ):
         raise ValueError("source_end_ms cannot precede source_start_ms")
+
+
+def _validate_asr_timing_diagnostics(
+    *,
+    word_count: int,
+    first_word_start_ms: Optional[float],
+    last_word_end_ms: Optional[float],
+    timing_basis: str,
+) -> None:
+    if (
+        not isinstance(word_count, int)
+        or isinstance(word_count, bool)
+        or word_count < 0
+    ):
+        raise ValueError("word_count must be a non-negative integer")
+    if timing_basis not in ASR_TIMING_BASES:
+        raise ValueError(f"unsupported ASR timing basis: {timing_basis!r}")
+    if first_word_start_ms is not None:
+        _validate_nonnegative_finite(
+            "first_word_start_ms", first_word_start_ms
+        )
+    if last_word_end_ms is not None:
+        _validate_nonnegative_finite("last_word_end_ms", last_word_end_ms)
+    complete_offsets = (
+        first_word_start_ms is not None and last_word_end_ms is not None
+    )
+    if (
+        complete_offsets
+        and last_word_end_ms <= first_word_start_ms
+    ):
+        raise ValueError(
+            "last_word_end_ms must follow first_word_start_ms"
+        )
+    if timing_basis == ASR_TIMING_BASIS_WORD_OFFSETS:
+        if word_count == 0 or not complete_offsets:
+            raise ValueError(
+                "word_offsets timing requires words and complete offsets"
+            )
+        return
+    if timing_basis == ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS:
+        if word_count == 0 or complete_offsets:
+            raise ValueError(
+                "incomplete_word_offsets timing requires words and a "
+                "missing boundary"
+            )
+        return
+    if word_count or first_word_start_ms is not None or last_word_end_ms is not None:
+        raise ValueError(
+            f"{timing_basis} timing cannot carry word-offset diagnostics"
+        )
 
 
 def _validate_subsequence_identity(

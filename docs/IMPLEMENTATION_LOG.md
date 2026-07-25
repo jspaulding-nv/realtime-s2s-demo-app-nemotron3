@@ -1152,17 +1152,96 @@ source-end lag, 1.742-8.312 second projected-end source-end lag, and a
 so it is not a semantic PASS/FAIL result. See
 [Semantic gate browser preflight](SEMANTIC_EVENT_GATE_PREFLIGHT_2026-07-25.md).
 
-Final review found that validating the AudioContext and client-clock
-recurrences independently still allowed the domains to diverge. The analyzer
-now rejects a per-frame playback-wait linkage residual above 25 ms or a
-capture-wide clock-offset span above 50 ms. Semantic decisions widen the raw
-projected parent envelope by 25 ms in both directions. The matched browser
-capture remained valid at a 17.8 ms maximum residual and 28.3 ms offset span.
-The 50 ms span ceiling remains provisional because it was calibrated on only
-60 seconds. The first long-duration capture must test that pre-registered
-limit unchanged; a clean clock-only rejection would require a duration-aware
-or common-clock evidence revision and a repeat, not a post-hoc threshold
-change.
+Final review initially added a 25 ms per-frame playback-wait linkage limit and
+a 50 ms capture-wide client/AudioContext offset-span limit. The matched
+60-second browser capture remained valid at a 17.8 ms maximum residual and
+28.3 ms span. The first long-form browser run correctly tested those registered
+limits unchanged. It completed 645 translated parents and 19,544 output
+frames, but is **INVALID evidence**, not a semantic PASS or FAIL. Three ASR
+finals lacked a word-derived source start, affecting three parents and 51
+frames. Separately, one discrete browser clock-offset step produced a 254.4 ms
+maximum linkage residual and a 286.9 ms capture span. No marker sidecar or
+two-person semantic review was performed. See
+[Semantic event gate long-form diagnostic](SEMANTIC_EVENT_GATE_LONG_FORM_DIAGNOSTIC_2026-07-25.md).
+
+The vNext evidence model replaces those provisional fixed residual/span
+thresholds. The browser now records a continuous clock trace at a nominal
+200 ms cadence while audio is queued, plus session, queue-start, queue-drain,
+and stop boundaries. Every queued interval must have exactly one unique,
+ordered start/drain pair and no performance-clock or AudioContext sample gap
+above 500 ms. Every observation retains the `performance.now()` before/after
+bracket around `currentTime`. An initialized `AudioContext.getOutputTimestamp()`
+pair is added only when both components are nonfuture and no more than 500 ms
+old; stale, future, zero, failed, or unavailable output timestamps downgrade to
+the bracket basis.
+
+The analyzer combines every sample bound with every per-frame schedule offset,
+plus a monotonic cross-corner rectangle between every adjacent sample inside a
+queued interval. Its lower corner is the previous `performanceBefore` minus
+the next `currentTime`; its upper corner is the next `performanceAfter` minus
+the previous `currentTime`. These broad rectangles conservatively contain a
+transient offset excursion between timer callbacks. The analyzer forms one
+capture-wide observed client/AudioContext offset interval and applies a
+pre-registered 32 ms guard to each side. Semantic decisions map the candidate
+frames' scheduled AudioContext start/end coordinates through that guarded
+interval. A discrete clock step can only widen the decision bounds; it cannot
+improve a PASS. The historical projected client-clock recurrence and the raw
+residual/span remain validation/diagnostic evidence, but the formal decision
+no longer relies on a fixed 25/50 ms rejection model.
+
+ASR attribution is now a separate prerequisite. Before another full gate, run
+the exact long-form padded PCM twice against the pinned direct ASR service:
+
+```bash
+python3 asr_final_attribution_gate.py \
+  --file test_audio/long-form-03-30min.wav \
+  --uri 127.0.0.1:50052 \
+  --docker-container <local-asr-container> \
+  --runs 2 \
+  --json-output \
+    experiment_results/semantic-event-gate/asr-final-attribution.json
+```
+
+The runner uses the same absolute chunk-end pacing as the browser gate. It
+passes only when both complete real-time runs share one exact padded PCM
+SHA-256/sample count, produce nonempty finals, and report zero finals missing
+word offsets. Each run also records maximum/mean chunk-release lateness and
+must remain within the preregistered 250 ms maximum, preventing a suspended VM
+from qualifying an overdue burst as real-time delivery. The replacement
+browser capture must use that same padded PCM identity. Any end-only final
+still blocks semantic analysis; neighboring ranges are never used to invent a
+start. Qualification artifacts remain ignored and transcript-free.
+
+Adversarial review also removed Web Audio decoding as an input-identity
+confound for the registered file. Both the browser and qualification runner now
+pass through the exact little-endian 16 kHz mono PCM16 RIFF `data` bytes and
+zero-pad only the final 4,800-sample wire chunk. The next run is registered to
+30,211,200 padded samples and SHA-256
+`9ad08fe1e83e714c48dde4f971606431302fae9d3079293b73ab8ff99d1d8143`.
+The historical Web Audio-derived digest
+`b3e622c467fb4be80622df5c2fea708cf08ca49a000cf46933bdadd0e1b9e11b`
+belongs only to the invalid diagnostic and cannot be reused.
+
+Both paths now enforce the same strict RIFF passthrough contract: exact
+declared RIFF length, one valid `fmt ` chunk, one `data` chunk, PCM format 1,
+mono, 16-bit, 16 kHz, consistent byte rate/block alignment, and aligned data.
+The qualification runner durably writes a fresh `passed=false`, zero-run
+attempt checkpoint before preflight, then checkpoints the attested pre-run
+state and every completed run. An interruption or lease loss cannot expose an
+older passing artifact as current evidence.
+
+The qualification JSON intentionally omits arbitrary filenames, endpoint
+strings, transcripts, translations, image tags, model profiles, and the local
+container name. The runner requires a literal `127.0.0.1` endpoint and proves
+the compatible Docker host-port binding before streaming. It verifies
+healthy/running state, the 50052 container-port binding, configured pinned
+image, local image ID, immutable repository digest, and exactly one registered
+Nemotron English streaming selector. The privacy-safe report retains its
+registered selector hash. It repeats the same attestation after every complete
+replay and invalidates the qualification if the attested identity changes. A
+valid report therefore requires
+`asr.runtime_attestation.verified=true`; declaration alone cannot substitute
+for Docker inspection.
 
 ## Handoff checklist
 
@@ -1188,6 +1267,10 @@ change.
 - [x] Add opt-in parent/frame wire metadata and observation-only browser telemetry
 - [x] Pass a 60-second matched live canary with protocol-v1 evidence
 - [x] Implement chunk-end-paced semantic source-event parent-envelope analysis
+- [x] Implement fail-closed runtime attestation for the ASR container's
+  endpoint binding, health, pinned image/digest, and registered profile
+- [ ] Pass two real-time ASR final-attribution qualification runs on the exact
+  long-form padded PCM
 - [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
 - [ ] Run protocol v1 across all three long-form samples

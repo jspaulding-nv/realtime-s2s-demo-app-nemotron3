@@ -56,6 +56,17 @@ export interface ClientTimingEvent {
   scheduledEndContextSec?: number;
   projectedScheduledStartClientMs?: number;
   sourceEndToProjectedScheduledStartMs?: number;
+  playbackClockSessionId?: number;
+  clockSampleSequence?: number;
+  clockSampleReason?: string;
+  clockSamplePerformanceClientMs?: number;
+  clockSamplePerformanceBeforeClientMs?: number;
+  clockSamplePerformanceAfterClientMs?: number;
+  clockSampleContextSec?: number;
+  clockSampleOutputContextSec?: number;
+  clockSampleOutputPerformanceClientMs?: number;
+  clockSampleBasis?: string;
+  clockSampleQueueEndContextSec?: number;
 }
 
 /** Backend timing event received via /ws/metrics. */

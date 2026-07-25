@@ -76,6 +76,91 @@ def test_response_parser_prefers_word_timing_envelope():
 
     assert event.source_start_ms == 250
     assert event.source_end_ms == 900
+    assert event.word_count == 2
+    assert event.first_word_start_ms == 250
+    assert event.last_word_end_ms == 900
+    assert event.timing_basis == "word_offsets"
+
+
+def test_response_parser_keeps_missing_word_start_fail_closed():
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Untimed final.",
+                        is_final=True,
+                        audio_processed=12.5,
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    assert event.word_count == 0
+    assert event.first_word_start_ms is None
+    assert event.last_word_end_ms is None
+    assert event.source_start_ms is None
+    assert event.source_end_ms == 12_500
+    assert event.timing_basis == "audio_processed_end_only"
+
+
+def test_response_parser_marks_partial_word_envelope_without_inventing_start():
+    words = [
+        SimpleNamespace(end_time=400),
+        SimpleNamespace(start_time=450, end_time=900),
+    ]
+
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Partially timed.",
+                        is_final=True,
+                        audio_processed=1.25,
+                        words=words,
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    assert event.word_count == 2
+    assert event.first_word_start_ms is None
+    assert event.last_word_end_ms == 900
+    assert event.source_start_ms is None
+    assert event.source_end_ms == 900
+    assert event.timing_basis == "incomplete_word_offsets"
+
+
+def test_response_parser_rejects_default_zero_length_word_envelope():
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Default scalar offsets.",
+                        is_final=True,
+                        audio_processed=1.25,
+                        words=[
+                            SimpleNamespace(start_time=0, end_time=0),
+                        ],
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    assert event.word_count == 1
+    assert event.first_word_start_ms == 0
+    assert event.last_word_end_ms is None
+    assert event.source_start_ms is None
+    assert event.source_end_ms == 1_250
+    assert event.timing_basis == "incomplete_word_offsets"
 
 
 def test_response_parser_preserves_hypothesis_local_source_timing():

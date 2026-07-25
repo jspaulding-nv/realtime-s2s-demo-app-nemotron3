@@ -129,6 +129,7 @@ describe('useTimingTracker', () => {
     act(() => result.current.startTest());
 
     act(() => result.current.logPlaybackScheduled({
+      playbackClockSessionId: 7,
       timestampMs: performance.now(),
       schedulePerformanceMs: performance.now(),
       audioContextTimeAtScheduleSeconds: 10,
@@ -151,6 +152,7 @@ describe('useTimingTracker', () => {
     expect(result.current.getEvents()).toEqual([
       expect.objectContaining({
         stage: 'playback_chunk_scheduled',
+        playbackClockSessionId: 7,
         audioBytes: 3200,
         queueDepthSec: 5.295238,
         playbackRate: 1.05,
@@ -160,6 +162,44 @@ describe('useTimingTracker', () => {
         stage: 'playback_queue_sample',
         queueDepthSec: 5.1,
         playbackRate: 1.05,
+      }),
+    ]);
+  });
+
+  it('records privacy-safe browser clock samples', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logPlaybackClockSample({
+      playbackClockSessionId: 7,
+      clockSampleSequence: 3,
+      clockSampleReason: 'interval',
+      clockSamplePerformanceClientMs: 1234.25,
+      clockSamplePerformanceBeforeClientMs: 1234.2,
+      clockSamplePerformanceAfterClientMs: 1234.3,
+      clockSampleContextSeconds: 2.5,
+      clockSampleOutputContextSeconds: 2.48,
+      clockSampleOutputPerformanceClientMs: 1214.1,
+      clockSampleBasis: 'get_output_timestamp',
+      clockSampleQueueEndContextSeconds: 5.75,
+    }));
+
+    expect(result.current.getEvents()).toEqual([
+      expect.objectContaining({
+        stage: 'playback_clock_sample',
+        chunkIndex: -1,
+        audioBytes: 0,
+        playbackClockSessionId: 7,
+        clockSampleSequence: 3,
+        clockSampleReason: 'interval',
+        clockSamplePerformanceClientMs: 1234.25,
+        clockSamplePerformanceBeforeClientMs: 1234.2,
+        clockSamplePerformanceAfterClientMs: 1234.3,
+        clockSampleContextSec: 2.5,
+        clockSampleOutputContextSec: 2.48,
+        clockSampleOutputPerformanceClientMs: 1214.1,
+        clockSampleBasis: 'get_output_timestamp',
+        clockSampleQueueEndContextSec: 5.75,
       }),
     ]);
   });
@@ -219,6 +259,7 @@ describe('useTimingTracker', () => {
     };
     act(() => result.current.logAudioReceived(3200, audioFrame));
     act(() => result.current.logPlaybackScheduled({
+      playbackClockSessionId: 7,
       timestampMs: 1801,
       schedulePerformanceMs: 1801,
       audioContextTimeAtScheduleSeconds: 10,
@@ -287,6 +328,7 @@ describe('useTimingTracker', () => {
       sourceEndToBinaryReceiptMs: 300,
     });
     expect(scheduled).toMatchObject({
+      playbackClockSessionId: 7,
       schedulePerformanceClientMs: 1801,
       audioContextTimeAtScheduleSec: 10,
       scheduledStartContextSec: 12,

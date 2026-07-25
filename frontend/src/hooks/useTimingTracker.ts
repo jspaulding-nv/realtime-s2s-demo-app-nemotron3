@@ -9,7 +9,10 @@ import type {
   AudioParentCompleteObservation,
   AudioSourceRange,
 } from '../types/audioMetadata';
-import type { PlaybackScheduleEvent } from './useAudioPlayback';
+import type {
+  PlaybackClockSampleEvent,
+  PlaybackScheduleEvent,
+} from './useAudioPlayback';
 import type { PlaybackMode } from '../utils/playbackPolicy';
 
 interface UseTimingTrackerReturn {
@@ -26,6 +29,7 @@ interface UseTimingTrackerReturn {
     observation: AudioParentCompleteObservation,
   ) => void;
   logPlaybackScheduled: (event: PlaybackScheduleEvent) => void;
+  logPlaybackClockSample: (event: PlaybackClockSampleEvent) => void;
   logPlaybackQueueSample: (
     queueDepthSec: number,
     playbackRate: number,
@@ -377,6 +381,7 @@ export function useTimingTracker(): UseTimingTrackerReturn {
       queueDepthSec: event.queueDepthSeconds,
       playbackRate: event.playbackRate,
       playbackMode: event.playbackMode,
+      playbackClockSessionId: event.playbackClockSessionId,
       schedulePerformanceClientMs: event.schedulePerformanceMs,
       audioContextTimeAtScheduleSec: (
         event.audioContextTimeAtScheduleSeconds
@@ -409,6 +414,43 @@ export function useTimingTracker(): UseTimingTrackerReturn {
         : {}),
     });
   }, [sourceEndMetrics]);
+
+  const logPlaybackClockSample = useCallback((
+    event: PlaybackClockSampleEvent,
+  ) => {
+    eventsRef.current.push({
+      stage: 'playback_clock_sample',
+      timestamp: (
+        event.clockSamplePerformanceClientMs - testStartRef.current
+      ),
+      chunkIndex: -1,
+      sourcePositionSec: 0,
+      audioBytes: 0,
+      playbackClockSessionId: event.playbackClockSessionId,
+      clockSampleSequence: event.clockSampleSequence,
+      clockSampleReason: event.clockSampleReason,
+      clockSamplePerformanceClientMs: (
+        event.clockSamplePerformanceClientMs
+      ),
+      clockSamplePerformanceBeforeClientMs: (
+        event.clockSamplePerformanceBeforeClientMs
+      ),
+      clockSamplePerformanceAfterClientMs: (
+        event.clockSamplePerformanceAfterClientMs
+      ),
+      clockSampleContextSec: event.clockSampleContextSeconds,
+      clockSampleOutputContextSec: (
+        event.clockSampleOutputContextSeconds
+      ),
+      clockSampleOutputPerformanceClientMs: (
+        event.clockSampleOutputPerformanceClientMs
+      ),
+      clockSampleBasis: event.clockSampleBasis,
+      clockSampleQueueEndContextSec: (
+        event.clockSampleQueueEndContextSeconds
+      ),
+    });
+  }, []);
 
   const logPlaybackQueueSample = useCallback((
     queueDepthSec: number,
@@ -445,6 +487,7 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     logAudioReceived,
     logAudioParentComplete,
     logPlaybackScheduled,
+    logPlaybackClockSample,
     logPlaybackQueueSample,
     getEvents,
     getSendCount,
@@ -457,6 +500,7 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     logAudioReceived,
     logAudioParentComplete,
     logPlaybackScheduled,
+    logPlaybackClockSample,
     logPlaybackQueueSample,
     getEvents,
     getSendCount,

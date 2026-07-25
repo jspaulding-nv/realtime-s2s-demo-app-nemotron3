@@ -21,7 +21,6 @@ type ServerTerminalState = 'pending' | 'completed' | 'error';
 const DRAIN_MIN_SEC = 10;
 const DRAIN_IDLE_SEC = 5;
 const DRAIN_MAX_SEC = 300;
-const PLAYBACK_DRAIN_EPSILON_SEC = 0.1;
 
 export function TestDashboard() {
   const [phase, setPhase] = useState<TestPhase>('idle');
@@ -71,6 +70,9 @@ export function TestDashboard() {
     initialMuted: true,
     adaptivePlayback: adaptivePlaybackEnabled,
     onSchedule: (event) => trackerRef.current.logPlaybackScheduled(event),
+    onClockSample: (event) => (
+      trackerRef.current.logPlaybackClockSample(event)
+    ),
   });
 
   // Stable refs for playback instances
@@ -443,7 +445,11 @@ export function TestDashboard() {
         serverTerminalStateRef.current === 'completed'
         && drainElapsedSec >= DRAIN_MIN_SEC
         && silenceSec >= DRAIN_IDLE_SEC
-        && queueDepthSec <= PLAYBACK_DRAIN_EPSILON_SEC;
+        // getPlaybackMetrics clamps a truly empty queue to exact zero. Do not
+        // stop up to 100 ms early: the formal clock trace needs the sampler to
+        // observe currentTime reaching the scheduled endpoint and emit the
+        // matching queue_drained boundary.
+        && queueDepthSec === 0;
       const timedOut = drainElapsedSec >= DRAIN_MAX_SEC;
 
       if (fullyDrained) {

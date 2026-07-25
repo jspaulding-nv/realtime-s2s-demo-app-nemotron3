@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 from dataclasses import replace
@@ -437,6 +438,48 @@ async def test_ordered_natural_drain_flushes_residual_and_overlaps_nmt_tts():
     assert [event.monotonic_ms for event in first_audio_events] == [
         segment.first_audio_monotonic_ms for segment in audio
     ]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_summary_exports_privacy_safe_final_attribution_diagnostics():
+    private_text = "Do not export this transcript."
+    timed_event = ASRStreamEvent(
+        kind=ASRStreamEventKind.FINAL,
+        final=AsrFinal(
+            final_id=0,
+            text=private_text,
+            received_monotonic_ms=now_ms(),
+            source_start_ms=100,
+            source_end_ms=900,
+            audio_processed_s=1.25,
+            word_count=5,
+            first_word_start_ms=100,
+            last_word_end_ms=900,
+            timing_basis="word_offsets",
+        ),
+    )
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([timed_event, COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=FakeTTSClient(),
+        config=config(),
+        session_id="asr-attribution-diagnostic",
+    )
+
+    await session.start()
+    session.finish_input()
+    await drain(session)
+    summary = session.summary(include_events=True)
+
+    diagnostic = summary["asr_final_attribution"]
+    assert diagnostic["nonempty_final_count"] == 1
+    assert diagnostic["final_missing_word_offsets_count"] == 0
+    assert diagnostic["all_nonempty_finals_have_word_offsets"] is True
+    assert diagnostic["finals"][0]["final_id"] == 0
+    assert diagnostic["finals"][0]["text_chars"] == len(private_text)
+    assert private_text not in json.dumps(diagnostic)
+    assert '"text"' not in json.dumps(diagnostic)
     await session.aclose()
 
 

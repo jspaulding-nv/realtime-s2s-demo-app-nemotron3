@@ -18,6 +18,10 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from asr_attribution import (
+    final_attribution_record,
+    summarize_final_attribution,
+)
 from config import (
     SUPPORTED_LANGUAGES,
     StagedPipelineConfig,
@@ -299,6 +303,7 @@ class StagedPipelineSession:
         self._state = StagedPipelineState.NEW
         self._closed = False
         self._telemetry: list[PipelineEvent] = []
+        self._asr_final_attribution_records: list[Dict[str, Any]] = []
         self._max_queue_depths: Dict[str, int] = {"nmt": 0, "tts": 0, "output": 0}
         self._blocked_put_counts: Dict[str, int] = {
             "nmt": 0,
@@ -551,6 +556,9 @@ class StagedPipelineSession:
             "audio_segments_produced": self._audio_segments_produced,
             "fillers_discarded": self._fillers_discarded,
             "segments_emitted": len(self._emitted_sequence_ids),
+            "asr_final_attribution": summarize_final_attribution(
+                self._asr_final_attribution_records
+            ),
             "nmt_retry_count": sum(
                 event.retry_count
                 for event in self._telemetry
@@ -798,6 +806,9 @@ class StagedPipelineSession:
                 await self._handle_segmenter_outcomes(segmenter_outcomes)
             elif event.kind is ASRStreamEventKind.FINAL:
                 final = event.final
+                self._asr_final_attribution_records.append(
+                    final_attribution_record(final)
+                )
                 self._record(
                     stage="asr",
                     event="final",

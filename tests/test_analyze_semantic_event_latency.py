@@ -52,6 +52,17 @@ CSV_COLUMNS = [
     "scheduled_end_context_sec",
     "projected_scheduled_start_client_ms",
     "source_end_to_projected_scheduled_start_ms",
+    "playback_clock_session_id",
+    "clock_sample_sequence",
+    "clock_sample_reason",
+    "clock_sample_performance_client_ms",
+    "clock_sample_performance_before_client_ms",
+    "clock_sample_performance_after_client_ms",
+    "clock_sample_context_sec",
+    "clock_sample_output_context_sec",
+    "clock_sample_output_performance_client_ms",
+    "clock_sample_basis",
+    "clock_sample_queue_end_context_sec",
 ]
 SOURCE_PCM_SHA256 = "ab" * 32
 SOURCE_PCM_SAMPLE_COUNT = 2000
@@ -106,6 +117,7 @@ def _protocol_row(
         media_duration_sec=media_duration,
         scheduled_duration_sec=duration,
         playback_rate=playback_rate if has_schedule else "",
+        playback_clock_session_id=7 if has_schedule else "",
         audio_metadata_protocol_version=1,
         stream_generation=7,
         parent_sequence_id=parent,
@@ -139,6 +151,42 @@ def _protocol_row(
             if has_schedule
             else ""
         ),
+    )
+
+
+def _clock_sample_row(
+    sequence,
+    reason,
+    *,
+    performance_ms,
+    context_sec,
+    queue_end_context_sec,
+    basis="get_output_timestamp",
+    output_offset_ms=12000,
+):
+    uses_output_timestamp = basis == "get_output_timestamp"
+    return _row(
+        source="client",
+        stage="playback_clock_sample",
+        chunk_index=-1,
+        audio_bytes=0,
+        playback_clock_session_id=7,
+        clock_sample_sequence=sequence,
+        clock_sample_reason=reason,
+        clock_sample_performance_client_ms=performance_ms,
+        clock_sample_performance_before_client_ms=performance_ms - 0.1,
+        clock_sample_performance_after_client_ms=performance_ms + 0.1,
+        clock_sample_context_sec=context_sec,
+        clock_sample_output_context_sec=(
+            context_sec if uses_output_timestamp else ""
+        ),
+        clock_sample_output_performance_client_ms=(
+            context_sec * 1000 + output_offset_ms
+            if uses_output_timestamp
+            else ""
+        ),
+        clock_sample_basis=basis,
+        clock_sample_queue_end_context_sec=queue_end_context_sec,
     )
 
 
@@ -258,6 +306,52 @@ def _base_rows():
             ),
         ]
     )
+    rows.extend(
+        [
+            _clock_sample_row(
+                0,
+                "session_started",
+                performance_ms=12990,
+                context_sec=0.99,
+                queue_end_context_sec=0.99,
+            ),
+            _clock_sample_row(
+                1,
+                "queue_started",
+                performance_ms=13000,
+                context_sec=1.0,
+                queue_end_context_sec=1.1,
+            ),
+            _clock_sample_row(
+                2,
+                "interval",
+                performance_ms=13100,
+                context_sec=1.1,
+                queue_end_context_sec=1.2,
+            ),
+            _clock_sample_row(
+                3,
+                "queue_drained",
+                performance_ms=13210,
+                context_sec=1.21,
+                queue_end_context_sec=1.2,
+            ),
+            _clock_sample_row(
+                4,
+                "queue_started",
+                performance_ms=15000,
+                context_sec=3.0,
+                queue_end_context_sec=3.2,
+            ),
+            _clock_sample_row(
+                5,
+                "queue_drained",
+                performance_ms=15210,
+                context_sec=3.21,
+                queue_end_context_sec=3.2,
+            ),
+        ]
+    )
     return rows
 
 
@@ -357,9 +451,31 @@ def test_valid_capture_calculates_conservative_bounds_and_claim_scope(
     assert analysis["evidence"]["source_pcm_sha256"] == SOURCE_PCM_SHA256
     assert analysis["evidence"]["source_pcm_sample_count"] == 2000
     assert analysis["evidence"]["source_pcm_binding_verified"] is True
-    assert analysis["evidence"]["playback_clock_link_tolerance_ms"] == 25
+    assert analysis["evidence"]["playback_clock_session_id"] == 7
+    assert analysis["evidence"]["playback_clock_sample_count"] == 6
     assert (
-        analysis["evidence"]["playback_clock_offset_span_limit_ms"] == 50
+        analysis["evidence"][
+            "playback_clock_output_timestamp_sample_count"
+        ]
+        == 6
+    )
+    assert analysis["evidence"]["playback_clock_fallback_sample_count"] == 0
+    assert (
+        analysis["evidence"]["playback_clock_maximum_sample_gap_ms"]
+        == 210
+    )
+    assert (
+        analysis["evidence"]["playback_clock_maximum_sample_gap_limit_ms"]
+        == 500
+    )
+    assert analysis["evidence"]["playback_clock_interval_guard_ms"] == 32
+    assert (
+        analysis["evidence"]["playback_clock_guarded_offset_lower_ms"]
+        == 11757.9
+    )
+    assert (
+        analysis["evidence"]["playback_clock_guarded_offset_upper_ms"]
+        == 12242.1
     )
     assert (
         analysis["evidence"][
@@ -367,7 +483,7 @@ def test_valid_capture_calculates_conservative_bounds_and_claim_scope(
         ]
         == 0
     )
-    assert analysis["evidence"]["playback_clock_offset_span_ms"] == 0
+    assert analysis["evidence"]["playback_clock_offset_span_ms"] == 420.2
     assert analysis["claim_scope"] == {
         "semantic_source_marker_reviewed": True,
         "source_pcm_binding_verified": True,
@@ -406,27 +522,27 @@ def test_valid_capture_calculates_conservative_bounds_and_claim_scope(
     assert event["projected_final_frame_end_client_ms"] == 13200
     assert (
         event["conservative_projected_first_frame_start_client_ms"]
-        == 12975
+        == 12757.9
     )
     assert (
         event["conservative_projected_final_frame_end_client_ms"]
-        == 13225
+        == 13442.1
     )
     assert event["latency_bounds_ms"] == {
         "first_candidate_frame_receipt": 1200,
         "last_candidate_frame_receipt": 2210,
         "parent_complete_receipt": 2320,
-        "conservative_projected_first_frame_start": 2175,
-        "conservative_projected_final_frame_end": 2425,
+        "conservative_projected_first_frame_start": 1957.9,
+        "conservative_projected_final_frame_end": 2642.1,
     }
 
 
 @pytest.mark.parametrize(
     ("maximum_latency", "expected"),
     [
-        (2.5, "pass"),
+        (2.7, "pass"),
         (2.3, "inconclusive"),
-        (2.1, "fail"),
+        (1.9, "fail"),
     ],
 )
 def test_event_status_uses_end_then_start_bounds(
@@ -449,7 +565,7 @@ def test_event_status_uses_end_then_start_bounds(
 @pytest.mark.parametrize(
     ("maximum_latency", "expected", "counts"),
     [
-        (3.8, "pass", (2, 0, 0)),
+        (4.0, "pass", (2, 0, 0)),
         (3.6, "inconclusive", (1, 1, 0)),
         (3.0, "fail", (1, 0, 1)),
     ],
@@ -562,6 +678,20 @@ def test_same_end_suffix_pair_or_chain_allows_outer_only_marker(
                     source_start=800,
                     source_end=900,
                     complete_receipt=16100,
+                ),
+                _clock_sample_row(
+                    6,
+                    "queue_started",
+                    performance_ms=16000,
+                    context_sec=4.0,
+                    queue_end_context_sec=4.1,
+                ),
+                _clock_sample_row(
+                    7,
+                    "queue_drained",
+                    performance_ms=16110,
+                    context_sec=4.11,
+                    queue_end_context_sec=4.1,
                 ),
             ]
         )
@@ -755,7 +885,7 @@ def test_global_projection_accepts_quantized_clocks_and_true_gap(tmp_path):
     ] == 15000
 
 
-def test_client_audio_context_wait_divergence_fails_closed(tmp_path):
+def test_schedule_clock_difference_widens_capture_interval(tmp_path):
     rows = _base_rows()
     for row in rows:
         if (
@@ -763,51 +893,238 @@ def test_client_audio_context_wait_divergence_fails_closed(tmp_path):
             and row["parent_sequence_id"] == "0"
             and row["audio_frame_id"] == "1"
         ):
-            # Both ordered recurrences still pass independently, but the
-            # context wait is now 30 ms longer than the projected wait.
-            row["audio_context_time_at_schedule_sec"] = "0.99"
+            # Both ordered recurrences still pass independently. The
+            # additional observed offset must widen the capture interval
+            # instead of being ignored or converted into a fixed-threshold
+            # rejection.
+            row["audio_context_time_at_schedule_sec"] = "0.4"
             break
     csv_path, marker_path = _write_case(tmp_path, rows=rows)
 
-    with pytest.raises(
-        SemanticEventLatencyError,
-        match="client/AudioContext playback-wait linkage",
-    ):
-        analyze_semantic_event_latency(csv_path, marker_path, 3)
+    analysis = analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+    assert analysis["evidence"]["playback_clock_offset_span_ms"] == 830.1
+    assert (
+        analysis["evidence"]["playback_clock_guarded_offset_upper_ms"]
+        == 12652
+    )
 
 
-def test_capture_wide_clock_offset_divergence_fails_closed(tmp_path):
+def test_discrete_clock_offset_step_can_only_weaken_a_pass(tmp_path):
     rows = _base_rows()
     for row in rows:
         if (
-            row["stage"] == "playback_chunk_scheduled"
-            and row["parent_sequence_id"] == "1"
+            row["stage"] == "playback_clock_sample"
+            and row["clock_sample_sequence"] in {"4", "5"}
         ):
-            # Both domains independently show an underrun, so their wait
-            # residual is zero. The 100 ms change in their session offset must
-            # still invalidate the capture.
-            row["audio_context_time_at_schedule_sec"] = "3.1"
-            row["scheduled_start_context_sec"] = "3.1"
-            row["scheduled_end_context_sec"] = "3.3"
+            row["clock_sample_output_performance_client_ms"] = str(
+                float(row["clock_sample_output_performance_client_ms"]) + 257
+            )
+            row["clock_sample_performance_client_ms"] = str(
+                float(row["clock_sample_performance_client_ms"]) + 257
+            )
+            row["clock_sample_performance_before_client_ms"] = str(
+                float(row["clock_sample_performance_before_client_ms"]) + 257
+            )
+            row["clock_sample_performance_after_client_ms"] = str(
+                float(row["clock_sample_performance_after_client_ms"]) + 257
+            )
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    analysis = analyze_semantic_event_latency(csv_path, marker_path, 2.5)
+
+    assert analysis["evidence"]["playback_clock_offset_span_ms"] == 577.2
+    assert (
+        analysis["evidence"]["playback_clock_guarded_offset_upper_ms"]
+        == 12499.1
+    )
+    assert analysis["events"][0]["status"] == "inconclusive"
+
+
+def test_gradual_clock_offset_divergence_can_only_weaken_a_pass(tmp_path):
+    baseline_csv, baseline_markers = _write_case(tmp_path)
+    baseline = analyze_semantic_event_latency(
+        baseline_csv,
+        baseline_markers,
+        2.7,
+    )
+    assert baseline["events"][0]["status"] == "pass"
+
+    rows = _base_rows()
+    for row in rows:
+        if row["stage"] != "playback_clock_sample":
+            continue
+        shift_ms = int(row["clock_sample_sequence"]) * 100
+        for field in (
+            "clock_sample_performance_client_ms",
+            "clock_sample_performance_before_client_ms",
+            "clock_sample_performance_after_client_ms",
+            "clock_sample_output_performance_client_ms",
+        ):
+            row[field] = str(float(row[field]) + shift_ms)
+    ramp_csv, ramp_markers = _write_case(tmp_path, rows=rows)
+
+    ramp = analyze_semantic_event_latency(
+        ramp_csv,
+        ramp_markers,
+        2.7,
+    )
+
+    assert (
+        ramp["evidence"]["playback_clock_offset_span_ms"]
+        > baseline["evidence"]["playback_clock_offset_span_ms"]
+    )
+    assert (
+        ramp["evidence"]["playback_clock_guarded_offset_upper_ms"]
+        > baseline["evidence"]["playback_clock_guarded_offset_upper_ms"]
+    )
+    status_rank = {"pass": 0, "inconclusive": 1, "fail": 2}
+    assert (
+        status_rank[ramp["events"][0]["status"]]
+        >= status_rank[baseline["events"][0]["status"]]
+    )
+
+
+def test_clock_trace_requires_continuous_samples(tmp_path):
+    rows = [
+        row
+        for row in _base_rows()
+        if row["stage"] != "playback_clock_sample"
+    ]
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="no continuous clock samples",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_clock_trace_requires_final_queue_drain_coverage(tmp_path):
+    rows = []
+    for row in _base_rows():
+        if (
+            row["stage"] == "playback_clock_sample"
+            and row["clock_sample_sequence"] == "3"
+        ):
+            continue
+        if (
+            row["stage"] == "playback_clock_sample"
+            and int(row["clock_sample_sequence"]) > 3
+        ):
+            row["clock_sample_sequence"] = str(
+                int(row["clock_sample_sequence"]) - 1
+            )
+        rows.append(row)
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="queue-boundary count",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_clock_trace_rejects_sampling_gap_while_audio_is_queued(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_clock_sample"
+            and row["clock_sample_sequence"] in {"2", "3"}
+        ):
+            row["clock_sample_performance_client_ms"] = str(
+                float(row["clock_sample_performance_client_ms"]) + 600
+            )
+            row["clock_sample_performance_before_client_ms"] = str(
+                float(row["clock_sample_performance_before_client_ms"]) + 600
+            )
+            row["clock_sample_performance_after_client_ms"] = str(
+                float(row["clock_sample_performance_after_client_ms"]) + 600
+            )
+            row["clock_sample_output_performance_client_ms"] = str(
+                float(row["clock_sample_output_performance_client_ms"]) + 600
+            )
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="sampling gap exceeds",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_clock_trace_rejects_frozen_output_timestamp_pairs(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if row["stage"] != "playback_clock_sample":
+            continue
+        row["clock_sample_output_context_sec"] = "0.99"
+        row["clock_sample_output_performance_client_ms"] = "12990"
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="stale output timestamp",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_clock_trace_rejects_future_output_timestamp_pair(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_clock_sample"
+            and row["clock_sample_sequence"] == "2"
+        ):
+            row["clock_sample_output_context_sec"] = "1.2"
             break
     csv_path, marker_path = _write_case(tmp_path, rows=rows)
 
     with pytest.raises(
         SemanticEventLatencyError,
-        match="clock offset span exceeds",
+        match="future output timestamp",
     ):
         analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_current_time_brackets_widen_mapping_without_output_timestamp(
+    tmp_path,
+):
+    rows = _base_rows()
+    for row in rows:
+        if row["stage"] != "playback_clock_sample":
+            continue
+        row["clock_sample_basis"] = "current_time_bracket"
+        row["clock_sample_output_context_sec"] = ""
+        row["clock_sample_output_performance_client_ms"] = ""
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    analysis = analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+    assert (
+        analysis["evidence"]["playback_clock_output_timestamp_sample_count"]
+        == 0
+    )
+    assert analysis["evidence"]["playback_clock_fallback_sample_count"] == 6
+    assert (
+        analysis["evidence"]["playback_clock_guarded_offset_lower_ms"]
+        == 11757.9
+    )
+    assert (
+        analysis["evidence"]["playback_clock_guarded_offset_upper_ms"]
+        == 12242.1
+    )
 
 
 @pytest.mark.parametrize(
     ("maximum_latency", "expected"),
     [
-        (2.41, "inconclusive"),
-        (2.18, "inconclusive"),
-        (2.17, "fail"),
+        (2.65, "pass"),
+        (2.2, "inconclusive"),
+        (1.95, "fail"),
     ],
 )
-def test_clock_link_allowance_is_applied_to_decision_bounds(
+def test_clock_interval_guard_is_applied_to_decision_bounds(
     tmp_path,
     maximum_latency,
     expected,
@@ -1618,9 +1935,9 @@ def test_cli_install_failure_rolls_back_complete_report_set(
 @pytest.mark.parametrize(
     ("maximum_latency", "expected_status", "expected_exit"),
     [
-        ("2.5", "pass", 0),
+        ("2.7", "pass", 0),
         ("2.3", "inconclusive", 3),
-        ("2.1", "fail", 1),
+        ("1.9", "fail", 1),
     ],
 )
 def test_cli_returns_distinct_gate_exit_codes_and_json(
