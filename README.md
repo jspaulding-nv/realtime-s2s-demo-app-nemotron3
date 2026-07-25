@@ -27,6 +27,7 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - A resumable one-command harness for sequential matched-policy runs across all three samples
 - Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
+- A fail-closed schema-v3 trace joiner and lossy whole-parent freshness simulator at 5-, 8-, and 10-second queue caps
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
 - Default-off schema-v3 incremental TTS publication with 100 ms PCM framing,
@@ -148,6 +149,9 @@ realtime-s2s-demo-app/
 ├── diagnose_short_segment.py # Privacy-safe isolated/context replay
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
+├── analyze_freshness_cap.py # Parent-aware lossy queue counterfactual
+├── freshness_trace.py      # Fail-closed schema-v3 evidence join
+├── playback_simulation.py  # No-drop and whole-parent queue simulators
 ├── run_streaming_tts_canary.sh # Matched atomic/schema-v3 live canary
 ├── summarize_streaming_tts_canary.py # Privacy-safe matched comparison
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
@@ -592,6 +596,29 @@ Sanitized aggregate replay findings are retained in
 [`NEMOTRON_TEST_RESULTS.md`](NEMOTRON_TEST_RESULTS.md); raw reports remain in
 ignored local output directories.
 
+When the ignored five-minute evidence is present (it is not part of a fresh
+clone), the schema-v3 canary can also be replayed through explicit lossy
+whole-parent policies:
+
+```bash
+python3 analyze_freshness_cap.py \
+  --results-csv \
+    experiment_results/streaming-tts-canary-20260724T232158Z-29cdf4e/streaming/shared-prefix_results.csv \
+  --summary-json \
+    experiment_results/streaming-tts-canary-20260724T232158Z-29cdf4e/streaming/shared-prefix_summary.json
+```
+
+The loader accepts the positional parent/frame join only after all parent,
+frame, byte, receive-order, timestamp, completion, and input-boundary evidence
+reconciles. The simulation is deliberately lossy and offline; it does not
+change browser playback. Primary results use a 100 ms cancellation guard and
+include 0/50/100/250 ms sensitivity. On the saved five-minute trace, the
+10-second oldest-first policy retained 85.77% of translated audio, reduced
+queue p95 from 17.077 to 8.352 seconds, and reduced listener tail from 27.120
+to 12.672 seconds. It still peaked at 14.059 seconds because an incomplete or
+audible parent cannot be removed whole. See the
+[whole-parent freshness-cap report](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md).
+
 The completed staged matrix can also size a post-NMT TTS subsegment experiment
 without copying translated text:
 
@@ -677,6 +704,7 @@ Detailed guides:
 - [Default-off incremental TTS publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md)
 - [Incremental TTS publication 60-second formal canary](docs/STREAMING_TTS_60S_CANARY_2026-07-24.md)
 - [Incremental TTS publication five-minute matched canary](docs/STREAMING_TTS_5MIN_CANARY_2026-07-24.md)
+- [Schema-3 whole-parent freshness-cap simulation](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
 - [July 22 partner-facing experiment update](docs/S2S_PARTNER_UPDATE_2026-07-22.md)

@@ -136,29 +136,33 @@ A live joke can therefore still be heard well after the room reacts. This run
 does not contain a synchronized punchline marker, so it does not assign one
 exact joke-delay value.
 
-## Decision and next experiment
+## Decision and completed follow-on
 
 Do not spend the next long-form matrix on the unchanged no-drop audience
 policy. Schema 3 is operationally ready for broader testing, but the
 five-minute trace already establishes that the existing controller cannot
 hold the requested 5-10 second freshness bound.
 
-The next experiment should be offline and deterministic over this saved
-schema-3 arrival trace:
+That offline experiment is now complete. It joined all 2,782 PCM arrivals to
+74 complete schema-3 parents and simulated 5-, 8-, and 10-second policies
+without changing live playback. Every eviction was a complete, not-yet-audible
+parent and every frame/byte invariant reconciled.
 
-1. add a hard freshness-cap simulator at 5, 8, and 10 seconds;
-2. drop only whole not-yet-audible parent units, never arbitrary PCM samples,
-   and report skipped parent/audio percentages plus each discontinuity;
-3. compare oldest-first eviction with a jump-to-live policy that preserves the
-   newest complete parent;
-4. retain 1.05x/1.10x playback before eviction, so dropping is a last resort;
-5. measure queue p95/max, listener tail, time above cap, eviction frequency,
-   longest continuous accelerated interval, and retained-audio percentage;
-6. reject any policy that hides loss or implies full translation fidelity;
-   and
-7. only after selecting an explicit fidelity-versus-freshness policy, implement
-   it in the browser and run synchronized phrase/punchline tests, followed by
-   all three long-form fixtures.
+With a practical 100 ms cancellation guard, the best freshness-prioritized
+candidate was 10-second oldest-first eviction. It retained 85.77% of generated
+audio, reduced queue p95 to 8.352 seconds, reduced peak queue to 14.059
+seconds, and reduced listener tail to 12.672 seconds. Doing so skipped 8 of 74
+parents and 39.056 seconds of translated speech. It still exceeded 10 seconds
+for 4.180 seconds. The headline was unchanged at 0 and 50 ms; a 250 ms guard
+retained 86.83% while producing a nearly identical 8.354-second p95 and 4.203
+seconds above the cap.
+
+No scenario enforced its selected cap: after all eligible whole-parent
+evictions, incomplete, already-audible, or protected audio still produced
+residual breaches. The next safe gate is therefore versioned parent/frame
+metadata and observation-only browser telemetry, followed by a short-lookahead
+queue behind an opt-in flag. See
+[Schema-3 whole-parent freshness-cap simulation](SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md).
 
 The live-audience requirement is now a product tradeoff as much as a model
 latency problem: a hard 5-10 second bound requires either enough acceleration

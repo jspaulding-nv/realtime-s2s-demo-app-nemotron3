@@ -971,6 +971,51 @@ freshness-cap simulation over the completed schema-3 arrival trace, reporting
 the explicit fidelity cost of whole-parent eviction at 5/8/10-second caps. See
 [Incremental TTS publication: five-minute matched canary](STREAMING_TTS_5MIN_CANARY_2026-07-24.md).
 
+## July 24, 2026: schema-3 whole-parent freshness-cap simulation
+
+The offline follow-on now joins client PCM arrivals to schema-3
+`(parent_sequence_id, audio_frame_id)` evidence only after parent-summary,
+frame-key, byte, order, timestamp, completion, and input-boundary layers
+reconcile. Public analyzer output contains only fixed role labels, hashes,
+numeric identities, counts, bytes, durations, and timing.
+
+The causal simulator applies the existing 1.00x/1.05x/1.10x decision before
+any loss. It can evict only a complete parent whose frames are all
+not-yet-audible, then compacts retained future frames while preserving their
+already-selected rates. It compares minimum oldest-first eviction with a
+jump-to-latest-complete policy and reports every residual breach rather than
+claiming an unachieved hard cap. Existing no-drop simulation output is
+unchanged.
+
+Primary results use a 100 ms cancellation guard so audio beginning effectively
+“now” is protected. The analyzer also replays 0, 50, 100, and 250 ms guards for
+the 10-second oldest-first candidate.
+
+The validated five-minute trace had 2,782 frames, 74 parents, and 274.369
+seconds of translated audio. No-drop queue p95/peak/tail were
+17.077/23.412/27.120 seconds. The most useful candidate was 10-second
+oldest-first: queue p95 fell to 8.352 seconds, peak to 14.059 seconds, and tail
+to 12.672 seconds. It retained 85.77% of generated audio, meaning it skipped 8
+parents and 39.056 seconds of speech. It still spent 4.180 seconds above the
+cap.
+
+The 10-second oldest-first headline was identical at 0/50/100 ms. At 250 ms it
+retained 86.83% instead of 85.77%, while queue p95 was 8.354 seconds and time
+above cap was 4.203 seconds. The candidate conclusion is therefore stable
+across the tested practical margins, though the selected parent IDs change.
+
+None of the six scenarios achieved its configured limit. Unaccelerated parent
+source-PCM duration was 11.331 seconds at p95 and 14.257 seconds maximum, but
+those media durations are not themselves rate-adjusted queue depth. The
+definitive failure evidence is the recorded residual breach after all eligible
+whole-parent evictions: incomplete, already-audible, or protected audio still
+exceeded each selected cap.
+
+Loss remains disabled. The next safe gate is versioned, opt-in parent/frame
+wire metadata plus observation-only browser telemetry, followed by an opt-in
+short-lookahead scheduler. See
+[Schema-3 whole-parent freshness-cap simulation](SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -991,6 +1036,8 @@ the explicit fidelity cost of whole-parent eviction at 5/8/10-second caps. See
 - [x] Pass one complete post-recovery staged Sample 02 canary
 - [x] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
 - [x] Sweep no-drop playback capacity on the completed matched traces
+- [x] Simulate 5/8/10-second whole-parent freshness/loss tradeoffs on schema 3
+- [ ] Add opt-in parent/frame wire metadata and observation-only browser telemetry
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries
