@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ from staged_models import AsrFinal  # noqa: E402
 
 
 SHA256_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 RIFF_HEADER_BYTES = 12
 RIFF_CHUNK_HEADER_BYTES = 8
 PCM_FORMAT = 1
@@ -43,6 +45,8 @@ REGISTERED_ASR_PROFILE = (
 REGISTERED_ASR_PROFILE_SHA256 = (
     "8d3fa26a44c471552b7edac76372f3db66e5c1bd73e24abac701091717026c58"
 )
+REGISTERED_SOURCE_LANGUAGE = "en-US"
+REGISTERED_EOU_MS = 800
 MAX_CHUNK_RELEASE_LATENESS_MS = 250.0
 
 
@@ -63,6 +67,7 @@ class RealtimeWaveChunks:
         self.expected_frames: Optional[int] = None
         self.source_frames: Optional[int] = None
         self.sample_rate = 0
+        self.source_wav_sha256: Optional[str] = None
         self.padded_pcm_sha256: Optional[str] = None
         self.chunk_release_count = 0
         self.maximum_release_lateness_ms = 0.0
@@ -93,10 +98,13 @@ class RealtimeWaveChunks:
         )
 
     def __iter__(self) -> Iterator[bytes]:
+        wav_bytes = self.path.read_bytes()
+        self.source_wav_sha256 = hashlib.sha256(wav_bytes).hexdigest()
         pcm = _extract_exact_mono_pcm16_wav(
-            self.path.read_bytes(),
+            wav_bytes,
             target_sample_rate=audio_config.sample_rate,
         )
+        del wav_bytes
         self.sample_rate = audio_config.sample_rate
         self.source_frames = len(pcm) // PCM16_BYTES_PER_SAMPLE
         chunk_size = audio_config.chunk_size
@@ -219,6 +227,37 @@ def _extract_exact_mono_pcm16_wav(
     return pcm
 
 
+def _compute_exact_wav_pcm_binding(path: Path) -> dict:
+    """Return hashes/counts implied by the exact browser passthrough contract."""
+    wav_bytes = path.read_bytes()
+    wav_sha256 = hashlib.sha256(wav_bytes).hexdigest()
+    pcm = _extract_exact_mono_pcm16_wav(
+        wav_bytes,
+        target_sample_rate=audio_config.sample_rate,
+    )
+    del wav_bytes
+    source_sample_count = len(pcm) // PCM16_BYTES_PER_SAMPLE
+    chunk_size = audio_config.chunk_size
+    padded_sample_count = (
+        (source_sample_count + chunk_size - 1) // chunk_size
+    ) * chunk_size
+    padded_digest = hashlib.sha256()
+    padded_digest.update(pcm)
+    padded_digest.update(
+        b"\x00"
+        * (
+            (padded_sample_count - source_sample_count)
+            * PCM16_BYTES_PER_SAMPLE
+        )
+    )
+    return {
+        "wav_sha256": wav_sha256,
+        "source_sample_count": source_sample_count,
+        "padded_pcm_sample_count": padded_sample_count,
+        "padded_pcm_sha256": padded_digest.hexdigest(),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -307,6 +346,7 @@ def run_once(
         "wall_seconds": time.monotonic() - started,
         "audio_seconds_sent": chunks.audio_seconds_sent,
         "source_sample_count": chunks.source_frames,
+        "source_wav_sha256": chunks.source_wav_sha256,
         "padded_pcm_sample_count": chunks.expected_frames,
         "padded_pcm_sha256": chunks.padded_pcm_sha256,
         "input_completed": chunks.input_completed,
@@ -336,6 +376,16 @@ def build_report(
     attempt_id: str,
     attempt_started_at_utc: str,
 ) -> dict:
+    expected_input_binding = _compute_exact_wav_pcm_binding(audio_path)
+    current_wav_sha256 = expected_input_binding["wav_sha256"]
+    captured_wav_hashes = {
+        run.get("source_wav_sha256")
+        for run in runs
+    }
+    exact_wav_binding = (
+        len(captured_wav_hashes) == 1
+        and next(iter(captured_wav_hashes), None) == current_wav_sha256
+    )
     pcm_bindings = {
         (
             run.get("padded_pcm_sha256"),
@@ -343,10 +393,15 @@ def build_report(
         )
         for run in runs
     }
-    exact_pcm_binding = (
-        len(pcm_bindings) == 1
-        and next(iter(pcm_bindings), (None, None))[0] is not None
-        and next(iter(pcm_bindings), (None, None))[1] is not None
+    expected_pcm_binding = (
+        expected_input_binding["padded_pcm_sha256"],
+        expected_input_binding["padded_pcm_sample_count"],
+    )
+    exact_pcm_binding = pcm_bindings == {expected_pcm_binding}
+    registered_asr_config = (
+        riva_config.source_language == REGISTERED_SOURCE_LANGUAGE
+        and riva_config.endpointing_history_ms == REGISTERED_EOU_MS
+        and riva_config.asr_word_time_offsets is True
     )
     passed = (
         requested_run_count >= 2
@@ -354,7 +409,9 @@ def build_report(
         and all(run["input_completed"] for run in runs)
         and all(run.get("realtime_pacing") is True for run in runs)
         and all(run["passed"] for run in runs)
+        and exact_wav_binding
         and exact_pcm_binding
+        and registered_asr_config
         and runtime_attestation.get("verified") is True
     )
     padded_pcm_sha256, padded_pcm_sample_count = (
@@ -375,15 +432,27 @@ def build_report(
             "missing_word_offsets_allowed_per_run": 0,
             "nonempty_finals_required_per_run": True,
             "exact_padded_pcm_binding_required": True,
+            "exact_source_wav_binding_required": True,
             "maximum_chunk_release_lateness_ms": (
                 MAX_CHUNK_RELEASE_LATENESS_MS
             ),
+            "source_language": REGISTERED_SOURCE_LANGUAGE,
+            "eou_ms": REGISTERED_EOU_MS,
         },
         "input": {
             "pcm_preparation_basis": (
                 "riff_pcm16le_passthrough_zero_pad_v1"
             ),
-            "wav_sha256": _sha256(audio_path),
+            "wav_sha256": current_wav_sha256,
+            "source_sample_count": (
+                expected_input_binding["source_sample_count"]
+            ),
+            "capture_wav_sha256": (
+                next(iter(captured_wav_hashes))
+                if exact_wav_binding
+                else None
+            ),
+            "exact_source_wav_binding_verified": exact_wav_binding,
             "padded_pcm_sha256": padded_pcm_sha256,
             "padded_pcm_sample_count": padded_pcm_sample_count,
             "exact_padded_pcm_binding_verified": exact_pcm_binding,
@@ -395,6 +464,7 @@ def build_report(
             "language": riva_config.source_language,
             "eou_ms": riva_config.endpointing_history_ms,
             "word_time_offsets_requested": riva_config.asr_word_time_offsets,
+            "registered_configuration_verified": registered_asr_config,
         },
         "runs": runs,
     }
@@ -440,11 +510,14 @@ def attest_local_asr_runtime(
         ):
             raise RuntimeError("unexpected container inspection schema")
         container = container_documents[0]
+        container_id = container["Id"]
         configured_image = container["Config"]["Image"]
         container_environment = container["Config"]["Env"]
         local_image_id = container["Image"]
         running = container["State"]["Running"] is True
         health = container["State"]["Health"]["Status"]
+        started_at = container["State"]["StartedAt"]
+        restart_count = container["RestartCount"]
         port_bindings = container["NetworkSettings"]["Ports"]["50052/tcp"]
 
         image_result = subprocess.run(
@@ -507,6 +580,24 @@ def attest_local_asr_runtime(
         and riva_config.asr_profile == expected_profile
         and profile_values == [expected_profile]
     )
+    container_instance_is_valid = (
+        isinstance(container_id, str)
+        and CONTAINER_ID_PATTERN.fullmatch(container_id) is not None
+        and isinstance(started_at, str)
+        and bool(started_at)
+        and isinstance(restart_count, int)
+        and not isinstance(restart_count, bool)
+        and restart_count >= 0
+    )
+    container_instance_sha256 = (
+        hashlib.sha256(
+            (
+                f"{container_id}\0{started_at}\0{restart_count}"
+            ).encode("utf-8")
+        ).hexdigest()
+        if container_instance_is_valid
+        else None
+    )
     verified = (
         configured_image == riva_config.asr_image
         and isinstance(local_image_id, str)
@@ -517,13 +608,14 @@ def attest_local_asr_runtime(
         and port_is_bound
         and digest_is_bound
         and profile_is_bound
+        and container_instance_is_valid
     )
     if not verified:
         raise RuntimeError(
             "local ASR runtime does not match the declared healthy image"
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "verified": True,
         "health": "healthy",
         "host_port": host_port,
@@ -531,6 +623,7 @@ def attest_local_asr_runtime(
         "local_image_id": local_image_id,
         "repository_digest": expected_digest,
         "profile_selector_sha256": REGISTERED_ASR_PROFILE_SHA256,
+        "container_instance_sha256": container_instance_sha256,
     }
 
 
@@ -591,6 +684,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not riva_config.asr_word_time_offsets:
         print(
             "RIVA_ASR_WORD_TIMES=1 is required for this gate",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        riva_config.source_language != REGISTERED_SOURCE_LANGUAGE
+        or riva_config.endpointing_history_ms != REGISTERED_EOU_MS
+    ):
+        print(
+            "registered en-US / 800 ms ASR configuration is required",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        _compute_exact_wav_pcm_binding(audio_path)
+    except ValueError:
+        print(
+            "input WAV does not match the exact PCM contract",
             file=sys.stderr,
         )
         return 2
@@ -726,17 +836,78 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def _write_report(path: Path, report: dict) -> None:
     """Durably checkpoint completed runs without transcript content."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
-    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    lock_path = path.with_name(f".{path.name}.lock")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if _existing_report_is_newer(path, report):
+            raise RuntimeError(
+                "a newer diagnostic attempt owns the output path"
+            )
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        report,
+                        indent=2,
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _existing_report_is_newer(path: Path, report: dict) -> bool:
+    if not path.is_file():
+        return False
     try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(existing, dict):
+        return False
+    existing_attempt = _report_attempt_order(existing)
+    candidate_attempt = _report_attempt_order(report)
+    return (
+        existing_attempt is not None
+        and candidate_attempt is not None
+        and existing.get("attempt_id") != report.get("attempt_id")
+        and existing_attempt > candidate_attempt
+    )
+
+
+def _report_attempt_order(report: dict) -> Optional[tuple[datetime, str]]:
+    started_at = report.get("attempt_started_at_utc")
+    attempt_id = report.get("attempt_id")
+    if not isinstance(started_at, str) or not isinstance(attempt_id, str):
+        return None
+    normalized = (
+        started_at[:-1] + "+00:00"
+        if started_at.endswith("Z")
+        else started_at
+    )
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc), attempt_id
 
 
 def _sha256(path: Path) -> str:

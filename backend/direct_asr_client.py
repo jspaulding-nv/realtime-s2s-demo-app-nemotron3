@@ -7,6 +7,7 @@ import math
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import (
     CancelledError as FutureCancelledError,
     Future,
@@ -21,13 +22,26 @@ from asr_config import create_streaming_asr_config
 from config import riva_config
 from riva_client import AudioChunkIterator
 from staged_models import (
+    ASR_BOUNDARY_NUMERIC_CLASSES,
+    ASR_BOUNDARY_PRESENCE_ABSENT,
+    ASR_BOUNDARY_PRESENCE_PRESENT,
+    ASR_BOUNDARY_PRESENCE_UNOBSERVABLE,
+    ASR_BOUNDARY_PRESENCES,
     ASR_TIMING_BASIS_AUDIO_PROCESSED_END_ONLY,
     ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS,
     ASR_TIMING_BASIS_UNAVAILABLE,
     ASR_TIMING_BASIS_WORD_OFFSETS,
+    ASR_WORD_TIMING_SHAPES,
+    ASRBoundaryNumericClassCounts,
+    ASRBoundaryObservation,
+    ASRBoundaryPresenceCounts,
     ASRStreamEvent,
     ASRStreamEventKind,
     ASRTranscript,
+    ASRWordTimingEntry,
+    ASRWordTimingEnvelope,
+    ASRWordTimingShapeCounts,
+    ASRWordTimingShapeDiagnostics,
     AsrFinal,
 )
 
@@ -457,6 +471,12 @@ def iter_transcript_results(
                 continue
 
             words = tuple(getattr(alternative, "words", ()) or ())
+            is_final = bool(getattr(result, "is_final", False))
+            word_timing_shape_diagnostics = (
+                _classify_word_timing_shapes(words)
+                if is_final
+                else None
+            )
             audio_processed_s = float(getattr(result, "audio_processed", 0.0) or 0.0)
             source_start_ms = None
             source_end_ms = None
@@ -502,7 +522,7 @@ def iter_transcript_results(
             )
             yield ASRTranscript(
                 text=text,
-                is_final=bool(getattr(result, "is_final", False)),
+                is_final=is_final,
                 received_monotonic_ms=resolved_clock(),
                 audio_processed_s=audio_processed_s,
                 stability=float(getattr(result, "stability", 0.0) or 0.0),
@@ -514,7 +534,211 @@ def iter_transcript_results(
                 first_word_start_ms=first_word_start_ms,
                 last_word_end_ms=last_word_end_ms,
                 timing_basis=timing_basis,
+                word_timing_shape_diagnostics=(
+                    word_timing_shape_diagnostics
+                ),
             )
+
+
+def _classify_word_timing_shapes(
+    words: tuple[object, ...],
+) -> ASRWordTimingShapeDiagnostics:
+    entries = []
+    entry_shapes: Counter[str] = Counter()
+    start_numeric_classes: Counter[str] = Counter()
+    end_numeric_classes: Counter[str] = Counter()
+    start_presences: Counter[str] = Counter()
+    end_presences: Counter[str] = Counter()
+    for word_index, word in enumerate(words):
+        start = _observe_word_boundary(word, "start_time")
+        end = _observe_word_boundary(word, "end_time")
+        numeric_relation, shape = _classify_word_timing_shape(start, end)
+        entry = ASRWordTimingEntry(
+            word_index=word_index,
+            start=start,
+            end=end,
+            numeric_relation=numeric_relation,
+            shape=shape,
+        )
+        entries.append(entry)
+        entry_shapes[shape] += 1
+        start_numeric_classes[start.numeric_class] += 1
+        end_numeric_classes[end.numeric_class] += 1
+        start_presences[start.presence] += 1
+        end_presences[end.presence] += 1
+
+    envelope = None
+    if entries:
+        envelope_start = entries[0].start
+        envelope_end = entries[-1].end
+        envelope_relation, envelope_shape = _classify_word_timing_shape(
+            envelope_start,
+            envelope_end,
+        )
+        envelope = ASRWordTimingEnvelope(
+            start_word_index=0,
+            end_word_index=len(entries) - 1,
+            start=envelope_start,
+            end=envelope_end,
+            numeric_relation=envelope_relation,
+            shape=envelope_shape,
+            usable=envelope_shape == "valid",
+        )
+
+    return ASRWordTimingShapeDiagnostics(
+        word_entry_count=len(entries),
+        no_word_entries=not entries,
+        envelope=envelope,
+        entry_shape_counts=ASRWordTimingShapeCounts(
+            **{
+                shape: entry_shapes[shape]
+                for shape in ASR_WORD_TIMING_SHAPES
+            }
+        ),
+        start_numeric_class_counts=ASRBoundaryNumericClassCounts(
+            **{
+                numeric_class: start_numeric_classes[numeric_class]
+                for numeric_class in ASR_BOUNDARY_NUMERIC_CLASSES
+            }
+        ),
+        end_numeric_class_counts=ASRBoundaryNumericClassCounts(
+            **{
+                numeric_class: end_numeric_classes[numeric_class]
+                for numeric_class in ASR_BOUNDARY_NUMERIC_CLASSES
+            }
+        ),
+        start_presence_counts=ASRBoundaryPresenceCounts(
+            **{
+                presence: start_presences[presence]
+                for presence in ASR_BOUNDARY_PRESENCES
+            }
+        ),
+        end_presence_counts=ASRBoundaryPresenceCounts(
+            **{
+                presence: end_presences[presence]
+                for presence in ASR_BOUNDARY_PRESENCES
+            }
+        ),
+        anomalies=tuple(entry for entry in entries if entry.shape != "valid"),
+    )
+
+
+def _observe_word_boundary(
+    word: object,
+    field_name: str,
+) -> ASRBoundaryObservation:
+    presence = _word_boundary_presence(word, field_name)
+    if presence == ASR_BOUNDARY_PRESENCE_ABSENT:
+        return ASRBoundaryObservation(
+            presence=presence,
+            numeric_class="not_available",
+        )
+    sentinel = object()
+    try:
+        value = getattr(word, field_name, sentinel)
+    except Exception:
+        value = sentinel
+    if value is sentinel or value is None:
+        numeric_class = (
+            "not_available"
+            if value is sentinel
+            else "unparseable"
+        )
+        return ASRBoundaryObservation(
+            presence=presence,
+            numeric_class=numeric_class,
+        )
+    if isinstance(value, bool):
+        return ASRBoundaryObservation(
+            presence=presence,
+            numeric_class="unparseable",
+        )
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return ASRBoundaryObservation(
+            presence=presence,
+            numeric_class="unparseable",
+        )
+    if not math.isfinite(converted):
+        return ASRBoundaryObservation(
+            presence=presence,
+            numeric_class="nonfinite",
+        )
+    if converted < 0:
+        numeric_class = "negative"
+    elif converted == 0:
+        numeric_class = "zero"
+    else:
+        numeric_class = "positive"
+    return ASRBoundaryObservation(
+        presence=presence,
+        numeric_class=numeric_class,
+        finite_value_ms=converted,
+    )
+
+
+def _word_boundary_presence(word: object, field_name: str) -> str:
+    descriptor = getattr(word, "DESCRIPTOR", None)
+    fields_by_name = getattr(descriptor, "fields_by_name", {})
+    field = (
+        fields_by_name.get(field_name)
+        if hasattr(fields_by_name, "get")
+        else None
+    )
+    if field is not None:
+        if getattr(field, "has_presence", False) is False:
+            return ASR_BOUNDARY_PRESENCE_UNOBSERVABLE
+        has_field = getattr(word, "HasField", None)
+        if callable(has_field):
+            try:
+                return (
+                    ASR_BOUNDARY_PRESENCE_PRESENT
+                    if has_field(field_name)
+                    else ASR_BOUNDARY_PRESENCE_ABSENT
+                )
+            except (TypeError, ValueError):
+                return ASR_BOUNDARY_PRESENCE_UNOBSERVABLE
+    try:
+        value = getattr(word, field_name)
+    except (AttributeError, TypeError, ValueError):
+        return ASR_BOUNDARY_PRESENCE_ABSENT
+    return (
+        ASR_BOUNDARY_PRESENCE_ABSENT
+        if value is None
+        else ASR_BOUNDARY_PRESENCE_PRESENT
+    )
+
+
+def _classify_word_timing_shape(
+    start: ASRBoundaryObservation,
+    end: ASRBoundaryObservation,
+) -> tuple[str, str]:
+    numeric_classes = {start.numeric_class, end.numeric_class}
+    if "not_available" in numeric_classes:
+        return "not_comparable", "absent_boundary"
+    if "unparseable" in numeric_classes:
+        return "not_comparable", "unparseable_boundary"
+    if "nonfinite" in numeric_classes:
+        return "not_comparable", "nonfinite_boundary"
+
+    start_value = start.finite_value_ms
+    end_value = end.finite_value_ms
+    if start_value is None or end_value is None:
+        return "not_comparable", "unparseable_boundary"
+    if end_value > start_value:
+        relation = "end_after_start"
+    elif end_value == start_value:
+        relation = "equal"
+    else:
+        relation = "end_before_start"
+    if "negative" in numeric_classes:
+        return relation, "negative_boundary"
+    if relation == "equal":
+        return relation, "zero_length"
+    if relation == "end_before_start":
+        return relation, "reversed"
+    return relation, "valid"
 
 
 def _optional_nonnegative_finite(value: object) -> Optional[float]:

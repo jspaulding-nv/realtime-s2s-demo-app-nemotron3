@@ -7,22 +7,43 @@ import asr_final_attribution_gate as gate_module
 import pytest
 from asr_final_attribution_gate import (
     RealtimeWaveChunks,
+    _write_report,
     attest_local_asr_runtime,
     build_parser,
     build_report,
 )
 
 RUNTIME_ATTESTATION = {
-    "schema_version": 1,
+    "schema_version": 2,
     "verified": True,
     "health": "healthy",
     "host_port": 50052,
     "container_port": 50052,
     "local_image_id": "sha256:" + "cd" * 32,
     "repository_digest": "sha256:" + "ef" * 32,
+    "container_instance_sha256": "12" * 32,
 }
 ATTEMPT_ID = "12" * 16
 ATTEMPT_STARTED_AT_UTC = "2026-07-25T00:00:00+00:00"
+
+
+@pytest.fixture(autouse=True)
+def registered_asr_config(monkeypatch):
+    monkeypatch.setattr(
+        gate_module.riva_config,
+        "source_language",
+        gate_module.REGISTERED_SOURCE_LANGUAGE,
+    )
+    monkeypatch.setattr(
+        gate_module.riva_config,
+        "endpointing_history_ms",
+        gate_module.REGISTERED_EOU_MS,
+    )
+    monkeypatch.setattr(
+        gate_module.riva_config,
+        "asr_word_time_offsets",
+        True,
+    )
 
 
 def write_pcm_wave(path, samples=(1, 2, 3, 4, 5)):
@@ -42,14 +63,17 @@ def riff_chunk(chunk_id, payload):
     )
 
 
-def successful_run(run_number):
+def successful_run(run_number, audio_path):
+    binding = gate_module._compute_exact_wav_pcm_binding(audio_path)
     return {
         "run_number": run_number,
         "input_completed": True,
         "realtime_pacing": True,
         "passed": True,
-        "padded_pcm_sha256": "ab" * 32,
-        "padded_pcm_sample_count": 30211200,
+        "source_sample_count": binding["source_sample_count"],
+        "padded_pcm_sha256": binding["padded_pcm_sha256"],
+        "padded_pcm_sample_count": binding["padded_pcm_sample_count"],
+        "source_wav_sha256": binding["wav_sha256"],
         "attribution": {
             "nonempty_final_count": 2,
             "final_missing_word_offsets_count": 0,
@@ -78,14 +102,17 @@ def test_parser_defaults_to_two_realtime_long_form_runs():
     assert not hasattr(args, "fast")
 
 
-def test_report_requires_two_independently_successful_runs(tmp_path):
+def test_report_requires_two_independently_successful_runs(
+    tmp_path,
+    monkeypatch,
+):
     audio = tmp_path / "long-form.wav"
-    audio.write_bytes(b"pcm")
+    write_pcm_wave(audio)
 
     one_run = build_report(
         audio_path=audio,
         uri="localhost:50052",
-        runs=[successful_run(1)],
+        runs=[successful_run(1, audio)],
         runtime_attestation=RUNTIME_ATTESTATION,
         requested_run_count=2,
         attempt_id=ATTEMPT_ID,
@@ -94,7 +121,7 @@ def test_report_requires_two_independently_successful_runs(tmp_path):
     two_runs = build_report(
         audio_path=audio,
         uri="localhost:50052",
-        runs=[successful_run(1), successful_run(2)],
+        runs=[successful_run(1, audio), successful_run(2, audio)],
         runtime_attestation=RUNTIME_ATTESTATION,
         requested_run_count=2,
         attempt_id=ATTEMPT_ID,
@@ -105,11 +132,12 @@ def test_report_requires_two_independently_successful_runs(tmp_path):
     assert two_runs["passed"] is True
     assert two_runs["requirements"]["missing_word_offsets_allowed_per_run"] == 0
     assert two_runs["input"]["exact_padded_pcm_binding_verified"] is True
+    assert two_runs["input"]["exact_source_wav_binding_verified"] is True
 
     unattested = build_report(
         audio_path=audio,
         uri="localhost:50052",
-        runs=[successful_run(1), successful_run(2)],
+        runs=[successful_run(1, audio), successful_run(2, audio)],
         runtime_attestation={"verified": False},
         requested_run_count=2,
         attempt_id=ATTEMPT_ID,
@@ -120,7 +148,7 @@ def test_report_requires_two_independently_successful_runs(tmp_path):
     incomplete_requested_set = build_report(
         audio_path=audio,
         uri="localhost:50052",
-        runs=[successful_run(1), successful_run(2)],
+        runs=[successful_run(1, audio), successful_run(2, audio)],
         runtime_attestation=RUNTIME_ATTESTATION,
         requested_run_count=3,
         attempt_id=ATTEMPT_ID,
@@ -132,15 +160,85 @@ def test_report_requires_two_independently_successful_runs(tmp_path):
         == 3
     )
 
+    changed_input_runs = [
+        successful_run(1, audio),
+        successful_run(2, audio),
+    ]
+    changed_input_runs[1]["source_wav_sha256"] = "01" * 32
+    changed_input = build_report(
+        audio_path=audio,
+        uri="localhost:50052",
+        runs=changed_input_runs,
+        runtime_attestation=RUNTIME_ATTESTATION,
+        requested_run_count=2,
+        attempt_id=ATTEMPT_ID,
+        attempt_started_at_utc=ATTEMPT_STARTED_AT_UTC,
+    )
+    assert changed_input["passed"] is False
+    assert changed_input["input"]["exact_source_wav_binding_verified"] is False
+
+    wrong_current_runs = [
+        successful_run(1, audio),
+        successful_run(2, audio),
+    ]
+    for run in wrong_current_runs:
+        run["source_wav_sha256"] = "01" * 32
+    wrong_current = build_report(
+        audio_path=audio,
+        uri="localhost:50052",
+        runs=wrong_current_runs,
+        runtime_attestation=RUNTIME_ATTESTATION,
+        requested_run_count=2,
+        attempt_id=ATTEMPT_ID,
+        attempt_started_at_utc=ATTEMPT_STARTED_AT_UTC,
+    )
+    assert wrong_current["passed"] is False
+    assert wrong_current["input"]["exact_source_wav_binding_verified"] is False
+
+    wrong_pcm_runs = [
+        successful_run(1, audio),
+        successful_run(2, audio),
+    ]
+    for run in wrong_pcm_runs:
+        run["padded_pcm_sha256"] = "01" * 32
+    wrong_pcm = build_report(
+        audio_path=audio,
+        uri="localhost:50052",
+        runs=wrong_pcm_runs,
+        runtime_attestation=RUNTIME_ATTESTATION,
+        requested_run_count=2,
+        attempt_id=ATTEMPT_ID,
+        attempt_started_at_utc=ATTEMPT_STARTED_AT_UTC,
+    )
+    assert wrong_pcm["passed"] is False
+    assert wrong_pcm["input"]["exact_padded_pcm_binding_verified"] is False
+
+    monkeypatch.setattr(
+        gate_module.riva_config,
+        "endpointing_history_ms",
+        300,
+    )
+    wrong_config = build_report(
+        audio_path=audio,
+        uri="localhost:50052",
+        runs=[successful_run(1, audio), successful_run(2, audio)],
+        runtime_attestation=RUNTIME_ATTESTATION,
+        requested_run_count=2,
+        attempt_id=ATTEMPT_ID,
+        attempt_started_at_utc=ATTEMPT_STARTED_AT_UTC,
+    )
+    assert wrong_config["passed"] is False
+    assert wrong_config["asr"]["registered_configuration_verified"] is False
+
 
 def test_report_contains_no_transcript_text(tmp_path):
     audio = tmp_path / "long-form.wav"
-    audio.write_bytes(b"pcm")
+    write_pcm_wave(audio)
 
     report = build_report(
         audio_path=audio,
         uri="localhost:50052",
-        runs=[successful_run(1), successful_run(2)],
+        runs=[successful_run(1, audio), successful_run(2, audio)],
         runtime_attestation=RUNTIME_ATTESTATION,
         requested_run_count=2,
         attempt_id=ATTEMPT_ID,
@@ -198,6 +296,9 @@ def test_realtime_chunks_pad_and_release_at_chunk_end(
     assert chunks.realtime_pacing_within_limit is True
     assert wire_pcm == struct.pack("<5h", *samples) + b"\x00" * 6
     assert chunks.padded_pcm_sha256 == hashlib.sha256(wire_pcm).hexdigest()
+    assert chunks.source_wav_sha256 == hashlib.sha256(
+        audio.read_bytes()
+    ).hexdigest()
 
 
 def test_realtime_chunks_record_and_reject_excessive_release_lateness(
@@ -322,6 +423,7 @@ def test_runtime_attestation_verifies_healthy_bound_image(
         if arguments[:2] == ["docker", "inspect"]:
             return Result(
                 {
+                    "Id": "12" * 32,
                     "Config": {
                         "Image": "registry.example/asr:1.2.0",
                         "Env": [
@@ -336,8 +438,10 @@ def test_runtime_attestation_verifies_healthy_bound_image(
                     "Image": image_id,
                     "State": {
                         "Running": True,
+                        "StartedAt": "2026-07-25T00:00:00Z",
                         "Health": {"Status": "healthy"},
                     },
+                    "RestartCount": 0,
                     "NetworkSettings": {
                         "Ports": {
                             "50052/tcp": [
@@ -381,6 +485,7 @@ def test_runtime_attestation_verifies_healthy_bound_image(
         attestation["profile_selector_sha256"]
         == gate_module.REGISTERED_ASR_PROFILE_SHA256
     )
+    assert len(attestation["container_instance_sha256"]) == 64
     assert "private-local-name" not in json.dumps(attestation)
 
 
@@ -436,6 +541,7 @@ def test_runtime_attestation_rejects_unbound_profile(
         if arguments[:2] == ["docker", "inspect"]:
             return Result(
                 {
+                    "Id": "12" * 32,
                     "Config": {
                         "Image": image_name,
                         "Env": profile_entries,
@@ -443,8 +549,10 @@ def test_runtime_attestation_rejects_unbound_profile(
                     "Image": image_id,
                     "State": {
                         "Running": True,
+                        "StartedAt": "2026-07-25T00:00:00Z",
                         "Health": {"Status": "healthy"},
                     },
+                    "RestartCount": 0,
                     "NetworkSettings": {
                         "Ports": {
                             "50052/tcp": [
@@ -580,3 +688,69 @@ def test_main_never_overwrites_input_with_report(tmp_path):
 
     assert exit_code == 2
     assert audio.read_bytes() == original
+
+
+def test_main_invalidates_same_image_container_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    audio = tmp_path / "input.wav"
+    output = tmp_path / "qualification.json"
+    write_pcm_wave(audio)
+    changed_instance = dict(RUNTIME_ATTESTATION)
+    changed_instance["container_instance_sha256"] = "34" * 32
+    attestations = iter([RUNTIME_ATTESTATION, changed_instance])
+    monkeypatch.setattr(
+        gate_module,
+        "attest_local_asr_runtime",
+        lambda **_kwargs: next(attestations),
+    )
+    monkeypatch.setattr(
+        gate_module,
+        "run_once",
+        lambda **kwargs: successful_run(kwargs["run_number"], audio),
+    )
+
+    exit_code = gate_module.main(
+        [
+            "--file",
+            str(audio),
+            "--uri",
+            "127.0.0.1:50052",
+            "--docker-container",
+            "private-local-name",
+            "--json-output",
+            str(output),
+        ]
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert report["passed"] is False
+    assert report["runs"] == []
+    assert (
+        report["asr"]["runtime_attestation"]["failure"]
+        == "runtime_identity_changed"
+    )
+
+
+def test_report_writer_rejects_an_older_attempt_after_newer_ownership(
+    tmp_path,
+):
+    output = tmp_path / "diagnostic.json"
+    newer = {
+        "attempt_id": "newer",
+        "attempt_started_at_utc": "2026-07-25T00:00:02+00:00",
+        "status": "initializing",
+    }
+    older = {
+        "attempt_id": "older",
+        "attempt_started_at_utc": "2026-07-25T00:00:01+00:00",
+        "status": "complete",
+    }
+
+    _write_report(output, newer)
+    with pytest.raises(RuntimeError, match="newer diagnostic attempt"):
+        _write_report(output, older)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == newer
