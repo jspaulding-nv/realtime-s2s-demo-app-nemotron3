@@ -70,6 +70,7 @@ export interface AudioConfig {
   chunkSize: number;
   channels: number;
   pipelineMode?: 'monolithic' | 'staged';
+  audioMetadataProtocolVersions?: AudioMetadataProtocolVersion[];
   stagedConfig?: {
     segmentMaxChars: number;
     segmentMaxAgeMs: number;

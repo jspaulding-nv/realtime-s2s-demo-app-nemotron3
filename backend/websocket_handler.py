@@ -87,6 +87,7 @@ class TranslationSession:
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _closed: bool = False
     _awaiting_completion: bool = False
+    _monolithic_generation: int = 0
     _staged_pipeline: Any = None
     _staged_output_task: Optional[asyncio.Task] = None
     _staged_cleanup_pipeline: Any = None
@@ -199,6 +200,61 @@ class TranslationSession:
             print(f"[WS] Failed to send audio: {exc}")
             return False
 
+    async def _send_monolithic_audio(
+        self,
+        generation: int,
+        audio_data: bytes,
+    ) -> Optional[bool]:
+        """Send PCM only while its monolithic stream generation is current."""
+        async with self._send_lock:
+            if (
+                generation != self._monolithic_generation
+                or self._closed
+                or self.status
+                not in {SessionStatus.LISTENING, SessionStatus.PROCESSING}
+            ):
+                return None
+            return await self._send_audio_unlocked(audio_data)
+
+    async def _send_monolithic_error(
+        self,
+        generation: int,
+        message: str,
+    ) -> bool:
+        """Claim an error only for the monolithic stream that produced it."""
+        async with self._send_lock:
+            if generation != self._monolithic_generation or self._closed:
+                return False
+            self._awaiting_completion = False
+            self.status = SessionStatus.ERROR
+            await self._send_json_unlocked(
+                {
+                    "type": "error",
+                    "message": message,
+                }
+            )
+            return True
+
+    async def _send_monolithic_completed(self, generation: int) -> bool:
+        """Complete only the monolithic stream whose input was finalized."""
+        async with self._send_lock:
+            if (
+                generation != self._monolithic_generation
+                or self._closed
+                or not self._awaiting_completion
+            ):
+                return False
+            self._awaiting_completion = False
+            self.status = SessionStatus.COMPLETED
+            await self._send_json_unlocked(
+                {
+                    "type": "status",
+                    "status": SessionStatus.COMPLETED.value,
+                    "message": "Riva translated-audio stream complete",
+                }
+            )
+            return True
+
     async def start_stream(
         self,
         target_language: str,
@@ -249,6 +305,8 @@ class TranslationSession:
                     negotiated_metadata_version,
                 )
             else:
+                self._monolithic_generation += 1
+                monolithic_generation = self._monolithic_generation
                 await self.send_status(
                     SessionStatus.LISTENING,
                     f"Translating to {target_language}",
@@ -262,26 +320,52 @@ class TranslationSession:
                 pending_audio_sends = []
 
                 def on_audio(audio_bytes: bytes):
-                    if not self._closed:
+                    if (
+                        not self._closed
+                        and monolithic_generation
+                        == self._monolithic_generation
+                    ):
                         timing_logger.log_audio_from_riva(len(audio_bytes))
 
                         async def _send_and_log():
-                            if not await self.send_audio(audio_bytes):
+                            sent = await self._send_monolithic_audio(
+                                monolithic_generation,
+                                audio_bytes,
+                            )
+                            if sent is False:
                                 raise RuntimeError(
                                     "translated audio could not be sent to the client"
                                 )
-                            timing_logger.log_audio_sent_to_client(len(audio_bytes))
+                            if sent:
+                                timing_logger.log_audio_sent_to_client(
+                                    len(audio_bytes)
+                                )
 
                         pending_audio_sends.append(
                             asyncio.run_coroutine_threadsafe(_send_and_log(), loop)
                         )
 
                 def on_error(error_msg: str):
-                    if not self._closed:
-                        asyncio.run_coroutine_threadsafe(self.send_error(error_msg), loop)
+                    if (
+                        not self._closed
+                        and monolithic_generation
+                        == self._monolithic_generation
+                    ):
+                        asyncio.run_coroutine_threadsafe(
+                            self._send_monolithic_error(
+                                monolithic_generation,
+                                error_msg,
+                            ),
+                            loop,
+                        )
 
                 def on_complete():
-                    if self._closed or not self._awaiting_completion:
+                    if (
+                        self._closed
+                        or monolithic_generation
+                        != self._monolithic_generation
+                        or not self._awaiting_completion
+                    ):
                         return
 
                     done, not_done = wait(pending_audio_sends, timeout=60)
@@ -303,12 +387,8 @@ class TranslationSession:
                         return
 
                     async def _mark_completed():
-                        if self._closed or not self._awaiting_completion:
-                            return
-                        self._awaiting_completion = False
-                        await self.send_status(
-                            SessionStatus.COMPLETED,
-                            "Riva translated-audio stream complete",
+                        await self._send_monolithic_completed(
+                            monolithic_generation
                         )
 
                     asyncio.run_coroutine_threadsafe(_mark_completed(), loop)
@@ -1323,6 +1403,7 @@ class TranslationSession:
                     self._audio_metadata_protocol_version = None
                 staged_stop_generation = self._staged_generation
             else:
+                self._monolithic_generation += 1
                 send_monolithic_stopped = True
 
         if staged_stop_generation is not None:
@@ -1392,6 +1473,7 @@ class TranslationSession:
         """Best-effort legacy close; manager cleanup uses awaited ``aclose``."""
         self._closed = True
         self._awaiting_completion = False
+        self._monolithic_generation += 1
         self._audio_metadata_protocol_version = None
         if self.chunk_iterator:
             self.chunk_iterator.stop()
@@ -1416,6 +1498,7 @@ class TranslationSession:
         async with self._lock:
             self._closed = True
             self._awaiting_completion = False
+            self._monolithic_generation += 1
             if self.chunk_iterator:
                 self.chunk_iterator.stop()
                 self.chunk_iterator = None

@@ -647,18 +647,41 @@ def render_freshness_cap_markdown(analysis: dict[str, Any]) -> str:
             )
         )
 
+    unachieved_scenarios = [
+        scenario
+        for scenario in analysis["scenarios"]
+        if not scenario["summary"]["hard_cap_achieved"]
+    ]
+    if unachieved_scenarios:
+        cap_outcome = (
+            "Whole-parent eviction did not achieve every tested cap/strategy "
+            "scenario on this capture. "
+        )
+        residual_outcome = (
+            "The observed residual breaches show that protected, incomplete, "
+            "or otherwise ineligible audio still exceeded at least one tested "
+            "scenario's cap."
+        )
+    else:
+        cap_outcome = (
+            "Whole-parent eviction achieved every tested cap/strategy scenario "
+            "on this capture. "
+        )
+        residual_outcome = (
+            "That result is specific to this offline capture and does not "
+            "establish a universal live hard-cap guarantee."
+        )
     lines.extend(
         [
             "",
             (
-                "Whole-parent eviction did not achieve every cap on this "
-                "capture. Unaccelerated parent source-PCM duration was "
+                cap_outcome
+                + "Unaccelerated parent source-PCM duration was "
                 f"{parent_duration['p50']:.3f}s p50, "
                 f"{parent_duration['p95']:.3f}s p95, and "
                 f"{parent_duration['max']:.3f}s maximum. These durations are "
-                "context rather than scheduled queue depth; the observed "
-                "residual breaches prove that protected/incomplete audio "
-                "still exceeded each tested cap."
+                "context rather than scheduled queue depth. "
+                + residual_outcome
             ),
             "",
             (

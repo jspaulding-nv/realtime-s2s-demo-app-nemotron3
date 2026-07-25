@@ -2119,6 +2119,103 @@ async def test_environment_default_monolithic_never_uses_staged_factory(
 
 
 @pytest.mark.asyncio
+async def test_replaced_monolithic_stream_drops_stale_audio_and_error(
+    mock_websocket,
+):
+    callbacks = []
+
+    async def translate_stream(**kwargs):
+        callbacks.append(kwargs)
+        return MagicMock()
+
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="monolithic",
+    )
+    with patch(
+        "websocket_handler.riva_client.translate_stream",
+        side_effect=translate_stream,
+    ):
+        await session.start_stream("es-US")
+        # Queue old PCM behind the writer lock, then replace the stream before
+        # that coroutine can re-check its generation.
+        await session._send_lock.acquire()
+        callbacks[0]["on_audio"](b"stale audio")
+        await asyncio.sleep(0)
+        replacement = asyncio.create_task(session.start_stream("es-US"))
+        await asyncio.sleep(0)
+        session._send_lock.release()
+        await replacement
+
+    mock_websocket.send_bytes.reset_mock()
+    mock_websocket.send_json.reset_mock()
+    callbacks[0]["on_error"]("stale error")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    mock_websocket.send_bytes.assert_not_awaited()
+    assert not any(
+        call.args
+        and call.args[0].get("type") == "error"
+        for call in mock_websocket.send_json.await_args_list
+    )
+    assert session.status is SessionStatus.LISTENING
+
+    callbacks[1]["on_audio"](b"current audio")
+    await _wait_until(lambda: mock_websocket.send_bytes.await_count == 1)
+    mock_websocket.send_bytes.assert_awaited_once_with(b"current audio")
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_replaced_monolithic_completion_cannot_complete_new_stream(
+    mock_websocket,
+):
+    callbacks = []
+
+    async def translate_stream(**kwargs):
+        callbacks.append(kwargs)
+        return MagicMock()
+
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="monolithic",
+    )
+    with patch(
+        "websocket_handler.riva_client.translate_stream",
+        side_effect=translate_stream,
+    ):
+        await session.start_stream("es-US")
+        await session.start_stream("es-US")
+        await session.finish_input()
+
+    mock_websocket.send_json.reset_mock()
+    callbacks[0]["on_complete"]()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert session.status is SessionStatus.PROCESSING
+    assert session._awaiting_completion is True
+    assert not any(
+        call.args
+        and call.args[0].get("status") == SessionStatus.COMPLETED.value
+        for call in mock_websocket.send_json.await_args_list
+    )
+
+    callbacks[1]["on_complete"]()
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+    assert session._awaiting_completion is False
+    mock_websocket.send_json.assert_awaited_once_with(
+        {
+            "type": "status",
+            "status": SessionStatus.COMPLETED.value,
+            "message": "Riva translated-audio stream complete",
+        }
+    )
+    await session.aclose()
+
+
+@pytest.mark.asyncio
 async def test_manager_replacement_awaits_old_staged_cleanup(mock_websocket):
     manager = SessionManager(
         pipeline_mode="staged",

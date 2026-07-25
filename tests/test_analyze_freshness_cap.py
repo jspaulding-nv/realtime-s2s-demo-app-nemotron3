@@ -266,12 +266,34 @@ def test_markdown_labels_source_offsets_as_nonsemantic_and_nonaudibility():
     assert "anonymous binary PCM" not in markdown
 
 
+def test_markdown_does_not_claim_residual_breaches_when_all_caps_achieve():
+    analysis = build_freshness_cap_analysis(
+        _source_clock_trace(),
+        freshness_caps=[5, 10],
+        strategies=["oldest_first", "jump_to_latest_complete"],
+    )
+    assert all(
+        scenario["summary"]["hard_cap_achieved"]
+        for scenario in analysis["scenarios"]
+    )
+
+    markdown = render_freshness_cap_markdown(analysis)
+
+    assert (
+        "achieved every tested cap/strategy scenario on this capture"
+        in markdown
+    )
+    assert "did not achieve every tested" not in markdown
+    assert "observed residual breaches" not in markdown
+    assert "does not establish a universal live hard-cap guarantee" in markdown
+
+
 def test_render_markdown_prominently_labels_loss_scope_and_browser_gate():
     markdown = render_freshness_cap_markdown(
         build_freshness_cap_analysis(
             _trace(),
             freshness_caps=[5],
-            strategies=["oldest_first"],
+            strategies=["oldest_first", "jump_to_latest_complete"],
         )
     )
 
@@ -284,6 +306,7 @@ def test_render_markdown_prominently_labels_loss_scope_and_browser_gate():
     assert "100 ms cancellation guard" in markdown
     assert "Cancellation-guard sensitivity" in markdown
     assert "anonymous binary PCM" in markdown
+    assert "did not achieve every tested cap/strategy scenario" in markdown
 
 
 def test_parse_cli_args_applies_defaults_dedupes_and_derives_outputs():

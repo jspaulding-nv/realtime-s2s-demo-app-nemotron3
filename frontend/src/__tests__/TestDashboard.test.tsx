@@ -114,19 +114,29 @@ vi.mock('../components/DriftChart', () => ({
 type MockFetchResponse = {
   ok: boolean;
   status?: number;
-  json: () => Promise<Record<string, string>>;
+  json: () => Promise<Record<string, unknown>>;
 };
-const mockFetch = vi.fn<() => Promise<MockFetchResponse>>(() =>
-  Promise.resolve({
-    ok: true,
-    json: () => Promise.resolve({ status: 'started' }),
-  }),
-);
+const defaultFetch = (input: RequestInfo | URL): Promise<MockFetchResponse> =>
+  Promise.resolve(String(input) === '/api/config'
+    ? {
+        ok: true,
+        json: () => Promise.resolve({
+          audioMetadataProtocolVersions: [1],
+        }),
+      }
+    : {
+        ok: true,
+        json: () => Promise.resolve({ status: 'started' }),
+      });
+const mockFetch = vi.fn<
+  (input: RequestInfo | URL) => Promise<MockFetchResponse>
+>(defaultFetch);
 vi.stubGlobal('fetch', mockFetch);
 
 describe('TestDashboard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockFetch.mockImplementation(defaultFetch);
     playbackInstances = [];
   });
 
@@ -202,13 +212,16 @@ describe('TestDashboard', () => {
       startStreaming: vi.fn(),
       stopStreaming: vi.fn(),
     });
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 409,
-      json: () => Promise.resolve({
-        detail: 'Cannot start a new test while a staged stream is active',
-      }),
-    });
+    mockFetch.mockImplementation((input) =>
+      String(input) === '/api/config'
+        ? defaultFetch(input)
+        : Promise.resolve({
+            ok: false,
+            status: 409,
+            json: () => Promise.resolve({
+              detail: 'Cannot start a new test while a staged stream is active',
+            }),
+          }));
     render(<TestDashboard />);
 
     await act(async () => {
@@ -219,6 +232,44 @@ describe('TestDashboard', () => {
       'Could not start test: Cannot start a new test while a staged stream is active',
     );
     expect(screen.getByText('Start Test')).toBeInTheDocument();
+    expect(mockPlaybackStart).not.toHaveBeenCalled();
+    expect(mockTrackerStartTest).not.toHaveBeenCalled();
+  });
+
+  it('does not start capture when audio metadata v1 is not advertised', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+    mockFetch.mockImplementation((input) =>
+      Promise.resolve(String(input) === '/api/config'
+        ? {
+            ok: true,
+            json: () => Promise.resolve({
+              audioMetadataProtocolVersions: [],
+            }),
+          }
+        : {
+            ok: true,
+            json: () => Promise.resolve({ status: 'started' }),
+          }));
+
+    render(<TestDashboard />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Could not start test: Audio metadata protocol version 1 is unavailable',
+    );
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith('/api/config');
     expect(mockPlaybackStart).not.toHaveBeenCalled();
     expect(mockTrackerStartTest).not.toHaveBeenCalled();
   });

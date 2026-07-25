@@ -95,15 +95,17 @@ export function useWebSocket({
   const finishMetadataProtocol = useCallback((
     context: string,
     detach: boolean = false,
-  ) => {
+  ): boolean => {
     const protocol = metadataProtocolRef.current;
     if (!protocol) {
-      return;
+      return true;
     }
     try {
       protocol.receiver.finishStream(context);
+      return true;
     } catch (error) {
       reportMetadataProtocolError(error);
+      return false;
     } finally {
       if (detach && metadataProtocolRef.current === protocol) {
         metadataProtocolRef.current = null;
@@ -235,20 +237,25 @@ export function useWebSocket({
         const message = parsedMessage as ServerMessage;
 
         switch (message.type) {
-          case 'status':
-            setStatus(message.status);
-            onStatusRef.current?.(message.status, message.message);
+          case 'status': {
+            const isTerminal = (
+              message.status === 'completed'
+              || message.status === 'stopped'
+              || message.status === 'error'
+            );
             if (
               metadataProtocol
-              && (
-                message.status === 'completed'
-                || message.status === 'stopped'
-                || message.status === 'error'
-              )
+              && isTerminal
+              && !finishMetadataProtocol(`terminal status ${message.status}`)
             ) {
-              finishMetadataProtocol(`terminal status ${message.status}`);
+              // Do not expose a successful terminal state after strict
+              // metadata reconciliation has failed.
+              return;
             }
+            setStatus(message.status);
+            onStatusRef.current?.(message.status, message.message);
             break;
+          }
           case 'error':
             setStatus('error');
             onErrorRef.current?.(message.message);

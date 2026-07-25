@@ -74,10 +74,13 @@ Transcript-free structural telemetry from the clean matrix produced 2,027
 character-count/PCM-duration pairs. A leave-one-sample-out model places the
 4-second-p95 and 8-second observed-max-residual limits at 44 and 46 translated
 characters. The strict five-character grid therefore starts at 40 characters,
-but this is not yet a production setting: the same fit predicts substantial
-call amplification and possible fixed-duration overhead. The next live canary
-must compare unsplit, 40-, 45-, and 60-character post-NMT TTS policies while
-measuring both burst size and total output expansion.
+but the subsequent matched live canary showed that every 40-, 45-, and
+60-character policy increased total synthesized audio and listener backlog
+relative to the unsplit control. Post-NMT splitting therefore remains disabled.
+Incremental PCM publication removed some avoidable response buffering, and the
+current observation gate can associate each output frame with a source parent.
+The next gate is a synchronized semantic source-event marker that measures a
+known source moment through translated receipt and scheduled playback.
 
 ## Architecture
 
@@ -614,7 +617,7 @@ source fixtures are the explicit exception described in
 `test_audio/README.md`. Sanitized aggregate interpretation and comparison with
 @jgough-essextec's earlier runs are in `NEMOTRON_TEST_RESULTS.md`.
 
-For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so this branch experiments with a 5-second catch-up target, an 8-second urgent threshold, and a 10-second soft ceiling. It schedules output at 1.00x, 1.05x, or 1.10x and never drops speech.
+For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so this implementation experiments with a 5-second catch-up target, an 8-second urgent threshold, and a 10-second soft ceiling. It schedules output at 1.00x, 1.05x, or 1.10x and never drops speech.
 
 The 10-second value is an audience-experience objective, not a guaranteed hard cap. If translated audio is generated faster than 1.10x playback can consume it, the queue can still exceed that value. Browser queue depth also excludes the upstream time spent waiting for ASR finalization, translation, and the first TTS audio; therefore it does not by itself equal the delay between an English joke and its Spanish rendering.
 

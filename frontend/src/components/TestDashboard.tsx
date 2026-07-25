@@ -12,7 +12,7 @@ import {
   summarizePlaybackQueue,
   type PlaybackQueueSample,
 } from '../utils/playbackPolicy';
-import type { SessionStatus } from '../types/messages';
+import type { AudioConfig, SessionStatus } from '../types/messages';
 
 type TestPhase = 'idle' | 'running' | 'draining' | 'completed' | 'failed';
 type FinishedPhase = Extract<TestPhase, 'completed' | 'failed'>;
@@ -266,8 +266,24 @@ export function TestDashboard() {
     setFailureMessage('');
     setDrainCountdown(DRAIN_IDLE_SEC);
 
-    console.log('[TestDashboard] Calling /api/test/start...');
+    console.log('[TestDashboard] Checking /api/config capabilities...');
     try {
+      const configResponse = await fetch('/api/config');
+      if (!configResponse.ok) {
+        throw new Error(
+          `Could not discover audio metadata capabilities (HTTP ${configResponse.status}).`,
+        );
+      }
+      const config = await configResponse.json() as Partial<AudioConfig>;
+      if (!config.audioMetadataProtocolVersions?.includes(1)) {
+        setFailureMessage(
+          'Audio metadata protocol version 1 is unavailable. '
+          + 'Use the staged schema-3 incremental-TTS pipeline.',
+        );
+        return;
+      }
+
+      console.log('[TestDashboard] Calling /api/test/start...');
       const response = await fetch('/api/test/start', { method: 'POST' });
       if (!response.ok) {
         let detail = `Backend returned HTTP ${response.status}.`;

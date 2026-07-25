@@ -287,12 +287,14 @@ describe('useWebSocket audio metadata protocol', () => {
     const onAudio = vi.fn();
     const onAudioParentComplete = vi.fn();
     const onError = vi.fn();
+    const onStatus = vi.fn();
     const { result, unmount } = renderHook(() => useWebSocket({
       url: 'ws://example.test/ws/translate',
       audioMetadataProtocolVersion: 1,
       onAudio,
       onAudioParentComplete,
       onError,
+      onStatus,
     }));
     const socket = connect(result);
     startStream(result);
@@ -310,6 +312,11 @@ describe('useWebSocket audio metadata protocol', () => {
     expect(onError).toHaveBeenCalledWith(
       expect.stringMatching(/without audio_parent_complete/),
     );
+    expect(onStatus).not.toHaveBeenCalledWith(
+      'completed',
+      expect.any(String),
+    );
+    expect(result.current.status).toBe('error');
     unmount();
   });
 

@@ -155,5 +155,7 @@ The detailed evidence is in [the staged pipeline report](STAGED_NMT_TTS_PIPELINE
 [the Sample 03 canary report](LONG_FORM_03_STAGED_CANARY.md), and
 [the July 22 acceptance run](ACCEPTANCE_RUN_2026-07-22.md). The implementation
 was subsequently committed and pushed on `agent/staged-nmt-tts-pipeline` at
-`55b59bd` and is tracked in
-[draft PR #6](https://github.com/jspaulding-nv/realtime-s2s-demo-app-nemotron3/pull/6).
+`55b59bd`. Its historical
+[draft PR #6](https://github.com/jspaulding-nv/realtime-s2s-demo-app-nemotron3/pull/6)
+was superseded by the cumulative
+[PR #10](https://github.com/jspaulding-nv/realtime-s2s-demo-app-nemotron3/pull/10).
