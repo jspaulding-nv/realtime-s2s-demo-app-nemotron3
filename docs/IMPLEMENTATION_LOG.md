@@ -1243,6 +1243,21 @@ valid report therefore requires
 `asr.runtime_attestation.verified=true`; declaration alone cannot substitute
 for Docker inspection.
 
+### Two-run qualification outcome (2026-07-25)
+
+The registered two-run qualification completed against the reviewed merged
+branch. Runtime attestation, strict PCM identity, full input consumption, and
+real-time pacing all passed. Both runs produced the same 437 nonempty finals,
+but the same 13 final IDs lacked complete usable word envelopes: 10 had
+incomplete word timing and 3 had only an `audio_processed` end horizon.
+Top-level `passed=false` is therefore the correct result, and the formal
+semantic browser gate remains blocked.
+
+The transcript-free ignored report has SHA-256
+`ee4661f59a2d1839c36ac10bec2d8aa60de962582571a82ae381394391fa9f6e`.
+Detailed sanitized findings and the service-team escalation package are in
+`docs/ASR_FINAL_ATTRIBUTION_GATE_2026-07-25.md`.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1269,8 +1284,10 @@ for Docker inspection.
 - [x] Implement chunk-end-paced semantic source-event parent-envelope analysis
 - [x] Implement fail-closed runtime attestation for the ASR container's
   endpoint binding, health, pinned image/digest, and registered profile
+- [x] Execute two real-time ASR final-attribution qualification runs on the
+  exact long-form padded PCM
 - [ ] Pass two real-time ASR final-attribution qualification runs on the exact
-  long-form padded PCM
+  long-form padded PCM (blocked by 13 deterministic incomplete finals per run)
 - [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
 - [ ] Run protocol v1 across all three long-form samples
