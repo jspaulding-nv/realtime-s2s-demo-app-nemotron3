@@ -4,8 +4,12 @@ import json
 import pytest
 
 from batch_latency_test import (
+    INPUT_PACING_DEADLINE_BASIS,
+    INPUT_PACING_MODE,
+    INPUT_SAMPLE_ZERO_CLOCK,
     TestResult as BatchTestResult,
     TimingEvent,
+    _send_pcm_chunks_at_end_boundaries,
     compute_playback_metrics,
     fetch_backend_export,
     fetch_backend_config,
@@ -604,6 +608,154 @@ def successful_websocket_receive_events_v3():
     ]
 
 
+def test_end_boundary_pacer_uses_absolute_deadlines_and_stable_sample_zero():
+    clock_value = 25.0
+    deadlines = []
+    sent = []
+    anchors = []
+    successful_sends = []
+
+    def clock():
+        return clock_value
+
+    async def exercise():
+        nonlocal clock_value
+        stream_abort = asyncio.Event()
+
+        async def wait_until(deadline, observed_abort):
+            nonlocal clock_value
+            assert observed_abort is stream_abort
+            assert not observed_abort.is_set()
+            deadlines.append(deadline)
+            clock_value = deadline
+            return True
+
+        async def send_chunk(idx, chunk, send_timestamp):
+            sent.append((idx, chunk, send_timestamp))
+            return True
+
+        return await _send_pcm_chunks_at_end_boundaries(
+            b"abcdefgh",
+            stream_abort,
+            send_chunk,
+            on_sample_zero=anchors.append,
+            on_successful_send=lambda idx, emitted, deadline: (
+                successful_sends.append((idx, emitted, deadline))
+            ),
+            clock=clock,
+            wait_until=wait_until,
+            chunk_bytes=4,
+            chunk_duration=0.3,
+        )
+
+    sample_zero, chunk_count = asyncio.run(exercise())
+
+    assert sample_zero == 25.0
+    assert anchors == [25.0]
+    assert chunk_count == 2
+    assert deadlines == pytest.approx([25.3, 25.6])
+    assert [item[0] for item in sent] == [0, 1]
+    assert [item[1] for item in sent] == [b"abcd", b"efgh"]
+    assert [item[2] for item in sent] == pytest.approx([25.3, 25.6])
+    assert successful_sends == pytest.approx(
+        [(0, 25.3, 25.3), (1, 25.6, 25.6)]
+    )
+    # Returning at the second send timestamp proves there is no trailing
+    # third interval after the final source chunk.
+    assert clock_value == pytest.approx(25.6)
+
+    client_clock_origin = 24.5
+    input_sample_zero_ms = (sample_zero - client_clock_origin) * 1000
+    receipt_clock = 25.725
+    source_end_to_receipt_ms = (
+        (receipt_clock - client_clock_origin) * 1000
+        - input_sample_zero_ms
+        - 600.0
+    )
+    assert source_end_to_receipt_ms == pytest.approx(125.0)
+
+
+def test_end_boundary_pacer_aborts_during_pre_first_wait():
+    clock_value = 10.0
+    deadlines = []
+    sent = []
+
+    def clock():
+        return clock_value
+
+    async def exercise():
+        nonlocal clock_value
+        stream_abort = asyncio.Event()
+
+        async def wait_until(deadline, observed_abort):
+            nonlocal clock_value
+            deadlines.append(deadline)
+            clock_value = 10.1
+            observed_abort.set()
+            return False
+
+        async def send_chunk(idx, chunk, send_timestamp):
+            sent.append((idx, chunk, send_timestamp))
+            return True
+
+        return await _send_pcm_chunks_at_end_boundaries(
+            b"abcd",
+            stream_abort,
+            send_chunk,
+            clock=clock,
+            wait_until=wait_until,
+            chunk_bytes=4,
+            chunk_duration=0.3,
+        )
+
+    sample_zero, chunk_count = asyncio.run(exercise())
+
+    assert sample_zero == 10.0
+    assert deadlines == pytest.approx([10.3])
+    assert sent == []
+    assert chunk_count == 0
+    assert clock_value == 10.1
+
+
+def test_end_boundary_pacer_records_only_successful_sends():
+    clock_value = 5.0
+    successful_sends = []
+
+    def clock():
+        return clock_value
+
+    async def exercise():
+        nonlocal clock_value
+        stream_abort = asyncio.Event()
+
+        async def wait_until(deadline, _observed_abort):
+            nonlocal clock_value
+            clock_value = deadline
+            return True
+
+        async def send_chunk(idx, _chunk, _send_timestamp):
+            return idx == 0
+
+        return await _send_pcm_chunks_at_end_boundaries(
+            b"abcdefgh",
+            stream_abort,
+            send_chunk,
+            on_successful_send=lambda idx, emitted, deadline: (
+                successful_sends.append((idx, emitted, deadline))
+            ),
+            clock=clock,
+            wait_until=wait_until,
+            chunk_bytes=4,
+            chunk_duration=0.3,
+        )
+
+    sample_zero, chunk_count = asyncio.run(exercise())
+
+    assert sample_zero == 5.0
+    assert chunk_count == 1
+    assert successful_sends == pytest.approx([(0, 5.3, 5.3)])
+
+
 def test_generate_summary_records_capture_integrity(tmp_path):
     config = staged_config()
     staged_pipeline = successful_staged_export()
@@ -629,6 +781,16 @@ def test_generate_summary_records_capture_integrity(tmp_path):
         terminal_arrival_lag_sec=0.5,
         translation_completed=True,
         server_error="",
+        input_pacing={
+            "mode": INPUT_PACING_MODE,
+            "chunk_duration_ms": 300.0,
+            "source_sample_zero_clock": INPUT_SAMPLE_ZERO_CLOCK,
+            "deadline_basis": INPUT_PACING_DEADLINE_BASIS,
+            "source_sample_zero_timestamp_ms": 1.5,
+            "observed_chunk_count": 200,
+            "min_emission_minus_deadline_ms": 0.01,
+            "max_emission_minus_deadline_ms": 2.5,
+        },
     )
     output = tmp_path / "example_summary.json"
 
@@ -656,6 +818,18 @@ def test_generate_summary_records_capture_integrity(tmp_path):
     assert summary["terminal_arrival_lag_sec"] == 0.5
     assert summary["translation_completed"] is True
     assert summary["server_error"] == ""
+    assert summary["input_pacing"] == {
+        "mode": "chunk_end_boundary_v1",
+        "chunk_duration_ms": 300.0,
+        "source_sample_zero_clock": "client_monotonic",
+        "deadline_basis": (
+            "source_sample_zero_plus_one_based_chunk_duration"
+        ),
+        "source_sample_zero_timestamp_ms": 1.5,
+        "observed_chunk_count": 200,
+        "min_emission_minus_deadline_ms": 0.01,
+        "max_emission_minus_deadline_ms": 2.5,
+    }
 
 
 def test_generate_summary_keeps_monolithic_runs_backward_compatible(tmp_path):
@@ -677,6 +851,7 @@ def test_generate_summary_keeps_monolithic_runs_backward_compatible(tmp_path):
         "passed": None,
         "errors": [],
     }
+    assert "input_pacing" not in summary
 
 
 def test_resolve_pipeline_mode_records_api_or_legacy_provenance():
@@ -1508,6 +1683,48 @@ def test_playback_tail_legacy_fallback_adds_exact_chunk_duration():
     compute_playback_metrics(result)
 
     assert result.playback_tail_sec == pytest.approx(0.6)
+
+
+def test_playback_tail_end_boundary_fallback_uses_send_timestamp_directly():
+    result = BatchTestResult(
+        audio_path="test_audio/example.wav",
+        duration_sec=0.1,
+        audio_metadata_protocol_version=1,
+        input_pacing={
+            "mode": INPUT_PACING_MODE,
+            "chunk_duration_ms": 300.0,
+            "source_sample_zero_clock": INPUT_SAMPLE_ZERO_CLOCK,
+            "deadline_basis": INPUT_PACING_DEADLINE_BASIS,
+            "source_sample_zero_timestamp_ms": 0.0,
+            "observed_chunk_count": 1,
+            "min_emission_minus_deadline_ms": 0.0,
+            "max_emission_minus_deadline_ms": 0.0,
+        },
+        client_events=[
+            TimingEvent("client", "chunk_sent", 300.0, 0, 0.0, 3200),
+            TimingEvent("client", "audio_received", 600.0, 0, 0.1, 3200),
+        ],
+    )
+
+    compute_playback_metrics(result)
+
+    assert result.playback_tail_sec == pytest.approx(0.4)
+
+
+def test_playback_tail_partial_unnegotiated_pacing_uses_legacy_fallback():
+    result = BatchTestResult(
+        audio_path="test_audio/example.wav",
+        duration_sec=0.1,
+        input_pacing={"mode": INPUT_PACING_MODE},
+        client_events=[
+            TimingEvent("client", "chunk_sent", 300.0, 0, 0.0, 3200),
+            TimingEvent("client", "audio_received", 600.0, 0, 0.1, 3200),
+        ],
+    )
+
+    compute_playback_metrics(result)
+
+    assert result.playback_tail_sec == pytest.approx(0.3)
 
 
 def test_run_batch_fails_when_requested_file_is_missing(tmp_path):

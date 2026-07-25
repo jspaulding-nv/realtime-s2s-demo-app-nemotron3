@@ -16,6 +16,7 @@ const capture = vi.hoisted(() => ({
 
 const socket = vi.hoisted(() => ({
   sendMessage: vi.fn(),
+  sendAudio: vi.fn(),
   connect: vi.fn(),
   disconnect: vi.fn(),
 }));
@@ -46,7 +47,7 @@ vi.mock('../hooks/useWebSocket', () => ({
     isConnected: true,
     status: 'connected',
     sendMessage: socket.sendMessage,
-    sendAudio: vi.fn(),
+    sendAudio: socket.sendAudio,
     connect: socket.connect,
     disconnect: socket.disconnect,
   })),
@@ -71,6 +72,7 @@ describe('TranslationPanel playback telemetry', () => {
     vi.clearAllMocks();
     playback.getMetrics.mockReturnValue(emptyMetrics);
     capture.start.mockResolvedValue(undefined);
+    socket.sendAudio.mockReturnValue(true);
     // Language discovery is unrelated to these telemetry assertions. Leave
     // the request pending so it cannot schedule a post-render state update.
     vi.stubGlobal('fetch', vi.fn(() => new Promise(() => undefined)));
@@ -90,6 +92,55 @@ describe('TranslationPanel playback telemetry', () => {
 
     const options = vi.mocked(useWebSocket).mock.calls.at(-1)?.[0];
     expect(options?.audioMetadataProtocolVersion).toBeUndefined();
+  });
+
+  it('fully tears down a live session when an audio frame cannot be sent', async () => {
+    const { useAudioCapture } = await import('../hooks/useAudioCapture');
+    const failureMetrics: PlaybackMetrics = {
+      ...emptyMetrics,
+      queueDepthSeconds: 4.25,
+      peakQueueDepthSeconds: 8.5,
+      playbackRate: 1.1,
+      playbackMode: 'urgent',
+      aboveTarget: true,
+      limitExceededCount: 1,
+    };
+    render(<TranslationPanel />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Start translation' }));
+    });
+    const options = vi.mocked(useAudioCapture).mock.calls.at(-1)?.[0];
+    playback.getMetrics.mockReturnValue(failureMetrics);
+    socket.sendAudio.mockReturnValue(false);
+
+    act(() => {
+      options?.onChunk(new ArrayBuffer(4));
+    });
+
+    expect(socket.sendAudio).toHaveBeenCalledOnce();
+    expect(capture.stop).toHaveBeenCalledOnce();
+    expect(playback.stop).toHaveBeenCalledOnce();
+    expect(socket.sendMessage).toHaveBeenLastCalledWith({
+      type: 'stop_stream',
+    });
+    const telemetry = screen.getByLabelText('Spanish playback telemetry');
+    expect(telemetry).toHaveAttribute('data-session-active', 'false');
+    expect(telemetry).toHaveAttribute('data-queue-current-seconds', '4.25');
+    expect(telemetry).toHaveAttribute('data-queue-peak-seconds', '8.5');
+    expect(screen.getByText('Final stop snapshot')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start translation' }))
+      .toBeInTheDocument();
+
+    // A new run gets a fresh playback session and resets the displayed queue;
+    // it cannot inherit the stopped AudioContext's pending schedule.
+    playback.getMetrics.mockReturnValue(emptyMetrics);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Start translation' }));
+    });
+    expect(playback.start).toHaveBeenCalledTimes(2);
+    expect(capture.start).toHaveBeenCalledTimes(2);
+    expect(telemetry).toHaveAttribute('data-session-active', 'true');
+    expect(telemetry).toHaveAttribute('data-queue-current-seconds', '0');
   });
 
   it('reports current and peak browser queue metrics during translation', async () => {

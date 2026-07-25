@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import matplotlib
 matplotlib.use("Agg")
@@ -55,6 +55,23 @@ DRAIN_MAX_SECONDS = 300
 TERMINAL_SETTLE_SECONDS = 0.25
 EXPORT_POLL_INTERVAL_SECONDS = 0.1
 TARGET_LANGUAGE = "es-US"
+INPUT_PACING_MODE = "chunk_end_boundary_v1"
+INPUT_SAMPLE_ZERO_CLOCK = "client_monotonic"
+INPUT_PACING_DEADLINE_BASIS = (
+    "source_sample_zero_plus_one_based_chunk_duration"
+)
+INPUT_PACING_FIELDS = frozenset(
+    {
+        "mode",
+        "chunk_duration_ms",
+        "source_sample_zero_clock",
+        "deadline_basis",
+        "source_sample_zero_timestamp_ms",
+        "observed_chunk_count",
+        "min_emission_minus_deadline_ms",
+        "max_emission_minus_deadline_ms",
+    }
+)
 
 AUDIO_DIR = Path(os.environ.get("S2S_TEST_AUDIO_DIR", "test_audio")).expanduser()
 LONG_FORM_FILES = [
@@ -107,6 +124,7 @@ class TestResult:
     audio_metadata_protocol_version: int | None = None
     audio_metadata_stream_generation: int | None = None
     input_sample_zero_timestamp_ms: float | None = None
+    input_pacing: dict[str, Any] | None = None
     audio_metadata_paired_frames: int = 0
     audio_metadata_completed_parents: int = 0
     source_end_to_receipt_samples_ms: list[float] = field(default_factory=list)
@@ -2333,7 +2351,226 @@ def validate_staged_pipeline_integrity(
     return errors
 
 
-def validate_audio_metadata_observation(result: TestResult) -> list[str]:
+def validate_input_pacing_evidence(
+    result: TestResult,
+    *,
+    require_chunk_events: bool,
+    timing_tolerance_ms: float = 1e-6,
+) -> list[str]:
+    """Validate measured end-boundary pacing provenance.
+
+    Protocol-v1 capture objects retain the complete client event ledger, so
+    their recorded extrema are recomputed here. A saved summary contains the
+    same fixed clock identity, source-sample-zero anchor, count, and measured
+    extrema but not the full ledger; artifact validation separately replays
+    the CSV and calls this validator with ``require_chunk_events=True``.
+    """
+
+    errors: list[str] = []
+    pacing = result.input_pacing
+    if not isinstance(pacing, dict):
+        return ["audio metadata capture requires input pacing provenance"]
+    if set(pacing) != INPUT_PACING_FIELDS:
+        errors.append(
+            "audio metadata input pacing provenance fields are invalid"
+        )
+    if pacing.get("mode") != INPUT_PACING_MODE:
+        errors.append(
+            "audio metadata input pacing mode must be "
+            f"{INPUT_PACING_MODE!r}"
+        )
+    pacing_duration_ms = pacing.get("chunk_duration_ms")
+    duration_valid = (
+        isinstance(pacing_duration_ms, (int, float))
+        and not isinstance(pacing_duration_ms, bool)
+        and math.isfinite(pacing_duration_ms)
+        and math.isclose(
+            float(pacing_duration_ms),
+            CHUNK_DURATION * 1000,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    )
+    if not duration_valid:
+        errors.append(
+            "audio metadata input pacing chunk duration is invalid"
+        )
+    if (
+        pacing.get("source_sample_zero_clock")
+        != INPUT_SAMPLE_ZERO_CLOCK
+    ):
+        errors.append(
+            "audio metadata input sample-zero clock must be "
+            f"{INPUT_SAMPLE_ZERO_CLOCK!r}"
+        )
+    if pacing.get("deadline_basis") != INPUT_PACING_DEADLINE_BASIS:
+        errors.append(
+            "audio metadata input pacing deadline basis is invalid"
+        )
+
+    anchor_ms = pacing.get("source_sample_zero_timestamp_ms")
+    anchor_valid = (
+        isinstance(anchor_ms, (int, float))
+        and not isinstance(anchor_ms, bool)
+        and math.isfinite(anchor_ms)
+        and anchor_ms >= 0
+    )
+    if not anchor_valid:
+        errors.append(
+            "audio metadata input pacing source-sample-zero timestamp "
+            "is invalid"
+        )
+    elif (
+        isinstance(result.input_sample_zero_timestamp_ms, (int, float))
+        and not isinstance(result.input_sample_zero_timestamp_ms, bool)
+        and math.isfinite(result.input_sample_zero_timestamp_ms)
+        and not math.isclose(
+            float(anchor_ms),
+            float(result.input_sample_zero_timestamp_ms),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    ):
+        errors.append(
+            "audio metadata input pacing source-sample-zero timestamp "
+            "does not match the observation"
+        )
+
+    observed_count = pacing.get("observed_chunk_count")
+    count_valid = (
+        isinstance(observed_count, int)
+        and not isinstance(observed_count, bool)
+        and observed_count > 0
+    )
+    if not count_valid:
+        errors.append(
+            "audio metadata input pacing observed chunk count is invalid"
+        )
+    elif (
+        not isinstance(result.chunks_sent, int)
+        or isinstance(result.chunks_sent, bool)
+        or observed_count != result.chunks_sent
+    ):
+        errors.append(
+            "audio metadata input pacing observed chunk count does not "
+            "match chunks_sent"
+        )
+
+    minimum_margin = pacing.get("min_emission_minus_deadline_ms")
+    maximum_margin = pacing.get("max_emission_minus_deadline_ms")
+    margins_valid = all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        for value in (minimum_margin, maximum_margin)
+    )
+    if not margins_valid:
+        errors.append(
+            "audio metadata input pacing emission margins are invalid"
+        )
+    elif minimum_margin > maximum_margin:
+        errors.append(
+            "audio metadata input pacing emission margin range is invalid"
+        )
+    elif minimum_margin < -timing_tolerance_ms:
+        errors.append(
+            "audio metadata input pacing contains an early chunk emission"
+        )
+
+    if not require_chunk_events:
+        return errors
+
+    chunk_events = [
+        event
+        for event in result.client_events
+        if isinstance(event, TimingEvent)
+        and event.source == "client"
+        and event.stage == "chunk_sent"
+    ]
+    if not count_valid or len(chunk_events) != observed_count:
+        errors.append(
+            "audio metadata input pacing event count does not match "
+            "observed_chunk_count"
+        )
+        return errors
+    if not duration_valid or not anchor_valid:
+        return errors
+
+    calculated_margins: list[float] = []
+    expected_indices = list(range(len(chunk_events)))
+    observed_indices = [event.chunk_index for event in chunk_events]
+    if observed_indices != expected_indices:
+        errors.append(
+            "audio metadata input pacing chunk indices are not contiguous"
+        )
+    for expected_index, event in enumerate(chunk_events):
+        if (
+            not isinstance(event.timestamp_ms, (int, float))
+            or isinstance(event.timestamp_ms, bool)
+            or not math.isfinite(event.timestamp_ms)
+        ):
+            errors.append(
+                "audio metadata input pacing chunk timestamp is invalid"
+            )
+            continue
+        expected_source_position = (
+            expected_index * float(pacing_duration_ms) / 1000
+        )
+        if (
+            not isinstance(event.source_position_sec, (int, float))
+            or isinstance(event.source_position_sec, bool)
+            or not math.isfinite(event.source_position_sec)
+            or not math.isclose(
+                float(event.source_position_sec),
+                expected_source_position,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            errors.append(
+                "audio metadata input pacing source position is invalid"
+            )
+        deadline_ms = (
+            float(anchor_ms)
+            + (expected_index + 1) * float(pacing_duration_ms)
+        )
+        calculated_margins.append(float(event.timestamp_ms) - deadline_ms)
+
+    if len(calculated_margins) != len(chunk_events):
+        return errors
+    calculated_minimum = min(calculated_margins)
+    calculated_maximum = max(calculated_margins)
+    if calculated_minimum < -timing_tolerance_ms:
+        errors.append(
+            "audio metadata input pacing event ledger contains an early "
+            "chunk emission"
+        )
+    if margins_valid and (
+        not math.isclose(
+            float(minimum_margin),
+            calculated_minimum,
+            rel_tol=0.0,
+            abs_tol=timing_tolerance_ms,
+        )
+        or not math.isclose(
+            float(maximum_margin),
+            calculated_maximum,
+            rel_tol=0.0,
+            abs_tol=timing_tolerance_ms,
+        )
+    ):
+        errors.append(
+            "audio metadata input pacing emission margins do not match "
+            "the client event ledger"
+        )
+    return errors
+
+
+def validate_audio_metadata_observation(
+    result: TestResult,
+    *,
+    require_pacing_chunk_events: bool = True,
+) -> list[str]:
     """Replay captured wire evidence and fail closed on v1 inconsistencies."""
 
     if result.audio_metadata_protocol_version is None:
@@ -2353,11 +2590,15 @@ def validate_audio_metadata_observation(result: TestResult) -> list[str]:
     ):
         return ["audio metadata protocol version must equal 1"]
 
+    errors = validate_input_pacing_evidence(
+        result,
+        require_chunk_events=require_pacing_chunk_events,
+    )
+
     tracker = AudioMetadataTracker(
         enabled=True,
         protocol_version=result.audio_metadata_protocol_version,
     )
-    errors: list[str] = []
     observed_orders: list[int] = []
     completed_terminals = 0
     frame_fields = (
@@ -2596,7 +2837,11 @@ def validate_audio_metadata_observation(result: TestResult) -> list[str]:
     return errors
 
 
-def validate_capture_result(result: TestResult) -> list[str]:
+def validate_capture_result(
+    result: TestResult,
+    *,
+    require_pacing_chunk_events: bool = True,
+) -> list[str]:
     """Return operational failures that make a batch capture incomplete."""
     errors: list[str] = []
     if result.pipeline_mode not in {"monolithic", "staged"}:
@@ -2641,7 +2886,12 @@ def validate_capture_result(result: TestResult) -> list[str]:
             abs_tol=1e-6,
         ):
             errors.append("terminal arrival lag is inconsistent with timestamps")
-    errors.extend(validate_audio_metadata_observation(result))
+    errors.extend(
+        validate_audio_metadata_observation(
+            result,
+            require_pacing_chunk_events=require_pacing_chunk_events,
+        )
+    )
     errors.extend(result.staged_integrity_errors)
     return errors
 
@@ -2649,9 +2899,11 @@ def validate_capture_result(result: TestResult) -> list[str]:
 def compute_playback_metrics(result: TestResult) -> None:
     """Compute arrival-replay first-audio latency and listener-visible tail.
 
-    ``chunk_sent`` timestamps identify the start of each source chunk, not the
-    end of input. Prefer the observed ``end_input`` send timestamp; for older
-    or partial traces, add each chunk's exact PCM duration to its send time.
+    Prefer the observed ``end_input`` send timestamp. In
+    ``chunk_end_boundary_v1`` captures each ``chunk_sent`` timestamp already
+    identifies that chunk's source-end boundary, so the fallback uses it
+    directly. Legacy or unproven traces retain the historical behavior of
+    adding each chunk's exact PCM duration to its send time.
     """
     playback_end_sec = 0.0
     estimated_input_end_sec = 0.0
@@ -2661,14 +2913,25 @@ def compute_playback_metrics(result: TestResult) -> None:
         else None
     )
     result.first_audio_latency_sec = 0.0
+    chunks_end_at_send = (
+        result.audio_metadata_protocol_version
+        == AUDIO_METADATA_PROTOCOL_VERSION
+        and isinstance(result.input_pacing, dict)
+        and set(result.input_pacing) == INPUT_PACING_FIELDS
+        and result.input_pacing.get("mode") == INPUT_PACING_MODE
+    )
 
     for event in sorted(result.client_events, key=lambda event: event.timestamp_ms):
         event_time_sec = event.timestamp_ms / 1000
         if event.stage == "chunk_sent":
+            chunk_duration_sec = (
+                0.0
+                if chunks_end_at_send
+                else event.audio_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+            )
             estimated_input_end_sec = max(
                 estimated_input_end_sec,
-                event_time_sec
-                + event.audio_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE),
+                event_time_sec + chunk_duration_sec,
             )
         elif event.stage == "input_ended":
             explicit_input_end_sec = event_time_sec
@@ -2737,6 +3000,93 @@ def nearest_rank(values: list[float], quantile: float) -> float | None:
     ordered = sorted(values)
     index = max(0, math.ceil(quantile * len(ordered)) - 1)
     return ordered[index]
+
+
+async def _wait_until_or_abort(
+    deadline: float,
+    stream_abort: asyncio.Event,
+    *,
+    clock: Callable[[], float],
+) -> bool:
+    """Wait for one absolute deadline, returning false if the stream aborts."""
+
+    while not stream_abort.is_set():
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return True
+        try:
+            await asyncio.wait_for(
+                stream_abort.wait(),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            continue
+        return False
+    return False
+
+
+async def _send_pcm_chunks_at_end_boundaries(
+    pcm_bytes: bytes,
+    stream_abort: asyncio.Event,
+    send_chunk: Callable[[int, bytes, float], Awaitable[bool]],
+    *,
+    on_sample_zero: Callable[[float], None] | None = None,
+    on_successful_send: (
+        Callable[[int, float, float], None] | None
+    ) = None,
+    clock: Callable[[], float] | None = None,
+    wait_until: (
+        Callable[[float, asyncio.Event], Awaitable[bool]] | None
+    ) = None,
+    chunk_bytes: int | None = None,
+    chunk_duration: float | None = None,
+) -> tuple[float, int]:
+    """Send PCM no earlier than each chunk's absolute source-end boundary."""
+
+    resolved_clock = clock or time.monotonic
+    resolved_chunk_bytes = CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    resolved_chunk_duration = (
+        CHUNK_DURATION if chunk_duration is None else chunk_duration
+    )
+    if resolved_chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    if resolved_chunk_duration <= 0:
+        raise ValueError("chunk_duration must be positive")
+
+    sample_zero = resolved_clock()
+    if on_sample_zero is not None:
+        on_sample_zero(sample_zero)
+
+    chunks_sent = 0
+    for idx, offset in enumerate(
+        range(0, len(pcm_bytes), resolved_chunk_bytes)
+    ):
+        deadline = sample_zero + (idx + 1) * resolved_chunk_duration
+        if wait_until is None:
+            deadline_reached = await _wait_until_or_abort(
+                deadline,
+                stream_abort,
+                clock=resolved_clock,
+            )
+        else:
+            deadline_reached = await wait_until(deadline, stream_abort)
+        if not deadline_reached or stream_abort.is_set():
+            break
+
+        send_timestamp = resolved_clock()
+        if send_timestamp < deadline:
+            raise RuntimeError(
+                "input pacing attempted to send before the source-end "
+                "boundary"
+            )
+        chunk = pcm_bytes[offset : offset + resolved_chunk_bytes]
+        if not await send_chunk(idx, chunk, send_timestamp):
+            break
+        if on_successful_send is not None:
+            on_successful_send(idx, send_timestamp, deadline)
+        chunks_sent += 1
+
+    return sample_zero, chunks_sent
 
 
 # ---------------------------------------------------------------------------
@@ -2932,6 +3282,7 @@ async def run_test(
         connection_lost = False
         server_error = ""
         last_print_time = 0.0
+        pacing_margins_ms: list[float] = []
 
         def current_drift() -> float:
             input_pos = chunks_sent * CHUNK_DURATION
@@ -2951,21 +3302,60 @@ async def run_test(
         # -- Send task ------------------------------------------------------
         async def send_audio():
             nonlocal chunks_sent, last_print_time, connection_lost
-            offset = 0
-            idx = 0
-            loop_start = time.monotonic()
-            if audio_metadata_protocol_version is not None:
+
+            def record_sample_zero(sample_zero: float) -> None:
+                if audio_metadata_protocol_version is None:
+                    return
                 result.input_sample_zero_timestamp_ms = (
-                    loop_start - client_clock_origin
+                    sample_zero - client_clock_origin
                 ) * 1000
+                result.input_pacing = {
+                    "mode": INPUT_PACING_MODE,
+                    "chunk_duration_ms": CHUNK_DURATION * 1000,
+                    "source_sample_zero_clock": (
+                        INPUT_SAMPLE_ZERO_CLOCK
+                    ),
+                    "deadline_basis": INPUT_PACING_DEADLINE_BASIS,
+                    "source_sample_zero_timestamp_ms": (
+                        result.input_sample_zero_timestamp_ms
+                    ),
+                    "observed_chunk_count": 0,
+                    "min_emission_minus_deadline_ms": None,
+                    "max_emission_minus_deadline_ms": None,
+                }
 
-            while offset < len(pcm_bytes):
-                if stream_abort.is_set():
-                    break
+            def record_successful_send(
+                idx: int,
+                send_timestamp: float,
+                deadline: float,
+            ) -> None:
+                if audio_metadata_protocol_version is None:
+                    return
+                pacing_margins_ms.append(
+                    (send_timestamp - deadline) * 1000
+                )
+                if not isinstance(result.input_pacing, dict):
+                    raise RuntimeError(
+                        "input pacing sample-zero anchor was not recorded"
+                    )
+                result.input_pacing.update(
+                    {
+                        "observed_chunk_count": idx + 1,
+                        "min_emission_minus_deadline_ms": min(
+                            pacing_margins_ms
+                        ),
+                        "max_emission_minus_deadline_ms": max(
+                            pacing_margins_ms
+                        ),
+                    }
+                )
 
-                chunk = pcm_bytes[offset : offset + CHUNK_BYTES]
-                send_ts = time.monotonic()
-
+            async def send_chunk(
+                idx: int,
+                chunk: bytes,
+                send_ts: float,
+            ) -> bool:
+                nonlocal chunks_sent, last_print_time, connection_lost
                 try:
                     await ws.send(chunk)
                 except websockets.exceptions.ConnectionClosed:
@@ -2974,7 +3364,7 @@ async def run_test(
                     terminal_received.set()
                     print(f"\nConnection lost at chunk {idx} "
                           f"({idx * CHUNK_DURATION:.1f}s)")
-                    break
+                    return False
 
                 result.client_events.append(TimingEvent(
                     source="client",
@@ -2986,8 +3376,6 @@ async def run_test(
                 ))
 
                 chunks_sent = idx + 1
-                offset += CHUNK_BYTES
-                idx += 1
 
                 # Progress reporting (every 1s)
                 now = time.monotonic()
@@ -3009,18 +3397,15 @@ async def run_test(
                         end="", flush=True,
                     )
                     last_print_time = now
+                return True
 
-                # Self-correcting timer: sleep until next chunk boundary
-                expected = loop_start + idx * CHUNK_DURATION
-                sleep_for = expected - time.monotonic()
-                if sleep_for > 0:
-                    try:
-                        await asyncio.wait_for(
-                            stream_abort.wait(),
-                            timeout=sleep_for,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
+            await _send_pcm_chunks_at_end_boundaries(
+                pcm_bytes,
+                stream_abort,
+                send_chunk,
+                on_sample_zero=record_sample_zero,
+                on_successful_send=record_successful_send,
+            )
 
         # -- Receive task ---------------------------------------------------
         async def receive_audio():
@@ -3649,6 +4034,8 @@ def generate_summary(result: TestResult, output_path: str):
         "translation_completed": result.translation_completed,
         "server_error": result.server_error,
     }
+    if result.input_pacing is not None:
+        summary["input_pacing"] = result.input_pacing
     with open(output_path, "w") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")

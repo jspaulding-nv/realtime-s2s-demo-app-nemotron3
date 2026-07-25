@@ -36,11 +36,13 @@ from batch_latency_test import (
     LONG_FORM_FILES,
     PREFLIGHT_FILE,
     TestResult,
+    TimingEvent,
     generate_csv,
     generate_plot,
     generate_summary,
     run_test,
     validate_capture_result,
+    validate_input_pacing_evidence,
 )
 
 
@@ -645,6 +647,7 @@ def _validate_saved_audio_metadata_observation(
         input_sample_zero_timestamp_ms=observation.get(
             "input_sample_zero_timestamp_ms"
         ),
+        input_pacing=summary.get("input_pacing"),
         audio_metadata_paired_frames=observation.get("paired_frames"),
         audio_metadata_completed_parents=observation.get(
             "completed_parents"
@@ -668,7 +671,10 @@ def _validate_saved_audio_metadata_observation(
         server_error=summary.get("server_error", ""),
     )
     try:
-        errors = validate_capture_result(result)
+        errors = validate_capture_result(
+            result,
+            require_pacing_chunk_events=False,
+        )
     except (TypeError, ValueError) as exc:
         return False, f"audio metadata capture validation failed: {exc}"
     if errors:
@@ -828,11 +834,26 @@ def validate_artifact_set(
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         sent_count = 0
+        sent_events: list[TimingEvent] = []
         received_count = 0
         received_bytes = 0
+        observation = summary.get("audio_metadata_observation")
+        protocol_v1 = (
+            isinstance(observation, dict)
+            and observation.get("protocol_version")
+            == AUDIO_METADATA_PROTOCOL_VERSION
+        )
         with csv_path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             required = {"source", "stage", "audio_bytes"}
+            if protocol_v1:
+                required.update(
+                    {
+                        "timestamp_ms",
+                        "chunk_index",
+                        "source_position_sec",
+                    }
+                )
             missing = required.difference(reader.fieldnames or ())
             if missing:
                 return False, (
@@ -843,6 +864,19 @@ def validate_artifact_set(
                     continue
                 if row["stage"] == "chunk_sent":
                     sent_count += 1
+                    if protocol_v1:
+                        sent_events.append(
+                            TimingEvent(
+                                source="client",
+                                stage="chunk_sent",
+                                timestamp_ms=float(row["timestamp_ms"]),
+                                chunk_index=int(row["chunk_index"]),
+                                source_position_sec=float(
+                                    row["source_position_sec"]
+                                ),
+                                audio_bytes=int(row["audio_bytes"]),
+                            )
+                        )
                 elif row["stage"] == "audio_received":
                     received_count += 1
                     received_bytes += int(row["audio_bytes"])
@@ -862,6 +896,32 @@ def validate_artifact_set(
         if observed != recorded:
             return False, (
                 f"CSV/summary {field} mismatch: CSV={observed}, summary={recorded}"
+            )
+
+    if protocol_v1:
+        pacing_result = TestResult(
+            audio_path=str(summary.get("audio_path", "")),
+            duration_sec=float(summary.get("input_duration_sec", 0)),
+            audio_metadata_protocol_version=(
+                AUDIO_METADATA_PROTOCOL_VERSION
+            ),
+            input_sample_zero_timestamp_ms=observation.get(
+                "input_sample_zero_timestamp_ms"
+            ),
+            input_pacing=summary.get("input_pacing"),
+            chunks_sent=sent_count,
+            client_events=sent_events,
+        )
+        pacing_errors = validate_input_pacing_evidence(
+            pacing_result,
+            require_chunk_events=True,
+            # generate_csv serializes client timestamps to 0.01 ms.
+            timing_tolerance_ms=0.011,
+        )
+        if pacing_errors:
+            return False, (
+                "input pacing CSV/summary validation failed: "
+                + "; ".join(pacing_errors)
             )
 
     if expected_hashes:

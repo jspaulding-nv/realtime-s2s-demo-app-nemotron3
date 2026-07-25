@@ -687,6 +687,151 @@ describe('TestDashboard', () => {
     expect(screen.getByText('New Test')).toBeInTheDocument();
   });
 
+  it('does not advance the timing ledger when an audio send is rejected', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    let emitChunk: Parameters<typeof useFileAudioSource>[0]['onChunk']
+      | undefined;
+    const stopStreaming = vi.fn();
+    const disconnect = vi.fn();
+
+    vi.mocked(useFileAudioSource).mockImplementation((options) => {
+      emitChunk = options.onChunk;
+      return {
+        isLoaded: true,
+        isStreaming: false,
+        duration: 60,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming: vi.fn(),
+        stopStreaming,
+      };
+    });
+    vi.mocked(useWebSocket).mockReturnValue({
+      isConnected: false,
+      status: 'connected',
+      sendMessage: vi.fn(),
+      sendAudio: vi.fn(() => false),
+      connect: vi.fn(),
+      disconnect,
+    });
+
+    render(<TestDashboard />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    await act(async () => {
+      emitChunk?.(new ArrayBuffer(4), {
+        chunkIndex: 0,
+        sampleRateHz: 16000,
+        sourceSampleStart: 0,
+        sourceSampleEndExclusive: 2,
+        inputPcmSha256: 'a'.repeat(64),
+        inputPcmSampleCount: 2,
+        emittedAtMs: 300,
+        inputSampleZeroClientMs: 0,
+      });
+      await Promise.resolve();
+    });
+
+    expect(mockLogChunkSent).not.toHaveBeenCalled();
+    expect(mockQueueAudio).not.toHaveBeenCalled();
+    expect(stopStreaming).toHaveBeenCalledTimes(1);
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Test failed: Audio capture stopped because a chunk could not be sent.',
+    );
+  });
+
+  it('finishes cleanup once when audio and stop-control sends both fail', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(
+      () => undefined,
+    );
+    try {
+      const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+      const { useWebSocket } = await import('../hooks/useWebSocket');
+      let emitChunk: Parameters<typeof useFileAudioSource>[0]['onChunk']
+        | undefined;
+      let notifyError: ((message: string) => void) | undefined;
+      const stopStreaming = vi.fn();
+      const disconnect = vi.fn();
+      const sendMessage = vi.fn(() => {
+        throw new Error('same socket rejected control');
+      });
+      const sendAudio = vi.fn(() => {
+        notifyError?.('Audio chunk send failed: transport rejected frame');
+        return false;
+      });
+
+      vi.mocked(useFileAudioSource).mockImplementation((options) => {
+        emitChunk = options.onChunk;
+        return {
+          isLoaded: true,
+          isStreaming: false,
+          duration: 60,
+          position: 0,
+          loadFile: vi.fn(),
+          startStreaming: vi.fn(),
+          stopStreaming,
+        };
+      });
+      vi.mocked(useWebSocket).mockImplementation((options) => {
+        notifyError = options.onError;
+        return {
+          isConnected: false,
+          status: 'connected',
+          sendMessage,
+          sendAudio,
+          connect: vi.fn(),
+          disconnect,
+        };
+      });
+
+      render(<TestDashboard />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Start Test'));
+      });
+      const observation = {
+        chunkIndex: 0,
+        sampleRateHz: 16000,
+        sourceSampleStart: 0,
+        sourceSampleEndExclusive: 2,
+        inputPcmSha256: 'a'.repeat(64),
+        inputPcmSampleCount: 2,
+        emittedAtMs: 300,
+        inputSampleZeroClientMs: 0,
+      };
+      await act(async () => {
+        emitChunk?.(new ArrayBuffer(4), observation);
+        // Model one already-queued callback arriving after stopStreaming.
+        emitChunk?.(new ArrayBuffer(4), observation);
+        await Promise.resolve();
+      });
+
+      expect(sendAudio).toHaveBeenCalledTimes(2);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledWith({ type: 'stop_stream' });
+      expect(stopStreaming).toHaveBeenCalledTimes(1);
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      expect(mockPlaybackStop).toHaveBeenCalledTimes(2);
+      expect(mockLogChunkSent).not.toHaveBeenCalled();
+      expect(
+        mockFetch.mock.calls.filter(
+          ([input]) => String(input) === '/api/test/stop',
+        ),
+      ).toHaveLength(1);
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Test failed: Audio chunk send failed: transport rejected frame',
+      );
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringMatching(/stop_stream control failed during cleanup/),
+        expect.any(Error),
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it('cancels delayed file input when metadata negotiation fails', async () => {
     vi.useFakeTimers();
     try {

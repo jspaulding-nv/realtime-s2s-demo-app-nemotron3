@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FileAudioChunkObservation } from '../types/timing';
+import { sha256Hex } from '../utils/sha256';
 
 export interface UseFileAudioSourceOptions {
   sampleRate?: number;
@@ -32,10 +33,13 @@ export function useFileAudioSource({
   const [duration, setDuration] = useState(0);
   const [position, setPosition] = useState(0);
 
-  const audioBufferRef = useRef<AudioBuffer | null>(null);
+  const pcmBufferRef = useRef<Int16Array | null>(null);
+  const inputPcmSha256Ref = useRef<string | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chunkIndexRef = useRef(0);
   const isStreamingRef = useRef(false);
+  const streamRunRef = useRef(0);
+  const loadRunRef = useRef(0);
 
   const onChunkRef = useRef(onChunk);
   const onCompleteRef = useRef(onComplete);
@@ -46,6 +50,22 @@ export function useFileAudioSource({
   }, [onChunk, onComplete]);
 
   const loadFile = useCallback(async (file: File) => {
+    const loadId = loadRunRef.current + 1;
+    loadRunRef.current = loadId;
+    streamRunRef.current += 1;
+    isStreamingRef.current = false;
+    if (timeoutRef.current !== null) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    pcmBufferRef.current = null;
+    inputPcmSha256Ref.current = null;
+    chunkIndexRef.current = 0;
+    setIsLoaded(false);
+    setIsStreaming(false);
+    setDuration(0);
+    setPosition(0);
+
     const arrayBuffer = await file.arrayBuffer();
 
     // Use OfflineAudioContext to decode and resample to target sample rate
@@ -65,81 +85,133 @@ export function useFileAudioSource({
     source.start();
     const resampled = await offlineCtx.startRendering();
 
-    audioBufferRef.current = resampled;
+    // Construct the complete wire image once, including the zero padding in
+    // the final frame. The digest and every transmitted chunk are derived
+    // from this same immutable Int16 PCM buffer.
+    const sourceSamples = resampled.getChannelData(0);
+    const totalChunks = Math.ceil(sourceSamples.length / chunkSize);
+    const totalPaddedSamples = totalChunks * chunkSize;
+    const pcmBuffer = new Int16Array(totalPaddedSamples);
+    for (let i = 0; i < sourceSamples.length; i++) {
+      const sample = Math.max(-1, Math.min(1, sourceSamples[i]));
+      pcmBuffer[i] = sample < 0 ? sample * 32768 : sample * 32767;
+    }
+    const inputPcmSha256 = await sha256Hex(pcmBuffer.buffer);
+
+    if (loadRunRef.current !== loadId) return;
+    pcmBufferRef.current = pcmBuffer;
+    inputPcmSha256Ref.current = inputPcmSha256;
     setDuration(resampled.duration);
     setPosition(0);
     chunkIndexRef.current = 0;
     setIsLoaded(true);
-  }, [sampleRate]);
+  }, [chunkSize, sampleRate]);
 
   const startStreaming = useCallback(() => {
-    if (!audioBufferRef.current) return;
+    if (!pcmBufferRef.current || !inputPcmSha256Ref.current) return;
 
-    const buffer = audioBufferRef.current;
-    const channelData = buffer.getChannelData(0);
-    const totalChunks = Math.ceil(channelData.length / chunkSize);
+    const pcmBuffer = pcmBufferRef.current;
+    const inputPcmSha256 = inputPcmSha256Ref.current;
+    const totalPaddedSamples = pcmBuffer.length;
+    const totalChunks = totalPaddedSamples / chunkSize;
+    const inputSampleZeroClientMs = performance.now();
+    const runId = streamRunRef.current + 1;
 
+    streamRunRef.current = runId;
+    if (timeoutRef.current !== null) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
     chunkIndexRef.current = 0;
     isStreamingRef.current = true;
     setIsStreaming(true);
     setPosition(0);
 
-    const chunkIntervalMs = (chunkSize / sampleRate) * 1000; // 300ms
-    let expectedTime = performance.now() + chunkIntervalMs;
-    let inputSampleZeroClientMs: number | null = null;
+    function isCurrentRun() {
+      return (
+        isStreamingRef.current
+        && streamRunRef.current === runId
+      );
+    }
 
     function sendNext() {
-      if (!isStreamingRef.current) return;
+      timeoutRef.current = null;
+      if (!isCurrentRun()) return;
 
       const idx = chunkIndexRef.current;
       if (idx >= totalChunks) {
-        // File finished
         isStreamingRef.current = false;
         setIsStreaming(false);
         onCompleteRef.current?.();
         return;
       }
 
-      // Extract chunk and convert Float32 -> Int16
       const start = idx * chunkSize;
-      const end = Math.min(start + chunkSize, channelData.length);
-      const int16Array = new Int16Array(chunkSize);
+      const end = start + chunkSize;
+      // The transmitted frame is zero-padded to chunkSize, so its source-end
+      // deadline follows the padded sample ledger rather than the file length.
+      const sourceSampleEndExclusive = start + chunkSize;
+      const sourceEndBoundaryClientMs = (
+        inputSampleZeroClientMs
+        + (sourceSampleEndExclusive / sampleRate) * 1000
+      );
+      const now = performance.now();
 
-      for (let i = 0; i < end - start; i++) {
-        const sample = Math.max(-1, Math.min(1, channelData[start + i]));
-        int16Array[i] = sample < 0 ? sample * 32768 : sample * 32767;
+      // Schedule against the absolute source timeline. Re-check the deadline
+      // in case a browser timer fires fractionally early.
+      if (now < sourceEndBoundaryClientMs) {
+        timeoutRef.current = setTimeout(
+          sendNext,
+          sourceEndBoundaryClientMs - now,
+        );
+        return;
       }
-      // Zero-pad if last chunk is shorter (already zeros from Int16Array constructor)
+
+      // Copy the exact byte range from the already hashed wire image.
+      const chunk = pcmBuffer.buffer.slice(
+        start * Int16Array.BYTES_PER_ELEMENT,
+        end * Int16Array.BYTES_PER_ELEMENT,
+      ) as ArrayBuffer;
 
       const emittedAtMs = performance.now();
-      if (inputSampleZeroClientMs === null) {
-        inputSampleZeroClientMs = emittedAtMs;
-      }
-      onChunkRef.current(int16Array.buffer, {
+      onChunkRef.current(chunk, {
         chunkIndex: idx,
         sampleRateHz: sampleRate,
         sourceSampleStart: start,
         // The server processes the padded PCM frame, so this ledger follows
         // transmitted samples rather than only non-padding file samples.
-        sourceSampleEndExclusive: start + chunkSize,
+        sourceSampleEndExclusive,
+        inputPcmSha256,
+        inputPcmSampleCount: totalPaddedSamples,
         emittedAtMs,
         inputSampleZeroClientMs,
       });
 
+      if (!isCurrentRun()) return;
+
       chunkIndexRef.current = idx + 1;
       setPosition((idx + 1) * chunkSize / sampleRate);
 
-      // Self-correcting timer
-      const drift = performance.now() - expectedTime;
-      expectedTime += chunkIntervalMs;
-      timeoutRef.current = setTimeout(sendNext, Math.max(0, chunkIntervalMs - drift));
+      if (chunkIndexRef.current >= totalChunks) {
+        // Completion belongs to the transmission of the final padded frame;
+        // it does not require one more chunk interval or timer callback.
+        isStreamingRef.current = false;
+        setIsStreaming(false);
+        onCompleteRef.current?.();
+        return;
+      }
+
+      // Each call computes its next absolute source-end deadline, so late
+      // callbacks do not permanently shift the rest of the stream.
+      sendNext();
     }
 
-    // Send first chunk immediately
+    // The first chunk is sent at its source-end boundary (300 ms by default).
     sendNext();
   }, [chunkSize, sampleRate]);
 
   const stopStreaming = useCallback(() => {
+    streamRunRef.current += 1;
     isStreamingRef.current = false;
     setIsStreaming(false);
     if (timeoutRef.current !== null) {

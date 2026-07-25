@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
+import { createHash } from 'node:crypto';
 import { useFileAudioSource } from '../hooks/useFileAudioSource';
 
 // Mock AudioBuffer that works in jsdom
@@ -53,6 +54,13 @@ function setupMockOfflineAudioContext(sampleRate: number, length: number) {
   return mockBuffer;
 }
 
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 describe('useFileAudioSource', () => {
   let onChunk: ReturnType<typeof vi.fn>;
   let onComplete: ReturnType<typeof vi.fn>;
@@ -61,12 +69,31 @@ describe('useFileAudioSource', () => {
     onChunk = vi.fn();
     onComplete = vi.fn();
     vi.useFakeTimers();
+    vi.stubGlobal('crypto', {
+      subtle: {
+        digest: vi.fn(async (
+          _algorithm: string,
+          data: BufferSource,
+        ) => {
+          const bytes = ArrayBuffer.isView(data)
+            ? new Uint8Array(
+              data.buffer,
+              data.byteOffset,
+              data.byteLength,
+            )
+            : new Uint8Array(data);
+          const digest = createHash('sha256').update(bytes).digest();
+          return Uint8Array.from(digest).buffer;
+        }),
+      },
+    });
     setupMockOfflineAudioContext(16000, 16000); // 1 second of audio
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('starts with unloaded state', () => {
@@ -107,7 +134,11 @@ describe('useFileAudioSource', () => {
 
     act(() => result.current.startStreaming());
 
-    // First chunk sent immediately
+    // The first frame is held until its 300 ms source-end boundary.
+    expect(onChunk).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(299));
+    expect(onChunk).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
     expect(onChunk).toHaveBeenCalledTimes(1);
 
     // Each chunk: 4800 samples * 2 bytes/sample = 9600 bytes
@@ -118,10 +149,41 @@ describe('useFileAudioSource', () => {
       sampleRateHz: 16000,
       sourceSampleStart: 0,
       sourceSampleEndExclusive: 4800,
+      inputPcmSampleCount: 19200,
     });
-    expect(onChunk.mock.calls[0][1].inputSampleZeroClientMs).toBe(
-      onChunk.mock.calls[0][1].emittedAtMs,
+    expect(onChunk.mock.calls[0][1].inputPcmSha256).toMatch(
+      /^[0-9a-f]{64}$/,
     );
+    expect(
+      onChunk.mock.calls[0][1].emittedAtMs
+      - onChunk.mock.calls[0][1].inputSampleZeroClientMs,
+    ).toBe(300);
+  });
+
+  it('paces chunks at exact absolute source-end boundaries', async () => {
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+
+    const mockFile = createMockFile('test.wav');
+    await act(async () => {
+      await result.current.loadFile(mockFile);
+    });
+
+    act(() => result.current.startStreaming());
+    expect(onChunk).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(300));
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    const first = onChunk.mock.calls[0][1];
+    expect(first.emittedAtMs - first.inputSampleZeroClientMs).toBe(300);
+
+    act(() => vi.advanceTimersByTime(299));
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    act(() => vi.advanceTimersByTime(1));
+    expect(onChunk).toHaveBeenCalledTimes(2);
+    const second = onChunk.mock.calls[1][1];
+    expect(second.emittedAtMs - second.inputSampleZeroClientMs).toBe(600);
   });
 
   it('emits a contiguous transmitted-sample ledger with a stable anchor', async () => {
@@ -143,9 +205,136 @@ describe('useFileAudioSource', () => {
       sampleRateHz: 16000,
       sourceSampleStart: 4800,
       sourceSampleEndExclusive: 9600,
+      inputPcmSha256: first.inputPcmSha256,
+      inputPcmSampleCount: 19200,
       inputSampleZeroClientMs: first.inputSampleZeroClientMs,
     });
-    expect(second.emittedAtMs).toBeGreaterThanOrEqual(first.emittedAtMs);
+    expect(first.emittedAtMs - first.inputSampleZeroClientMs).toBe(300);
+    expect(second.emittedAtMs - first.inputSampleZeroClientMs).toBe(600);
+  });
+
+  it('hashes the exact padded PCM bytes transmitted by every chunk', async () => {
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+    await act(async () => {
+      await result.current.loadFile(createMockFile('test.wav'));
+    });
+
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(1200));
+
+    const chunks = onChunk.mock.calls.map(
+      (call) => new Uint8Array(call[0] as ArrayBuffer),
+    );
+    const transmitted = new Uint8Array(
+      chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+    );
+    let offset = 0;
+    for (const chunk of chunks) {
+      transmitted.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const expectedDigest = await sha256Hex(transmitted.buffer);
+    const observations = onChunk.mock.calls.map((call) => call[1]);
+
+    expect(chunks).toHaveLength(4);
+    expect(transmitted.byteLength).toBe(19200 * 2);
+    expect(
+      Array.from(new Int16Array(transmitted.buffer).slice(16000)),
+    ).toEqual(Array(3200).fill(0));
+    expect(
+      new Set(observations.map((item) => item.inputPcmSha256)),
+    ).toEqual(new Set([expectedDigest]));
+    expect(
+      new Set(observations.map((item) => item.inputPcmSampleCount)),
+    ).toEqual(new Set([19200]));
+  });
+
+  it('hashes the exact transmitted PCM without Web Crypto on plain HTTP', async () => {
+    vi.stubGlobal('crypto', {});
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+    await act(async () => {
+      await result.current.loadFile(createMockFile('plain-http.wav'));
+    });
+
+    expect(result.current.isLoaded).toBe(true);
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(1200));
+
+    const transmitted = new Uint8Array(19200 * Int16Array.BYTES_PER_ELEMENT);
+    let offset = 0;
+    for (const [chunk] of onChunk.mock.calls) {
+      const chunkBytes = new Uint8Array(chunk as ArrayBuffer);
+      transmitted.set(chunkBytes, offset);
+      offset += chunkBytes.byteLength;
+    }
+    const expectedDigest = createHash('sha256')
+      .update(transmitted)
+      .digest('hex');
+
+    expect(onChunk).toHaveBeenCalledTimes(4);
+    expect(offset).toBe(transmitted.byteLength);
+    expect(
+      new Set(onChunk.mock.calls.map((call) => call[1].inputPcmSha256)),
+    ).toEqual(new Set([expectedDigest]));
+  });
+
+  it('changes the digest when the exact input PCM changes', async () => {
+    const firstBuffer = setupMockOfflineAudioContext(16000, 16000);
+    firstBuffer.getChannelData()[0] = 0.25;
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+    await act(async () => {
+      await result.current.loadFile(createMockFile('a.wav'));
+    });
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(300));
+    const firstDigest = onChunk.mock.calls[0][1].inputPcmSha256;
+
+    act(() => result.current.stopStreaming());
+    onChunk.mockClear();
+    const secondBuffer = setupMockOfflineAudioContext(16000, 16000);
+    secondBuffer.getChannelData()[0] = -0.25;
+    await act(async () => {
+      await result.current.loadFile(createMockFile('b.wav'));
+    });
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(300));
+
+    expect(onChunk.mock.calls[0][1].inputPcmSha256).not.toBe(firstDigest);
+  });
+
+  it('invalidates a prior PCM image before a replacement load fails', async () => {
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+    await act(async () => {
+      await result.current.loadFile(createMockFile('good.wav'));
+    });
+    expect(result.current.isLoaded).toBe(true);
+
+    const failedFile = createMockFile('failed.wav');
+    Object.defineProperty(failedFile, 'arrayBuffer', {
+      value: vi.fn().mockRejectedValue(new Error('decode input unavailable')),
+    });
+    let failure: unknown;
+    await act(async () => {
+      try {
+        await result.current.loadFile(failedFile);
+      } catch (error) {
+        failure = error;
+      }
+    });
+
+    expect(failure).toEqual(new Error('decode input unavailable'));
+    expect(result.current.isLoaded).toBe(false);
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(1200));
+    expect(onChunk).not.toHaveBeenCalled();
   });
 
   it('converts Float32 to Int16 correctly', async () => {
@@ -159,6 +348,7 @@ describe('useFileAudioSource', () => {
     });
 
     act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(300));
 
     const firstChunk = onChunk.mock.calls[0][0] as ArrayBuffer;
     const int16View = new Int16Array(firstChunk);
@@ -189,6 +379,7 @@ describe('useFileAudioSource', () => {
 
     act(() => result.current.startStreaming());
     expect(result.current.isStreaming).toBe(true);
+    expect(onChunk).not.toHaveBeenCalled();
 
     const chunksBeforeStop = onChunk.mock.calls.length;
 
@@ -198,9 +389,10 @@ describe('useFileAudioSource', () => {
     // Advance time — no more chunks should be sent
     act(() => vi.advanceTimersByTime(1000));
     expect(onChunk.mock.calls.length).toBe(chunksBeforeStop);
+    expect(onComplete).not.toHaveBeenCalled();
   });
 
-  it('calls onComplete when file finishes streaming', async () => {
+  it('completes immediately after transmitting the final padded chunk', async () => {
     const { result } = renderHook(() =>
       useFileAudioSource({ onChunk, onComplete }),
     );
@@ -213,12 +405,15 @@ describe('useFileAudioSource', () => {
     act(() => result.current.startStreaming());
 
     // 16000 samples / 4800 per chunk = 3.33 -> 4 chunks
-    // First chunk sent immediately, remaining need timer advancement
-    for (let i = 0; i < 5; i++) {
-      act(() => vi.advanceTimersByTime(300));
-    }
-
+    // The padded final frame ends at sample 19200, or 1200 ms.
+    act(() => vi.advanceTimersByTime(1199));
+    expect(onChunk).toHaveBeenCalledTimes(3);
+    expect(onComplete).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(onChunk).toHaveBeenCalledTimes(4);
     expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(result.current.isStreaming).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('updates position as streaming progresses', async () => {
@@ -237,13 +432,13 @@ describe('useFileAudioSource', () => {
     expect(result.current.position).toBe(0);
 
     act(() => result.current.startStreaming());
+    expect(result.current.position).toBe(0);
 
-    // After first chunk: position = 0.3s (4800/16000)
+    // After the first source-end boundary: position = 0.3s.
+    act(() => vi.advanceTimersByTime(300));
     expect(result.current.position).toBeCloseTo(0.3, 1);
 
-    // Self-correcting timer: first chunk fires at T, expected was T+300,
-    // so drift = -300, next fires at T+600. Advance enough to trigger it.
-    act(() => vi.advanceTimersByTime(600));
+    act(() => vi.advanceTimersByTime(300));
     expect(result.current.position).toBeCloseTo(0.6, 1);
   });
 });

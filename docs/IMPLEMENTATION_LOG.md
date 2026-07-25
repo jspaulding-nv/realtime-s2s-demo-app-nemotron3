@@ -1072,6 +1072,68 @@ translated audio and skipped one parent, yet it still peaked at 11.317 seconds.
 Loss remains disabled. See
 [Audio metadata protocol v1: 60-second formal canary](AUDIO_METADATA_60S_CANARY_2026-07-25.md).
 
+## July 25, 2026: semantic source-event parent-envelope gate
+
+The first semantic-event gate is now implemented without changing audio
+metadata protocol v1. A private exact-schema sidecar binds anonymous
+`event-NNN` markers at exact source PCM samples to both the SHA-256 of one Test
+Dashboard CSV and the SHA-256 plus padded sample count of the exact Int16 wire
+image. The browser constructs, hashes, and streams from that same immutable
+PCM buffer. At least two independent reviewers are required by default. The
+public analyzer output contains only hashes, anonymous IDs, numeric
+identity/timing, counts, and explicit claim booleans; it excludes transcript,
+translation, filenames, paths, free text, and ignored CSV columns.
+
+The browser and CLI real-time file senders now anchor source sample zero before
+their first wait and release each complete PCM chunk at its absolute source-end
+deadline. The first two default chunks therefore transmit at 300 and 600 ms,
+not at 0 and approximately 600 ms. Timer lateness remains measured, the final
+chunk completes without an extra interval, and stop/restart invalidates stale
+timers. Protocol-v1 summaries record the privacy-safe monotonic sample-zero
+anchor, fixed absolute-deadline formula, successful chunk count, and measured
+minimum/maximum emission-minus-deadline margins. Live validation recomputes
+those margins from the client event ledger; resumed long-form validation
+replays the serialized CSV against the summary and rejects missing, malformed,
+early, or inconsistent evidence. The playback-tail fallback now treats a
+proven chunk-end send timestamp as that chunk's end while preserving the
+historical add-duration rule for legacy or provenance-free traces. Older
+start-boundary-paced captures are not formal gate evidence.
+
+`analyze_semantic_event_latency.py` independently reconciles the capture hash,
+marker schema, reviewer count, contiguous input ledger, chunk-end pacing,
+exact PCM digest/count, protocol version/generation, attributed source ranges,
+parent/frame identity, bytes, receipt/completion timing, AudioContext
+projection, 16-kHz mono Int16 duration, global wire order, and non-overlapping
+projected playback chronology. It allows different source markers within one
+ASR final while assigning their shared conservative parent envelope a
+deterministic anonymous group ID. Marker counts and unique candidate-group
+counts are reported separately so repeated markers are not presented as
+independent trials. Duplicate source samples, incomplete evidence, end-only
+offsets, overlapping or backward-moving distinct ranges, or impossible
+timelines fail the complete analysis.
+
+For an explicitly supplied SLA, the result is PASS only when the complete
+candidate parent envelope projects to finish by the limit, FAIL when even its
+first projected frame starts after the limit, and INCONCLUSIVE when the
+unknown target landmark could fall on either side. This does not identify the
+Spanish landmark or prove physical audibility. A target-sample annotation,
+common-clock digital loopback, and ultimately a two-channel physical recording
+remain higher evidence tiers. CLI exit codes distinguish PASS (`0`), FAIL
+(`1`), invalid arguments/evidence or report-output I/O failure (`2`), and
+INCONCLUSIVE (`3`) for automation. Multi-report output is staged before
+installation and rolled back as a set on expected installation failures.
+
+Review found and closed an initial false-PASS path that trusted projected
+schedule fields without independently reconciling their source-boundary and
+AudioContext clocks. Later review also closed missing source-PCM binding,
+self-declared-only CLI pacing provenance, automation exit-status, partial-tail
+fallback, and repeated-parent-counting ambiguities. The final validation passed
+408 root Python tests with one optional test skipped, 418 backend tests, and
+146 frontend tests. Frontend lint/build, Python compilation, shell syntax,
+Compose configuration, and whitespace checks also passed. No live semantic
+marker result is claimed yet. See
+[Semantic source-event latency gate](SEMANTIC_EVENT_LATENCY_GATE.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1095,6 +1157,8 @@ Loss remains disabled. See
 - [x] Simulate 5/8/10-second whole-parent freshness/loss tradeoffs on schema 3
 - [x] Add opt-in parent/frame wire metadata and observation-only browser telemetry
 - [x] Pass a 60-second matched live canary with protocol-v1 evidence
+- [x] Implement chunk-end-paced semantic source-event parent-envelope analysis
+- [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
 - [ ] Run protocol v1 across all three long-form samples
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model

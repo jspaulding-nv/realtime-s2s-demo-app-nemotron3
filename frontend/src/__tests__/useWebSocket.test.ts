@@ -17,6 +17,7 @@ class MockWebSocket {
   binaryType: BinaryType = 'blob';
   readyState = MockWebSocket.CONNECTING;
   sent: Array<string | ArrayBufferLike | Blob | ArrayBufferView> = [];
+  sendError: unknown = null;
   onopen: ((event: Event) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
@@ -28,6 +29,9 @@ class MockWebSocket {
   }
 
   send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+    if (this.sendError !== null) {
+      throw this.sendError;
+    }
     this.sent.push(data);
   }
 
@@ -134,6 +138,83 @@ describe('useWebSocket audio metadata protocol', () => {
 
     expect(onAudio).toHaveBeenCalledOnce();
     expect(onAudio).toHaveBeenCalledWith(audio);
+    unmount();
+  });
+
+  it('reports whether an audio frame was accepted by an open socket', () => {
+    const onError = vi.fn();
+    const { result, unmount } = renderHook(() => useWebSocket({
+      url: 'ws://example.test/ws/translate',
+      onError,
+    }));
+    const audio = new ArrayBuffer(4);
+    let accepted = true;
+
+    act(() => {
+      accepted = result.current.sendAudio(audio);
+    });
+
+    expect(accepted).toBe(false);
+    expect(onError).toHaveBeenCalledWith(
+      expect.stringMatching(/WebSocket is not open/),
+    );
+    expect(result.current.status).toBe('error');
+
+    const socket = connect(result);
+    onError.mockClear();
+    act(() => {
+      accepted = result.current.sendAudio(audio);
+    });
+
+    expect(accepted).toBe(true);
+    expect(socket.sent).toContain(audio);
+    expect(onError).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it('returns false and reports a synchronous WebSocket send failure', () => {
+    const onError = vi.fn();
+    const { result, unmount } = renderHook(() => useWebSocket({
+      url: 'ws://example.test/ws/translate',
+      onError,
+    }));
+    const socket = connect(result);
+    socket.sendError = new Error('transport rejected frame');
+    let accepted = true;
+
+    act(() => {
+      accepted = result.current.sendAudio(new ArrayBuffer(4));
+    });
+
+    expect(accepted).toBe(false);
+    expect(onError).toHaveBeenCalledWith(
+      'Audio chunk send failed: transport rejected frame',
+    );
+    expect(result.current.status).toBe('error');
+    unmount();
+  });
+
+  it('returns false instead of throwing when a control send fails', () => {
+    const onError = vi.fn();
+    const { result, unmount } = renderHook(() => useWebSocket({
+      url: 'ws://example.test/ws/translate',
+      onError,
+    }));
+    const socket = connect(result);
+    socket.sendError = new Error('transport rejected control');
+    let accepted = true;
+
+    expect(() => {
+      act(() => {
+        accepted = result.current.sendMessage({ type: 'stop_stream' });
+      });
+    }).not.toThrow();
+
+    expect(accepted).toBe(false);
+    expect(onError).toHaveBeenCalledWith(
+      'WebSocket stop_stream send failed: transport rejected control',
+    );
+    expect(result.current.status).toBe('error');
     unmount();
   });
 

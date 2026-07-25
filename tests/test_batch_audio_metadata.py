@@ -193,6 +193,26 @@ def test_run_test_negotiates_and_captures_observation_metadata(monkeypatch):
     assert result.audio_metadata_stream_generation == 1
     assert result.audio_metadata_paired_frames == 1
     assert result.audio_metadata_completed_parents == 1
+    assert result.input_pacing["mode"] == "chunk_end_boundary_v1"
+    assert result.input_pacing["chunk_duration_ms"] == 1.0
+    assert (
+        result.input_pacing["source_sample_zero_clock"]
+        == "client_monotonic"
+    )
+    assert result.input_pacing["deadline_basis"] == (
+        "source_sample_zero_plus_one_based_chunk_duration"
+    )
+    assert result.input_pacing["source_sample_zero_timestamp_ms"] == (
+        pytest.approx(result.input_sample_zero_timestamp_ms)
+    )
+    assert result.input_pacing["observed_chunk_count"] == 1
+    assert (
+        result.input_pacing["min_emission_minus_deadline_ms"]
+        == pytest.approx(
+            result.input_pacing["max_emission_minus_deadline_ms"]
+        )
+    )
+    assert result.input_pacing["min_emission_minus_deadline_ms"] >= 0
     assert result.source_end_to_receipt_availability == (
         "available_audio_processed_end_offset_not_semantic_boundary"
     )
@@ -208,8 +228,100 @@ def test_run_test_negotiates_and_captures_observation_metadata(monkeypatch):
     assert pcm_event["parentSequenceId"] == 0
     assert pcm_event["audioFrameId"] == 0
     assert pcm_event["sourceEndMs"] == 10.0
+    assert result.source_end_to_receipt_samples_ms[0] == pytest.approx(
+        pcm_event["timestamp_ms"]
+        - result.input_sample_zero_timestamp_ms
+        - pcm_event["sourceEndMs"]
+    )
     assert validate_audio_metadata_observation(result) == []
     assert validate_capture_result(result) == []
+
+
+def test_protocol_v1_validation_rejects_missing_or_wrong_input_pacing(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+        )
+    )
+    valid_pacing = dict(result.input_pacing)
+
+    result.input_pacing = None
+    assert (
+        "audio metadata capture requires input pacing provenance"
+        in validate_audio_metadata_observation(result)
+    )
+
+    result.input_pacing = dict(
+        valid_pacing,
+        mode="chunk_start_boundary",
+        source_sample_zero_clock="wall_clock",
+    )
+    errors = validate_audio_metadata_observation(result)
+    assert (
+        "audio metadata input pacing mode must be "
+        "'chunk_end_boundary_v1'"
+    ) in errors
+    assert (
+        "audio metadata input sample-zero clock must be "
+        "'client_monotonic'"
+    ) in errors
+
+    result.input_pacing = dict(valid_pacing, chunk_duration_ms=0.5)
+    assert (
+        "audio metadata input pacing chunk duration is invalid"
+        in validate_audio_metadata_observation(result)
+    )
+
+    result.input_pacing = dict(
+        valid_pacing,
+        observed_chunk_count=2,
+    )
+    assert (
+        "audio metadata input pacing observed chunk count does not "
+        "match chunks_sent"
+    ) in validate_audio_metadata_observation(result)
+
+    result.input_pacing = dict(
+        valid_pacing,
+        min_emission_minus_deadline_ms=-0.25,
+    )
+    assert (
+        "audio metadata input pacing contains an early chunk emission"
+    ) in validate_audio_metadata_observation(result)
+
+    result.input_pacing = dict(
+        valid_pacing,
+        max_emission_minus_deadline_ms=(
+            valid_pacing["max_emission_minus_deadline_ms"] + 1
+        ),
+    )
+    assert (
+        "audio metadata input pacing emission margins do not match "
+        "the client event ledger"
+    ) in validate_audio_metadata_observation(result)
+
+    result.input_pacing = valid_pacing
+    chunk_event = next(
+        event
+        for event in result.client_events
+        if event.stage == "chunk_sent"
+    )
+    chunk_event.timestamp_ms -= 2.0
+    errors = validate_audio_metadata_observation(result)
+    assert (
+        "audio metadata input pacing event ledger contains an early "
+        "chunk emission"
+    ) in errors
+    assert (
+        "audio metadata input pacing emission margins do not match "
+        "the client event ledger"
+    ) in errors
 
 
 def test_run_test_legacy_capture_does_not_record_v1_clock_anchor(monkeypatch):
@@ -228,6 +340,7 @@ def test_run_test_legacy_capture_does_not_record_v1_clock_anchor(monkeypatch):
         "targetLanguage": "es-US",
     }
     assert result.input_sample_zero_timestamp_ms is None
+    assert result.input_pacing is None
     assert result.audio_metadata_stream_generation is None
     assert result.audio_metadata_paired_frames == 0
     assert result.audio_metadata_completed_parents == 0

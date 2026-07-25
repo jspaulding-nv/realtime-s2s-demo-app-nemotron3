@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useAudioCapture } from '../hooks/useAudioCapture';
 import {
@@ -112,6 +112,8 @@ export function TranslationPanel() {
   const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>(
     INITIAL_PLAYBACK_STATUS,
   );
+  const stopSessionRef = useRef<() => void>(() => undefined);
+  const sessionActiveRef = useRef(false);
   // Audio playback hook
   const {
     queueAudio,
@@ -155,12 +157,38 @@ export function TranslationPanel() {
     sampleRate: AUDIO_CONFIG.sampleRate,
     chunkSize: AUDIO_CONFIG.chunkSize,
     onChunk: (chunk: ArrayBuffer) => {
-      sendAudio(chunk);
+      if (!sendAudio(chunk)) {
+        stopSessionRef.current();
+      }
     },
     onError: (error: string) => {
       dispatch({ type: 'SET_ERROR', message: error });
     },
   });
+
+  const stopTranslationSession = useCallback(() => {
+    if (!sessionActiveRef.current) return;
+    sessionActiveRef.current = false;
+
+    const metrics = getPlaybackMetrics();
+    // Preserve the final browser-side observation before stopPlayback closes
+    // the AudioContext and discards any remaining scheduled audio.
+    setPlaybackStatus(playbackStatusFromMetrics(metrics));
+    stopCapture();
+    stopPlayback();
+    try {
+      // Best effort: the audio failure may mean this control cannot travel
+      // over the same socket, but local teardown must still complete.
+      sendMessage({ type: 'stop_stream' });
+    } catch (error) {
+      console.error('Failed to send stop_stream during local teardown:', error);
+    }
+    setIsTranslating(false);
+  }, [getPlaybackMetrics, sendMessage, stopCapture, stopPlayback]);
+
+  useEffect(() => {
+    stopSessionRef.current = stopTranslationSession;
+  }, [stopTranslationSession]);
 
   // Fetch languages on mount
   useEffect(() => {
@@ -201,32 +229,27 @@ export function TranslationPanel() {
   // Handle start/stop translation
   const handleToggle = useCallback(async () => {
     if (isTranslating) {
-      // Stop translation
-      const metrics = getPlaybackMetrics();
-      // Preserve the final browser-side observation before stopPlayback closes
-      // the AudioContext and discards any remaining scheduled audio.
-      setPlaybackStatus(playbackStatusFromMetrics(metrics));
-      stopCapture();
-      stopPlayback();
-      sendMessage({ type: 'stop_stream' });
-      setIsTranslating(false);
+      stopTranslationSession();
     } else {
       // Start translation
       setPlaybackStatus(INITIAL_PLAYBACK_STATUS);
       setHasPlaybackSession(true);
+      sessionActiveRef.current = true;
       startPlayback();
       sendMessage({ type: 'start_stream', targetLanguage: state.targetLanguage });
       await startCapture();
-      setIsTranslating(true);
+      // A capture callback can fail synchronously while startCapture settles.
+      // Do not resurrect a session that its teardown already closed.
+      if (sessionActiveRef.current) {
+        setIsTranslating(true);
+      }
     }
   }, [
     isTranslating,
     startCapture,
-    stopCapture,
     startPlayback,
-    stopPlayback,
     sendMessage,
-    getPlaybackMetrics,
+    stopTranslationSession,
     state.targetLanguage,
   ]);
 
