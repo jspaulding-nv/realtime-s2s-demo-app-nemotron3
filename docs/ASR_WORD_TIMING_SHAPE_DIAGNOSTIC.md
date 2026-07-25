@@ -226,7 +226,9 @@ Expected local artifact path:
 experiment_results/asr-word-timing-shape-diagnostic-20260725.json
 ```
 
-No live result is claimed in this document.
+A completed registered replay and its transcript-free findings are documented
+in
+[ASR Word-Timing-Shape Diagnostic Result — 2026-07-25](ASR_WORD_TIMING_SHAPE_RESULT_2026-07-25.md).
 
 ## Interruption and stale-artifact behavior
 
@@ -277,3 +279,9 @@ Use the result to choose one reviewed next action:
    unchanged formal two-run qualification. A passing attribution gate enables
    the later semantic audience-latency measurement; it does not itself prove a
    5–10 second audience-delay target.
+
+The registered July 25 replay found ten zero-duration final envelopes and
+three finals with no word entries. It found no absent, unparseable, nonfinite,
+negative, numerically zero, or reversed supplied boundaries. Do not repeat the
+unchanged two-run gate until the ASR response contract or a supported
+remediation is understood.

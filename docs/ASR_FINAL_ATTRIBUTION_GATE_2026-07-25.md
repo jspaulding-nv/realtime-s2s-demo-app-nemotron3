@@ -13,12 +13,16 @@ This result blocks a formal semantic source-event browser gate. It does not
 measure transcription accuracy, translation quality, target-language
 audibility, or end-to-end audience latency by itself.
 
-The formal gate remains failed. The next registered action is one
-diagnostic-only real-time replay using the privacy-safe raw word-timing-shape
-instrumentation described in
+The formal gate remains failed. The registered diagnostic-only replay has now
+completed using the privacy-safe raw word-timing-shape instrumentation
+described in
 [ASR Word-Timing-Shape Diagnostic](ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md).
-That single replay is not qualification evidence and must complete before
-deciding whether the unchanged formal two-run gate should be rerun.
+It found ten zero-duration final envelopes and three finals with no word
+entries. The exact findings are in
+[ASR Word-Timing-Shape Diagnostic Result — 2026-07-25](ASR_WORD_TIMING_SHAPE_RESULT_2026-07-25.md).
+That single replay is not qualification evidence. Do not rerun the unchanged
+formal gate until the ASR timing contract or a supported remediation is
+understood.
 
 ## Registered configuration
 
@@ -112,14 +116,13 @@ arbitrary filename, endpoint string, or local container name.
    this ASR qualification. Exact source attribution is still incomplete.
 2. Provide the sanitized counts, repeated final IDs, model version/digest,
    profile hash, EOU, and report hash to the ASR service team. Ask whether
-   every nonempty final is expected to carry a complete positive-duration word-time
-   envelope when word offsets are requested.
-3. Run exactly one privacy-safe word-timing-shape diagnostic. It distinguishes
-   absent, unparseable, nonfinite, negative, zero-length, reversed, and valid
-   word entries without retaining token or transcript text. Proto3 scalar
-   zero is recorded with unobservable presence; it is not labeled missing.
-   Review that result before deciding whether another formal two-run
-   qualification is justified.
+   every nonempty final is expected to carry a complete positive-duration
+   word-time envelope when word offsets are requested.
+3. Review the completed privacy-safe word-timing-shape diagnostic with the ASR
+   service team. It reproduced the same 13 IDs: ten zero-duration envelopes
+   with positive numeric timestamps and three finals with no word entries.
+   Confirm whether word times are duration intervals or point-alignment
+   timestamps and obtain a supported treatment before changing the gate.
 4. Do not silently synthesize a missing source start from neighboring finals.
    Any conservative fallback must be separately specified, reviewed, and
    preregistered. A word-derived start plus an `audio_processed` end could
