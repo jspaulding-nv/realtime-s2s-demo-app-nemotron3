@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FileAudioChunkObservation } from '../types/timing';
 import { extractExactMonoPcm16Wav } from '../utils/pcmWav';
 import { sha256Hex } from '../utils/sha256';
+import type {
+  RenderedDigitalSourceClock,
+  RenderedDigitalSourceClockTick,
+} from '../types/renderedDigitalCapture';
 
 export interface UseFileAudioSourceOptions {
   sampleRate?: number;
@@ -11,6 +15,15 @@ export interface UseFileAudioSourceOptions {
     observation: FileAudioChunkObservation,
   ) => void;
   onComplete?: () => void;
+  onError?: (message: string) => void;
+}
+
+export interface LoadedFilePcmSnapshot {
+  pcm: ArrayBuffer;
+  sampleRateHz: number;
+  sampleCount: number;
+  pcmSha256: string;
+  sourceFileSha256: string;
 }
 
 export interface UseFileAudioSourceReturn {
@@ -19,8 +32,9 @@ export interface UseFileAudioSourceReturn {
   duration: number;
   position: number;
   loadFile: (file: File) => Promise<void>;
-  startStreaming: () => void;
+  startStreaming: (sourceClock?: RenderedDigitalSourceClock) => void;
   stopStreaming: () => void;
+  getLoadedPcmSnapshot?: () => LoadedFilePcmSnapshot | null;
 }
 
 export function useFileAudioSource({
@@ -28,15 +42,18 @@ export function useFileAudioSource({
   chunkSize = 4800,
   onChunk,
   onComplete,
+  onError,
 }: UseFileAudioSourceOptions): UseFileAudioSourceReturn {
   const [isLoaded, setIsLoaded] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [duration, setDuration] = useState(0);
   const [position, setPosition] = useState(0);
 
-  const pcmBufferRef = useRef<Int16Array | null>(null);
+  const pcmBufferRef = useRef<Int16Array<ArrayBuffer> | null>(null);
   const inputPcmSha256Ref = useRef<string | null>(null);
+  const sourceFileSha256Ref = useRef<string | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sourceClockUnsubscribeRef = useRef<(() => void) | null>(null);
   const chunkIndexRef = useRef(0);
   const isStreamingRef = useRef(false);
   const streamRunRef = useRef(0);
@@ -44,11 +61,13 @@ export function useFileAudioSource({
 
   const onChunkRef = useRef(onChunk);
   const onCompleteRef = useRef(onComplete);
+  const onErrorRef = useRef(onError);
 
   useEffect(() => {
     onChunkRef.current = onChunk;
     onCompleteRef.current = onComplete;
-  }, [onChunk, onComplete]);
+    onErrorRef.current = onError;
+  }, [onChunk, onComplete, onError]);
 
   const loadFile = useCallback(async (file: File) => {
     const loadId = loadRunRef.current + 1;
@@ -59,8 +78,11 @@ export function useFileAudioSource({
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
+    sourceClockUnsubscribeRef.current?.();
+    sourceClockUnsubscribeRef.current = null;
     pcmBufferRef.current = null;
     inputPcmSha256Ref.current = null;
+    sourceFileSha256Ref.current = null;
     chunkIndexRef.current = 0;
     setIsLoaded(false);
     setIsStreaming(false);
@@ -68,6 +90,7 @@ export function useFileAudioSource({
     setPosition(0);
 
     const arrayBuffer = await file.arrayBuffer();
+    const sourceFileSha256 = await sha256Hex(arrayBuffer);
     const exactPcm = extractExactMonoPcm16Wav(arrayBuffer, sampleRate);
     let sourceSampleCount: number;
     let sourceDuration: number;
@@ -118,20 +141,25 @@ export function useFileAudioSource({
     if (loadRunRef.current !== loadId) return;
     pcmBufferRef.current = pcmBuffer;
     inputPcmSha256Ref.current = inputPcmSha256;
+    sourceFileSha256Ref.current = sourceFileSha256;
     setDuration(sourceDuration);
     setPosition(0);
     chunkIndexRef.current = 0;
     setIsLoaded(true);
   }, [chunkSize, sampleRate]);
 
-  const startStreaming = useCallback(() => {
+  const startStreaming = useCallback((
+    sourceClock?: RenderedDigitalSourceClock,
+  ) => {
     if (!pcmBufferRef.current || !inputPcmSha256Ref.current) return;
 
     const pcmBuffer = pcmBufferRef.current;
     const inputPcmSha256 = inputPcmSha256Ref.current;
     const totalPaddedSamples = pcmBuffer.length;
     const totalChunks = totalPaddedSamples / chunkSize;
-    const inputSampleZeroClientMs = performance.now();
+    const inputSampleZeroClientMs = (
+      sourceClock?.sourceZeroClientMs ?? performance.now()
+    );
     const runId = streamRunRef.current + 1;
 
     streamRunRef.current = runId;
@@ -139,6 +167,8 @@ export function useFileAudioSource({
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
+    sourceClockUnsubscribeRef.current?.();
+    sourceClockUnsubscribeRef.current = null;
     chunkIndexRef.current = 0;
     isStreamingRef.current = true;
     setIsStreaming(true);
@@ -149,6 +179,106 @@ export function useFileAudioSource({
         isStreamingRef.current
         && streamRunRef.current === runId
       );
+    }
+
+    function finishRun() {
+      if (!isCurrentRun()) return;
+      sourceClockUnsubscribeRef.current?.();
+      sourceClockUnsubscribeRef.current = null;
+      isStreamingRef.current = false;
+      setIsStreaming(false);
+      onCompleteRef.current?.();
+    }
+
+    function failRun(message: string) {
+      if (!isCurrentRun()) return;
+      sourceClockUnsubscribeRef.current?.();
+      sourceClockUnsubscribeRef.current = null;
+      isStreamingRef.current = false;
+      setIsStreaming(false);
+      onErrorRef.current?.(message);
+    }
+
+    function emitChunk(
+      idx: number,
+      tick?: RenderedDigitalSourceClockTick,
+    ) {
+      if (!isCurrentRun()) return;
+      if (idx !== chunkIndexRef.current || idx >= totalChunks) {
+        failRun(
+          'Common-clock source pacing was missing, duplicated, or reordered.',
+        );
+        return;
+      }
+
+      const start = idx * chunkSize;
+      const end = start + chunkSize;
+      const sourceSampleEndExclusive = start + chunkSize;
+      if (
+        tick
+        && (
+          tick.sourceSampleStart !== start
+          || tick.sourceSampleEndExclusive !== sourceSampleEndExclusive
+        )
+      ) {
+        failRun('Common-clock source pacing did not match the PCM ledger.');
+        return;
+      }
+
+      const chunk = pcmBuffer.buffer.slice(
+        start * Int16Array.BYTES_PER_ELEMENT,
+        end * Int16Array.BYTES_PER_ELEMENT,
+      ) as ArrayBuffer;
+      const emittedAtMs = performance.now();
+      const inputChunkEmittedContextFrame = tick
+        ? sourceClock?.getCurrentContextFrame()
+        : undefined;
+      onChunkRef.current(chunk, {
+        chunkIndex: idx,
+        sampleRateHz: sampleRate,
+        sourceSampleStart: start,
+        sourceSampleEndExclusive,
+        inputPcmSha256,
+        inputPcmSampleCount: totalPaddedSamples,
+        emittedAtMs,
+        inputSampleZeroClientMs,
+        ...(tick
+          ? {
+              inputSourceBoundaryContextFrame: tick.boundaryContextFrame,
+              inputSourceBoundaryDeliveredAfterContextFrame: (
+                tick.deliveredAfterContextFrame
+              ),
+              inputSourceBoundaryReceivedContextFrameBefore: (
+                tick.receivedContextFrameBefore
+              ),
+              inputSourceBoundaryReceivedContextFrameAfter: (
+                tick.receivedContextFrameAfter
+              ),
+              inputSourceBoundaryReceivedClientMs: tick.receivedAtClientMs,
+              inputChunkEmittedContextFrame,
+            }
+          : {}),
+      });
+
+      if (!isCurrentRun()) return;
+      chunkIndexRef.current = idx + 1;
+      setPosition((idx + 1) * chunkSize / sampleRate);
+      if (chunkIndexRef.current >= totalChunks) finishRun();
+    }
+
+    if (sourceClock) {
+      if (
+        sourceClock.sampleRateHz !== sampleRate
+        || sourceClock.sourceFrameCount !== totalPaddedSamples
+        || sourceClock.sourceChunkFrames !== chunkSize
+      ) {
+        failRun('Common-clock source pacing configuration is invalid.');
+        return;
+      }
+      sourceClockUnsubscribeRef.current = sourceClock.subscribe((tick) => {
+        emitChunk(tick.chunkIndex, tick);
+      });
+      return;
     }
 
     function sendNext() {
@@ -163,11 +293,9 @@ export function useFileAudioSource({
         return;
       }
 
-      const start = idx * chunkSize;
-      const end = start + chunkSize;
       // The transmitted frame is zero-padded to chunkSize, so its source-end
       // deadline follows the padded sample ledger rather than the file length.
-      const sourceSampleEndExclusive = start + chunkSize;
+      const sourceSampleEndExclusive = (idx + 1) * chunkSize;
       const sourceEndBoundaryClientMs = (
         inputSampleZeroClientMs
         + (sourceSampleEndExclusive / sampleRate) * 1000
@@ -184,43 +312,12 @@ export function useFileAudioSource({
         return;
       }
 
-      // Copy the exact byte range from the already hashed wire image.
-      const chunk = pcmBuffer.buffer.slice(
-        start * Int16Array.BYTES_PER_ELEMENT,
-        end * Int16Array.BYTES_PER_ELEMENT,
-      ) as ArrayBuffer;
-
-      const emittedAtMs = performance.now();
-      onChunkRef.current(chunk, {
-        chunkIndex: idx,
-        sampleRateHz: sampleRate,
-        sourceSampleStart: start,
-        // The server processes the padded PCM frame, so this ledger follows
-        // transmitted samples rather than only non-padding file samples.
-        sourceSampleEndExclusive,
-        inputPcmSha256,
-        inputPcmSampleCount: totalPaddedSamples,
-        emittedAtMs,
-        inputSampleZeroClientMs,
-      });
-
+      emitChunk(idx);
       if (!isCurrentRun()) return;
-
-      chunkIndexRef.current = idx + 1;
-      setPosition((idx + 1) * chunkSize / sampleRate);
-
-      if (chunkIndexRef.current >= totalChunks) {
-        // Completion belongs to the transmission of the final padded frame;
-        // it does not require one more chunk interval or timer callback.
-        isStreamingRef.current = false;
-        setIsStreaming(false);
-        onCompleteRef.current?.();
-        return;
-      }
 
       // Each call computes its next absolute source-end deadline, so late
       // callbacks do not permanently shift the rest of the stream.
-      sendNext();
+      if (chunkIndexRef.current < totalChunks) sendNext();
     }
 
     // The first chunk is sent at its source-end boundary (300 ms by default).
@@ -235,7 +332,28 @@ export function useFileAudioSource({
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
+    sourceClockUnsubscribeRef.current?.();
+    sourceClockUnsubscribeRef.current = null;
   }, []);
+
+  const getLoadedPcmSnapshot = useCallback(():
+  LoadedFilePcmSnapshot | null => {
+    const pcm = pcmBufferRef.current;
+    const pcmSha256 = inputPcmSha256Ref.current;
+    const sourceFileSha256 = sourceFileSha256Ref.current;
+    if (
+      pcm === null
+      || pcmSha256 === null
+      || sourceFileSha256 === null
+    ) return null;
+    return {
+      pcm: pcm.buffer,
+      sampleRateHz: sampleRate,
+      sampleCount: pcm.length,
+      pcmSha256,
+      sourceFileSha256,
+    };
+  }, [sampleRate]);
 
   return {
     isLoaded,
@@ -245,5 +363,6 @@ export function useFileAudioSource({
     loadFile,
     startStreaming,
     stopStreaming,
+    getLoadedPcmSnapshot,
   };
 }

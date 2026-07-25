@@ -16,6 +16,7 @@ describe('exportTimingDataAsCSV', () => {
     'queue_depth_sec',
     'playback_rate',
     'playback_mode',
+    'terminal_status',
     'adaptive_playback_enabled',
     'audio_metadata_protocol_version',
     'stream_generation',
@@ -35,6 +36,12 @@ describe('exportTimingDataAsCSV', () => {
     'input_pcm_sha256',
     'input_pcm_sample_count',
     'input_ledger_valid',
+    'input_source_boundary_context_frame',
+    'input_source_boundary_delivered_after_context_frame',
+    'input_source_boundary_received_context_frame_before',
+    'input_source_boundary_received_context_frame_after',
+    'input_source_boundary_received_client_ms',
+    'input_chunk_emitted_context_frame',
     'source_end_boundary_client_ms',
     'source_end_to_binary_receipt_ms',
     'source_end_to_parent_complete_ms',
@@ -42,6 +49,8 @@ describe('exportTimingDataAsCSV', () => {
     'audio_context_time_at_schedule_sec',
     'scheduled_start_context_sec',
     'scheduled_end_context_sec',
+    'scheduled_start_context_frame_floor',
+    'scheduled_end_context_frame_exclusive',
     'projected_scheduled_start_client_ms',
     'source_end_to_projected_scheduled_start_ms',
     'playback_clock_session_id',
@@ -62,6 +71,7 @@ describe('exportTimingDataAsCSV', () => {
     download: string;
     style: { display: string };
     click: ReturnType<typeof vi.fn>;
+    remove: ReturnType<typeof vi.fn>;
   };
 
   const OriginalBlob = globalThis.Blob;
@@ -74,6 +84,7 @@ describe('exportTimingDataAsCSV', () => {
       download: '',
       style: { display: '' },
       click: vi.fn(),
+      remove: vi.fn(),
     };
 
     vi.spyOn(document, 'createElement').mockReturnValue(mockAnchor as unknown as HTMLElement);
@@ -229,13 +240,14 @@ describe('exportTimingDataAsCSV', () => {
     exportTimingDataAsCSV(clientEvents, []);
 
     const fields = capturedCsvText.split('\n')[1].split(',');
-    expect(fields.slice(6, 13)).toEqual([
+    expect(fields.slice(6, 14)).toEqual([
       '0.100000',
       '0.095238',
       '5.200000',
       '5.295238',
       '1.05',
       'catch-up',
+      '',
       'true',
     ]);
   });
@@ -259,12 +271,17 @@ describe('exportTimingDataAsCSV', () => {
       inputPcmSha256: 'a'.repeat(64),
       inputPcmSampleCount: 19200,
       inputLedgerValid: true,
+      inputSourceBoundaryReceivedContextFrameBefore: 8000,
+      inputSourceBoundaryReceivedContextFrameAfter: 8000,
+      inputChunkEmittedContextFrame: 8010,
       sourceEndBoundaryClientMs: 1500,
       sourceEndToBinaryReceiptMs: 300,
       schedulePerformanceClientMs: 1801,
       audioContextTimeAtScheduleSec: 10,
       scheduledStartContextSec: 12,
       scheduledEndContextSec: 12.1,
+      scheduledStartContextFrameFloor: 192000,
+      scheduledEndContextFrameExclusive: 193600,
       projectedScheduledStartClientMs: 3801,
       sourceEndToProjectedScheduledStartMs: 2301,
     }];
@@ -289,8 +306,13 @@ describe('exportTimingDataAsCSV', () => {
       input_pcm_sha256: 'a'.repeat(64),
       input_pcm_sample_count: '19200',
       input_ledger_valid: 'true',
+      input_source_boundary_received_context_frame_before: '8000',
+      input_source_boundary_received_context_frame_after: '8000',
+      input_chunk_emitted_context_frame: '8010',
       source_end_boundary_client_ms: '1500.000',
       source_end_to_binary_receipt_ms: '300.000',
+      scheduled_start_context_frame_floor: '192000',
+      scheduled_end_context_frame_exclusive: '193600',
       projected_scheduled_start_client_ms: '3801.000',
       source_end_to_projected_scheduled_start_ms: '2301.000',
     });

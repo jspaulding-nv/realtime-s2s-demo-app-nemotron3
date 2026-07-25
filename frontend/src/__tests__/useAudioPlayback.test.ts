@@ -18,7 +18,9 @@ let mockGetOutputTimestamp: ReturnType<typeof vi.fn>;
 let createdSources: Array<{
   buffer: { duration: number } | null;
   connect: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
   start: ReturnType<typeof vi.fn>;
+  stop: ReturnType<typeof vi.fn>;
   onended: (() => void) | null;
   playbackRate: { value: number };
 }>;
@@ -61,7 +63,9 @@ function setupMockAudioContext() {
       const source = {
         buffer: null as { duration: number } | null,
         connect: vi.fn(),
+        disconnect: vi.fn(),
         start: vi.fn(),
+        stop: vi.fn(),
         onended: null as (() => void) | null,
         playbackRate: { value: 1 },
       };
@@ -527,6 +531,39 @@ describe('useAudioPlayback', () => {
     expect(createdSources.length).toBe(1);
     expect(createdSources[0].connect).toHaveBeenCalledWith(mockGainNode);
     expect(createdSources[0].start).toHaveBeenCalled();
+  });
+
+  it('borrows one context, taps a numbered capture input, and leaves ownership external', () => {
+    const mockCtx = setupMockAudioContext();
+    const captureNode = { type: 'common-clock-recorder' };
+    const { result } = renderHook(() => useAudioPlayback({
+      initialMuted: true,
+      minimumScheduleLeadSeconds: 0.25,
+    }));
+
+    act(() => result.current.start({
+      audioContext: mockCtx as unknown as AudioContext,
+      captureNode: captureNode as unknown as AudioNode,
+      captureInputIndex: 1,
+    }));
+    const schedule = result.current.queueAudio(
+      new Int16Array(1600).buffer,
+    );
+
+    expect(vi.mocked(AudioContext)).not.toHaveBeenCalled();
+    expect(createdSources[0].connect).toHaveBeenCalledWith(mockGainNode);
+    expect(createdSources[0].connect).toHaveBeenCalledWith(
+      captureNode,
+      0,
+      1,
+    );
+    expect(createdSources[0].start).toHaveBeenCalledWith(0.25);
+    expect(schedule?.scheduledStartContextSeconds).toBe(0.25);
+
+    act(() => result.current.stop());
+    expect(mockCtx.close).not.toHaveBeenCalled();
+    expect(createdSources[0].stop).toHaveBeenCalled();
+    expect(createdSources[0].disconnect).toHaveBeenCalled();
   });
 
   it('queueAudio sets onended handler on the source', () => {

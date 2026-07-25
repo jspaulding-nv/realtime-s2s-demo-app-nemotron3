@@ -1301,6 +1301,114 @@ remediation is known. The transcript-free result and escalation questions are
 in
 [ASR Word-Timing-Shape Diagnostic Result — 2026-07-25](ASR_WORD_TIMING_SHAPE_RESULT_2026-07-25.md).
 
+## 2026-07-25: rendered-digital common-clock preflight
+
+Implemented in the working branch, but **not yet live-run or accepted**:
+
+- Added a default-off Test Dashboard mode that owns one 16 kHz
+  `AudioContext` for the exact source reference, translated playback, worklet
+  capture, source chunk pacing, and queue schedule.
+- Routed the exact source after 1.00x playback-rate processing and before
+  monitor mute to stereo channel 0.
+- Routed translated output after queue scheduling and adaptive playback-rate
+  processing, but before monitor mute, to stereo channel 1.
+- Replaced independent timer pacing in the formal mode with 200 direct
+  worklet-observed source boundaries for the 960,000-frame padded PCM fixture.
+  Each source chunk is 4,800 frames.
+- Bound the tracked source WAV SHA-256
+  `0c2cb04d9774f60472b55355f587da2148a053f3a55c05ff36c7dfc23be5c257`
+  and padded PCM SHA-256
+  `81720f2e23e5b85df4eb2be0bbd486b6591d0b1ed98580118e9e2e1e466bd51c`.
+- Added a private four-file browser export: stereo PCM16 WAV, exact timing
+  CSV, per-render-block ledger CSV, and hash-binding manifest.
+- Added one exact `input_ended` timing row after all 200 `chunk_sent` rows and
+  before the server terminal. It binds the `-1` sentinel index, zero bytes, and
+  the 60.0-second source endpoint.
+- Added integer schedule columns for each translated frame. The manifest and
+  validator reconcile their floor/ceiling relationship to the AudioContext
+  schedule and use those exact intervals to validate channel-1 WAV occupancy.
+- Reconciled received and scheduled translated transport in browser memory and
+  bound their ordered aggregate PCM SHA-256 values, byte/frame counts, and
+  canonical frame-ledger hashes.
+- Required a normal dashboard completion, one server `completed` terminal,
+  no post-terminal translated receipt/scheduling, and an exactly drained
+  playback queue before formal export.
+- Bound a clean Git commit, staged protocol v1/schema-3 mode, ASR EOU 800 ms
+  with word times, punctuation segmentation at 240 characters/2,000 ms,
+  incremental TTS publication at 100 ms, and the registered image digests.
+  The gate also pins ASR/NMT/TTS/output queue capacities at 32/4/4/4, NMT/TTS
+  RPC deadlines at 15/60 seconds, TTS maximum segment audio at 60 seconds,
+  one retry, response-chunk telemetry off, TTS subsegmentation at 0/12,
+  four-character atomic fallback, and a 10-second close deadline:
+
+  ```text
+  ASR sha256:0f01867023d93402fefab2859bdc363cf6f002e37083e5c0ca5d632df30e1850
+  NMT sha256:3789b08b72c8dfbb09d1144e2bfd1f13c95911c2f997c9e11d81afb5aa90c9fb
+  TTS sha256:6eacebdc45b35199bf2782c1f0c27d102aef5361ae3ea874e27bf3b8f6d5333d
+  ```
+
+- Required the Vite frontend and FastAPI backend process-start provenance to
+  be clean and to name the same commit. A stale process cannot borrow the
+  current checkout's identity.
+- Replaced formal use of the mutable Vite development server with an immutable
+  `npm run build` plus production preview. Backend provenance is discovered
+  directly from Git and cannot be overridden by environment declarations.
+- Bracketed each worklet boundary's main-thread receipt on the shared
+  AudioContext and sampled the clock again only after successful WebSocket
+  handoff. Receipt and handoff are limited to 1,600 frames (100 ms) after the
+  source boundary.
+- Registered one strict 60-column timing CSV schema. The browser emits that
+  fixed header; the validator rejects missing, extra, duplicate, or reordered
+  fields.
+- Sized the worklet capture for 420 seconds, covering the 60-second source,
+  the dashboard's full 300-second drain limit, and teardown margin.
+- Fetched the recorder worklet without cache reuse, hashed the exact bytes
+  loaded into the `AudioContext`, and bound that digest for comparison with
+  the worklet tracked by the registered commit. The registered module SHA-256
+  is
+  `0a0206154739d0731f200629d8b2ae341e9c3176336936ef33fbfd40dc52d189`.
+- Added a fail-closed offline validator that reconciles the source, worklet
+  block, protocol frame/parent, terminal, artifact-hash, runtime, and captured
+  playback-schedule evidence.
+- Registered a no-drop adaptive queue gate with time-weighted p95 at or below
+  5 seconds and peak at or below 10 seconds. The validator reports `PASS` only
+  when both queue bounds and protocol PCM continuity pass, `FAIL` for valid
+  evidence that misses either mechanical gate, and `INVALID` for unusable or
+  contradictory evidence.
+- Added ignore rules for the four raw browser artifact patterns and documented
+  that all source/translated PCM and associated run evidence must remain
+  private.
+- Added `run_rendered_digital_preflight.py`, a fail-closed Chrome DevTools
+  runner that verifies the exact fixture, Riva readiness, clean Git state,
+  backend pins, immutable served frontend, exact four-file download set, and
+  offline report while cleaning up only processes it starts.
+- Added read-only Docker attestation by exact HTTP/gRPC port pair. The runner
+  requires distinct running/healthy containers, exact port mappings, approved
+  local image `RepoDigest`s, backend-declaration agreement, and unchanged
+  identities before/after capture. Its private `docker-attestation.json`
+  contains no environment, names, or secrets and is finalized with the clean
+  commit plus browser manifest SHA-256.
+- Completed the automated implementation checks: frontend build/lint and 202
+  tests passed; backend/analysis/runner suites passed 1,008 tests with one
+  skipped environment-specific case.
+
+The claim boundary remains intentionally narrow. This gate measures
+rendered-digital graph output on one sample clock; it does not prove physical
+DAC output, acoustic audibility, translation quality, semantic phrase delay,
+or audience-reaction alignment.
+
+Pending:
+
+- Commit the reviewed branch and restart the application from that clean
+  commit.
+- Run the exact 60-second browser preflight in a secure localhost context.
+- Preserve the private four-file bundle, run
+  `analyze_rendered_digital_preflight.py`, and review the first real
+  `PASS`/`FAIL`/`INVALID` report.
+
+See
+[Rendered-digital common-clock 60-second preflight](RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch

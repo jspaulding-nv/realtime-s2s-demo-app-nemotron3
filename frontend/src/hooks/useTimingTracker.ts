@@ -13,6 +13,7 @@ import type {
   PlaybackClockSampleEvent,
   PlaybackScheduleEvent,
 } from './useAudioPlayback';
+import { RENDERED_DIGITAL_MAX_MAIN_THREAD_LAG_FRAMES } from '../types/renderedDigitalCapture';
 import type { PlaybackMode } from '../utils/playbackPolicy';
 
 interface UseTimingTrackerReturn {
@@ -35,6 +36,11 @@ interface UseTimingTrackerReturn {
     playbackRate: number,
     playbackMode: PlaybackMode,
   ) => void;
+  logServerTerminal: (
+    status: 'completed' | 'error',
+    observedClientMs?: number,
+  ) => void;
+  logInputEnded: (observedClientMs?: number) => void;
   getEvents: () => ClientTimingEvent[];
   getSendCount: () => number;
   getReceiveCount: () => number;
@@ -80,6 +86,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
   const inputPcmSampleCountRef = useRef<number | null>(null);
   const inputLastSampleEndRef = useRef(0);
   const inputLastEmittedAtMsRef = useRef<number | null>(null);
+  const inputSourceContextFrameOffsetRef = useRef<number | null>(null);
+  const inputLastSourceBoundaryContextFrameRef = useRef<number | null>(null);
 
   const startTest = useCallback((configuration?: {
     adaptivePlaybackEnabled: boolean;
@@ -97,6 +105,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     inputPcmSampleCountRef.current = null;
     inputLastSampleEndRef.current = 0;
     inputLastEmittedAtMsRef.current = null;
+    inputSourceContextFrameOffsetRef.current = null;
+    inputLastSourceBoundaryContextFrameRef.current = null;
     testStartRef.current = performance.now();
     if (configuration) {
       eventsRef.current.push({
@@ -182,12 +192,99 @@ export function useTimingTracker(): UseTimingTrackerReturn {
         observation.emittedAtMs + INPUT_EMISSION_EARLY_TOLERANCE_MS
         >= sourceEndBoundaryClientMs
       );
+      const commonClockFieldCount = [
+        observation.inputSourceBoundaryContextFrame,
+        observation.inputSourceBoundaryDeliveredAfterContextFrame,
+        observation.inputSourceBoundaryReceivedContextFrameBefore,
+        observation.inputSourceBoundaryReceivedContextFrameAfter,
+        observation.inputSourceBoundaryReceivedClientMs,
+        observation.inputChunkEmittedContextFrame,
+      ].filter((value) => value !== undefined).length;
+      const hasCommonClock = commonClockFieldCount === 6;
+      const commonClockFieldsAreComplete = (
+        commonClockFieldCount === 0 || hasCommonClock
+      );
+      const boundaryContextFrame = (
+        observation.inputSourceBoundaryContextFrame
+      );
+      const deliveredAfterContextFrame = (
+        observation.inputSourceBoundaryDeliveredAfterContextFrame
+      );
+      const boundaryReceivedClientMs = (
+        observation.inputSourceBoundaryReceivedClientMs
+      );
+      const boundaryReceivedContextFrameBefore = (
+        observation.inputSourceBoundaryReceivedContextFrameBefore
+      );
+      const boundaryReceivedContextFrameAfter = (
+        observation.inputSourceBoundaryReceivedContextFrameAfter
+      );
+      const chunkEmittedContextFrame = (
+        observation.inputChunkEmittedContextFrame
+      );
+      const contextFrameOffset = (
+        hasCommonClock
+          ? (
+              boundaryContextFrame as number
+              - observation.sourceSampleEndExclusive
+            )
+          : null
+      );
+      const commonClockIsValid = (
+        !hasCommonClock
+        || (
+          Number.isSafeInteger(boundaryContextFrame)
+          && Number.isSafeInteger(deliveredAfterContextFrame)
+          && Number.isSafeInteger(boundaryReceivedContextFrameBefore)
+          && Number.isSafeInteger(boundaryReceivedContextFrameAfter)
+          && Number.isSafeInteger(chunkEmittedContextFrame)
+          && Number.isFinite(boundaryReceivedClientMs)
+          && (boundaryContextFrame as number) >= 0
+          && (deliveredAfterContextFrame as number)
+            >= (boundaryContextFrame as number)
+          && (deliveredAfterContextFrame as number)
+            - (boundaryContextFrame as number) < 128
+          && (boundaryReceivedContextFrameBefore as number)
+            >= (deliveredAfterContextFrame as number)
+          && (boundaryReceivedContextFrameAfter as number)
+            >= (boundaryReceivedContextFrameBefore as number)
+          && (chunkEmittedContextFrame as number)
+            >= (boundaryReceivedContextFrameAfter as number)
+          && (boundaryReceivedContextFrameAfter as number)
+            - (boundaryContextFrame as number)
+            <= RENDERED_DIGITAL_MAX_MAIN_THREAD_LAG_FRAMES
+          && (chunkEmittedContextFrame as number)
+            - (boundaryContextFrame as number)
+            <= RENDERED_DIGITAL_MAX_MAIN_THREAD_LAG_FRAMES
+          && observation.emittedAtMs
+            >= (boundaryReceivedClientMs as number)
+          && (
+            isFirst
+              ? (contextFrameOffset as number) >= 0
+              : (
+                  contextFrameOffset
+                    === inputSourceContextFrameOffsetRef.current
+                  && (
+                    inputLastSourceBoundaryContextFrameRef.current === null
+                    || (boundaryContextFrame as number)
+                      > inputLastSourceBoundaryContextFrameRef.current
+                  )
+                )
+          )
+        )
+      );
       const valid = (
         finiteNumbers
         && integerLedger
         && digestIsValid
         && bytesMatchLedger
-        && emissionIsNotEarly
+        && commonClockFieldsAreComplete
+        && commonClockIsValid
+        // In formal common-clock mode, the render-thread frame boundary is
+        // authoritative. The performance.now()/AudioContext.currentTime
+        // bridge is intentionally approximate and must not reject a valid
+        // render-clock ledger merely because arm sampling fell mid-quantum.
+        && (hasCommonClock || emissionIsNotEarly)
         && (firstIsValid || continuationIsValid)
       );
 
@@ -201,9 +298,13 @@ export function useTimingTracker(): UseTimingTrackerReturn {
           inputSampleRateHzRef.current = observation.sampleRateHz;
           inputPcmSha256Ref.current = observation.inputPcmSha256;
           inputPcmSampleCountRef.current = observation.inputPcmSampleCount;
+          inputSourceContextFrameOffsetRef.current = contextFrameOffset;
         }
         inputLastSampleEndRef.current = observation.sourceSampleEndExclusive;
         inputLastEmittedAtMsRef.current = observation.emittedAtMs;
+        inputLastSourceBoundaryContextFrameRef.current = (
+          boundaryContextFrame ?? null
+        );
         sourcePositionRef.current = (
           observation.sourceSampleEndExclusive / observation.sampleRateHz
         );
@@ -224,6 +325,24 @@ export function useTimingTracker(): UseTimingTrackerReturn {
         inputPcmSha256: observation.inputPcmSha256,
         inputPcmSampleCount: observation.inputPcmSampleCount,
         inputLedgerValid: valid,
+        inputSourceBoundaryContextFrame: (
+          observation.inputSourceBoundaryContextFrame
+        ),
+        inputSourceBoundaryDeliveredAfterContextFrame: (
+          observation.inputSourceBoundaryDeliveredAfterContextFrame
+        ),
+        inputSourceBoundaryReceivedContextFrameBefore: (
+          observation.inputSourceBoundaryReceivedContextFrameBefore
+        ),
+        inputSourceBoundaryReceivedContextFrameAfter: (
+          observation.inputSourceBoundaryReceivedContextFrameAfter
+        ),
+        inputSourceBoundaryReceivedClientMs: (
+          observation.inputSourceBoundaryReceivedClientMs
+        ),
+        inputChunkEmittedContextFrame: (
+          observation.inputChunkEmittedContextFrame
+        ),
       };
     } else {
       sourcePositionRef.current = (
@@ -388,6 +507,12 @@ export function useTimingTracker(): UseTimingTrackerReturn {
       ),
       scheduledStartContextSec: event.scheduledStartContextSeconds,
       scheduledEndContextSec: event.scheduledEndContextSeconds,
+      scheduledStartContextFrameFloor: (
+        event.scheduledStartContextFrameFloor
+      ),
+      scheduledEndContextFrameExclusive: (
+        event.scheduledEndContextFrameExclusive
+      ),
       projectedScheduledStartClientMs: (
         event.projectedScheduledStartClientMs
       ),
@@ -469,6 +594,31 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     });
   }, []);
 
+  const logServerTerminal = useCallback((
+    status: 'completed' | 'error',
+    observedClientMs = performance.now(),
+  ) => {
+    eventsRef.current.push({
+      stage: 'server_terminal',
+      timestamp: observedClientMs - testStartRef.current,
+      chunkIndex: -1,
+      sourcePositionSec: sourcePositionRef.current,
+      audioBytes: 0,
+      terminalStatus: status,
+    });
+  }, []);
+
+  const logInputEnded = useCallback((observedClientMs?: number) => {
+    const observed = observedClientMs ?? performance.now();
+    eventsRef.current.push({
+      stage: 'input_ended',
+      timestamp: observed - testStartRef.current,
+      chunkIndex: -1,
+      sourcePositionSec: sourcePositionRef.current,
+      audioBytes: 0,
+    });
+  }, []);
+
   const getEvents = useCallback(() => [...eventsRef.current], []);
   const getSendCount = useCallback(() => sendCountRef.current, []);
   const getReceiveCount = useCallback(() => receiveCountRef.current, []);
@@ -489,6 +639,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     logPlaybackScheduled,
     logPlaybackClockSample,
     logPlaybackQueueSample,
+    logServerTerminal,
+    logInputEnded,
     getEvents,
     getSendCount,
     getReceiveCount,
@@ -502,6 +654,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     logPlaybackScheduled,
     logPlaybackClockSample,
     logPlaybackQueueSample,
+    logServerTerminal,
+    logInputEnded,
     getEvents,
     getSendCount,
     getReceiveCount,

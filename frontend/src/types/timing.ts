@@ -7,6 +7,12 @@ export interface FileAudioChunkObservation {
   inputPcmSampleCount: number;
   emittedAtMs: number;
   inputSampleZeroClientMs: number;
+  inputSourceBoundaryContextFrame?: number;
+  inputSourceBoundaryDeliveredAfterContextFrame?: number;
+  inputSourceBoundaryReceivedContextFrameBefore?: number;
+  inputSourceBoundaryReceivedContextFrameAfter?: number;
+  inputSourceBoundaryReceivedClientMs?: number;
+  inputChunkEmittedContextFrame?: number;
 }
 
 export type SourceTimingBasis =
@@ -28,6 +34,7 @@ export interface ClientTimingEvent {
   queueDepthSec?: number;
   playbackRate?: number;
   playbackMode?: string;
+  terminalStatus?: 'completed' | 'error';
   adaptivePlaybackEnabled?: boolean;
   audioMetadataProtocolVersion?: number;
   streamGeneration?: number;
@@ -47,6 +54,12 @@ export interface ClientTimingEvent {
   inputPcmSha256?: string;
   inputPcmSampleCount?: number;
   inputLedgerValid?: boolean;
+  inputSourceBoundaryContextFrame?: number;
+  inputSourceBoundaryDeliveredAfterContextFrame?: number;
+  inputSourceBoundaryReceivedContextFrameBefore?: number;
+  inputSourceBoundaryReceivedContextFrameAfter?: number;
+  inputSourceBoundaryReceivedClientMs?: number;
+  inputChunkEmittedContextFrame?: number;
   sourceEndBoundaryClientMs?: number;
   sourceEndToBinaryReceiptMs?: number;
   sourceEndToParentCompleteMs?: number;
@@ -54,6 +67,8 @@ export interface ClientTimingEvent {
   audioContextTimeAtScheduleSec?: number;
   scheduledStartContextSec?: number;
   scheduledEndContextSec?: number;
+  scheduledStartContextFrameFloor?: number;
+  scheduledEndContextFrameExclusive?: number;
   projectedScheduledStartClientMs?: number;
   sourceEndToProjectedScheduledStartMs?: number;
   playbackClockSessionId?: number;
