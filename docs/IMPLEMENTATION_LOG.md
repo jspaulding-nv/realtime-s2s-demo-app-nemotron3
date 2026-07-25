@@ -1286,8 +1286,20 @@ incomplete word envelopes. Its evidence implementation now also binds the
 computed padded PCM, registered English/800 ms client configuration,
 container-instance continuity, and concurrent output ownership.
 
-No live result is claimed yet. Run and interpretation instructions are in
-[ASR Word-Timing-Shape Diagnostic](ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md).
+The registered replay completed in 1,888.578 seconds of wall time with exact
+input/PCM binding, valid pacing, and stable runtime identity. It reproduced the
+same 13 incomplete final IDs as both formal runs. Ten envelopes collapsed to
+equal positive start/end timestamps and three had no word entries. Across all
+5,263 word entries, 4,676 were zero-duration and 587 had positive duration;
+there were no absent, unparseable, nonfinite, negative, numerically zero, or
+reversed supplied boundaries.
+
+This is consistent with point-like alignment semantics for many word entries,
+but that interpretation requires service-contract confirmation. The unchanged
+formal gate should not be repeated until a supported timing policy or service
+remediation is known. The transcript-free result and escalation questions are
+in
+[ASR Word-Timing-Shape Diagnostic Result — 2026-07-25](ASR_WORD_TIMING_SHAPE_RESULT_2026-07-25.md).
 
 ## Handoff checklist
 
@@ -1319,8 +1331,9 @@ No live result is claimed yet. Run and interpretation instructions are in
   exact long-form padded PCM
 - [ ] Pass two real-time ASR final-attribution qualification runs on the exact
   long-form padded PCM (blocked by 13 deterministic incomplete finals per run)
-- [ ] Run and review one privacy-safe ASR word-timing-shape diagnostic before
-  deciding whether to repeat the formal two-run qualification
+- [x] Run and review one privacy-safe ASR word-timing-shape diagnostic; escalate
+  its deterministic point-like/no-word response shapes before repeating the
+  formal two-run qualification
 - [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
 - [ ] Run protocol v1 across all three long-form samples

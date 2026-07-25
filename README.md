@@ -756,6 +756,7 @@ Detailed guides:
 - [Semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md)
 - [ASR final-attribution qualification result](docs/ASR_FINAL_ATTRIBUTION_GATE_2026-07-25.md)
 - [Privacy-safe ASR word-timing-shape diagnostic](docs/ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md)
+- [ASR word-timing-shape diagnostic result](docs/ASR_WORD_TIMING_SHAPE_RESULT_2026-07-25.md)
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sample acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)
