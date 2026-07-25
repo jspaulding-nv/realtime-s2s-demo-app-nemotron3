@@ -1049,11 +1049,28 @@ backward compatibility for older positional schema-3 captures. Its 10-second
 oldest-first parent policy remains a counterfactual: no live audio is dropped.
 
 Before live capture, the complete backend suite passed 416 tests, the root
-Python suite passed 316 tests with one optional local-artifact test skipped
-(732 passing Python tests combined), and the frontend passed 118 tests plus
+Python suite passed 317 tests with one optional local-artifact test skipped
+(733 passing Python tests combined), and the frontend passed 118 tests plus
 TypeScript build and lint. Protocol,
 privacy, clock, rollout, and reproduction details are in
 [Audio metadata observation protocol v1](AUDIO_METADATA_OBSERVATION_V1.md).
+
+The first clean live candidate completed both 60-second model arms, but the
+formal comparator rejected a legacy-control artifact that contained a
+client sample-zero marker despite not negotiating v1. Commit `062f28a` scoped
+the marker to negotiated streams and added a regression test.
+
+The corrected formal canary then passed all matched-design, provenance, wire,
+parent, byte, terminal, drain, and cleanup gates. The schema-3 arm reconciled
+521 frames and 16 parents. Source end to client receipt was 2.656 seconds p50 /
+3.915 seconds p95, while source end to deterministic scheduled start was
+8.264 seconds p50 / 12.860 seconds p95. These source ranges are not proven
+semantic boundaries, and scheduled start is not actual audibility.
+
+The 10-second oldest-first shadow policy would have retained 87.3% of
+translated audio and skipped one parent, yet it still peaked at 11.317 seconds.
+Loss remains disabled. See
+[Audio metadata protocol v1: 60-second formal canary](AUDIO_METADATA_60S_CANARY_2026-07-25.md).
 
 ## Handoff checklist
 
@@ -1077,6 +1094,9 @@ privacy, clock, rollout, and reproduction details are in
 - [x] Sweep no-drop playback capacity on the completed matched traces
 - [x] Simulate 5/8/10-second whole-parent freshness/loss tradeoffs on schema 3
 - [x] Add opt-in parent/frame wire metadata and observation-only browser telemetry
+- [x] Pass a 60-second matched live canary with protocol-v1 evidence
+- [ ] Pass a five-minute matched live canary with protocol-v1 evidence
+- [ ] Run protocol v1 across all three long-form samples
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries

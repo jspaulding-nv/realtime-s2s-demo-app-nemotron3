@@ -722,6 +722,7 @@ Detailed guides:
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
 - [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
 - [Observation-only parent/frame metadata protocol v1](docs/AUDIO_METADATA_OBSERVATION_V1.md)
+- [Protocol-v1 60-second formal canary](docs/AUDIO_METADATA_60S_CANARY_2026-07-25.md)
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sample acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)
