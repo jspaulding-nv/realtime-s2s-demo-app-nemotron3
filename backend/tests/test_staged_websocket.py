@@ -194,13 +194,32 @@ def composite_audio(
     )
 
 
-def incremental_audio_frame(parent_sequence_id, audio_frame_id, audio):
+def incremental_audio_frame(
+    parent_sequence_id,
+    audio_frame_id,
+    audio,
+    *,
+    sample_rate_hz=16_000,
+    channels=1,
+    bytes_per_sample=2,
+    source_start_ms=0.0,
+    source_end_ms=1_000.0,
+):
     return SimpleNamespace(
         kind=StagedOutputEventKind.AUDIO_FRAME,
         frame=SimpleNamespace(
             audio=audio,
             parent_sequence_id=parent_sequence_id,
             audio_frame_id=audio_frame_id,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+            bytes_per_sample=bytes_per_sample,
+            translation=SimpleNamespace(
+                segment=SimpleNamespace(
+                    source_start_ms=source_start_ms,
+                    source_end_ms=source_end_ms,
+                )
+            ),
         ),
     )
 
@@ -212,6 +231,11 @@ def incremental_parent_complete(
     *,
     retry_count=0,
     atomic_fallback_applied=False,
+    sample_rate_hz=16_000,
+    channels=1,
+    bytes_per_sample=2,
+    source_start_ms=0.0,
+    source_end_ms=1_000.0,
 ):
     return SimpleNamespace(
         kind=StagedOutputEventKind.PARENT_COMPLETE,
@@ -221,6 +245,15 @@ def incremental_parent_complete(
             audio_bytes=audio_bytes,
             retry_count=retry_count,
             atomic_fallback_applied=atomic_fallback_applied,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+            bytes_per_sample=bytes_per_sample,
+            translation=SimpleNamespace(
+                segment=SimpleNamespace(
+                    source_start_ms=source_start_ms,
+                    source_end_ms=source_end_ms,
+                )
+            ),
         ),
     )
 
@@ -401,6 +434,393 @@ async def test_schema_v3_frames_are_sent_fifo_and_parent_complete_has_no_wire_by
     assert outbound.index(("audio", b"cc")) < outbound.index(
         ("json", completed)
     )
+    assert not any(
+        payload.get("type") in {"audio_frame", "audio_parent_complete"}
+        for kind, payload in outbound
+        if kind == "json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_metadata_v1_precedes_each_frame_and_completes_parent(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    outbound = []
+
+    async def record_audio(payload):
+        outbound.append(("audio", payload))
+
+    async def record_json(payload):
+        outbound.append(("json", payload))
+
+    mock_websocket.send_bytes.side_effect = record_audio
+    mock_websocket.send_json.side_effect = record_json
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    generation = session._staged_generation
+    await session.finish_input()
+    await pipeline.outputs.put(
+        incremental_audio_frame(
+            0,
+            0,
+            b"aa",
+            sample_rate_hz=22_050,
+            source_start_ms=1_250.0,
+            source_end_ms=2_500.0,
+        )
+    )
+    await pipeline.outputs.put(
+        incremental_audio_frame(
+            0,
+            1,
+            b"bbbb",
+            sample_rate_hz=22_050,
+            source_start_ms=1_250.0,
+            source_end_ms=2_500.0,
+        )
+    )
+    await pipeline.outputs.put(
+        incremental_parent_complete(
+            0,
+            2,
+            6,
+            sample_rate_hz=22_050,
+            source_start_ms=1_250.0,
+            source_end_ms=2_500.0,
+        )
+    )
+    await pipeline.outputs.put(
+        incremental_audio_frame(
+            1,
+            0,
+            b"cc",
+            sample_rate_hz=22_050,
+            source_start_ms=2_500.0,
+            source_end_ms=2_900.0,
+        )
+    )
+    await pipeline.outputs.put(
+        incremental_parent_complete(
+            1,
+            1,
+            2,
+            atomic_fallback_applied=True,
+            sample_rate_hz=22_050,
+            source_start_ms=2_500.0,
+            source_end_ms=2_900.0,
+        )
+    )
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(
+        lambda: (
+            session.status is SessionStatus.COMPLETED
+            and session._audio_metadata_protocol_version is None
+        )
+    )
+
+    relevant = [
+        item
+        for item in outbound
+        if item[0] == "audio"
+        or item[1].get("type")
+        in {"audio_frame", "audio_parent_complete"}
+    ]
+    assert relevant == [
+        (
+            "json",
+            {
+                "type": "audio_frame",
+                "protocolVersion": 1,
+                "streamGeneration": generation,
+                "parentSequenceId": 0,
+                "audioFrameId": 0,
+                "audioBytes": 2,
+                "sampleRateHz": 22_050,
+                "channels": 1,
+                "bytesPerSample": 2,
+                "sourceStartMs": 1_250.0,
+                "sourceEndMs": 2_500.0,
+            },
+        ),
+        ("audio", b"aa"),
+        (
+            "json",
+            {
+                "type": "audio_frame",
+                "protocolVersion": 1,
+                "streamGeneration": generation,
+                "parentSequenceId": 0,
+                "audioFrameId": 1,
+                "audioBytes": 4,
+                "sampleRateHz": 22_050,
+                "channels": 1,
+                "bytesPerSample": 2,
+                "sourceStartMs": 1_250.0,
+                "sourceEndMs": 2_500.0,
+            },
+        ),
+        ("audio", b"bbbb"),
+        (
+            "json",
+            {
+                "type": "audio_parent_complete",
+                "protocolVersion": 1,
+                "streamGeneration": generation,
+                "parentSequenceId": 0,
+                "audioFrameCount": 2,
+                "audioBytes": 6,
+                "sourceStartMs": 1_250.0,
+                "sourceEndMs": 2_500.0,
+            },
+        ),
+        (
+            "json",
+            {
+                "type": "audio_frame",
+                "protocolVersion": 1,
+                "streamGeneration": generation,
+                "parentSequenceId": 1,
+                "audioFrameId": 0,
+                "audioBytes": 2,
+                "sampleRateHz": 22_050,
+                "channels": 1,
+                "bytesPerSample": 2,
+                "sourceStartMs": 2_500.0,
+                "sourceEndMs": 2_900.0,
+            },
+        ),
+        ("audio", b"cc"),
+        (
+            "json",
+            {
+                "type": "audio_parent_complete",
+                "protocolVersion": 1,
+                "streamGeneration": generation,
+                "parentSequenceId": 1,
+                "audioFrameCount": 1,
+                "audioBytes": 2,
+                "sourceStartMs": 2_500.0,
+                "sourceEndMs": 2_900.0,
+            },
+        ),
+    ]
+    assert session._staged_parent_completions_sent[-1][
+        "atomic_fallback_applied"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_metadata_v1_rejects_pcm_format_change_between_parents(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    generation = session._staged_generation
+    assert await session._send_staged_audio(
+        generation,
+        b"aa",
+        0,
+        audio_frame_id=0,
+        include_frame=True,
+        sample_rate_hz=16_000,
+        channels=1,
+        bytes_per_sample=2,
+        source_start_ms=0.0,
+        source_end_ms=1_000.0,
+    ) is True
+    assert await session._complete_staged_parent(
+        generation,
+        incremental_parent_complete(0, 1, 2).completion,
+    ) is True
+
+    assert await session._send_staged_audio(
+        generation,
+        b"bb",
+        1,
+        audio_frame_id=0,
+        include_frame=True,
+        sample_rate_hz=22_050,
+        channels=1,
+        bytes_per_sample=2,
+        source_start_ms=1_000.0,
+        source_end_ms=2_000.0,
+    ) is False
+    assert [
+        call.args[0]
+        for call in mock_websocket.send_bytes.await_args_list
+    ] == [b"aa"]
+    assert [
+        call.args[0]["parentSequenceId"]
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "audio_frame"
+    ] == [0]
+
+    await session.stop_stream()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_version",
+    [None, True, False, 0, 2, 1.0, "1", {}, []],
+)
+async def test_audio_metadata_version_is_rejected_fail_closed(
+    mock_websocket,
+    requested_version,
+):
+    factory = MagicMock(return_value=FakeIncrementalStagedPipeline())
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=factory,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=requested_version,
+    )
+
+    factory.assert_not_called()
+    assert session.status is SessionStatus.ERROR
+    mock_websocket.send_bytes.assert_not_awaited()
+    errors = [
+        call.args[0]
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "error"
+    ]
+    assert errors == [
+        {
+            "type": "error",
+            "message": (
+                "audioMetadataProtocolVersion must be the integer 1"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_audio_metadata_v1_rejects_non_incremental_staged_pipeline(
+    mock_websocket,
+):
+    pipeline = FakeStagedPipeline()
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+
+    assert not pipeline.started
+    assert pipeline.closed
+    assert session.status is SessionStatus.ERROR
+    assert session._audio_metadata_protocol_version is None
+    mock_websocket.send_bytes.assert_not_awaited()
+    errors = [
+        call.args[0]
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "error"
+    ]
+    assert errors == [
+        {
+            "type": "error",
+            "message": (
+                "Failed to start stream: audio metadata protocol version 1 "
+                "requires the staged schema-3 incremental TTS pipeline"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_audio_metadata_negotiation_is_not_sticky_across_streams(
+    mock_websocket,
+):
+    first = FakeIncrementalStagedPipeline()
+    second = FakeIncrementalStagedPipeline()
+    pipelines = iter((first, second))
+    outbound = []
+
+    async def record_json(payload):
+        outbound.append(("json", payload))
+
+    async def record_audio(payload):
+        outbound.append(("audio", payload))
+
+    mock_websocket.send_json.side_effect = record_json
+    mock_websocket.send_bytes.side_effect = record_audio
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: next(pipelines),
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    first_generation = session._staged_generation
+    await first.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await first.outputs.put(incremental_parent_complete(0, 1, 2))
+    await _wait_until(
+        lambda: any(
+            kind == "json"
+            and payload.get("type") == "audio_parent_complete"
+            for kind, payload in outbound
+        )
+    )
+
+    await session.start_stream("es-US")
+    await second.outputs.put(incremental_audio_frame(0, 0, b"bb"))
+    await second.outputs.put(incremental_parent_complete(0, 1, 2))
+    await _wait_until(
+        lambda: [payload for kind, payload in outbound if kind == "audio"]
+        == [b"aa", b"bb"]
+    )
+
+    assert [
+        payload
+        for kind, payload in outbound
+        if kind == "json" and payload.get("type") == "audio_frame"
+    ] == [
+        {
+            "type": "audio_frame",
+            "protocolVersion": 1,
+            "streamGeneration": first_generation,
+            "parentSequenceId": 0,
+            "audioFrameId": 0,
+            "audioBytes": 2,
+            "sampleRateHz": 16_000,
+            "channels": 1,
+            "bytesPerSample": 2,
+            "sourceStartMs": 0.0,
+            "sourceEndMs": 1_000.0,
+        }
+    ]
+    await session.stop_stream()
+    assert session._audio_metadata_protocol_version is None
 
 
 @pytest.mark.asyncio
@@ -596,6 +1016,248 @@ async def test_schema_v3_send_failure_preserves_prefix_and_emits_one_error(
         for call in mock_websocket.send_json.await_args_list
         if call.args[0].get("type") == "status"
     )
+
+
+@pytest.mark.asyncio
+async def test_metadata_v1_binary_send_failure_leaves_header_then_terminal_error(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    outbound = []
+
+    async def record_json(payload):
+        outbound.append(("json", payload))
+
+    async def fail_audio(payload):
+        outbound.append(("audio_attempt", payload))
+        raise RuntimeError("socket write failed")
+
+    mock_websocket.send_json.side_effect = record_json
+    mock_websocket.send_bytes.side_effect = fail_audio
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    generation = session._staged_generation
+    await session.finish_input()
+    await pipeline.outputs.put(
+        incremental_audio_frame(
+            0,
+            0,
+            b"aa",
+            source_start_ms=500.0,
+            source_end_ms=750.0,
+        )
+    )
+    await pipeline.outputs.put(
+        incremental_parent_complete(
+            0,
+            1,
+            2,
+            source_start_ms=500.0,
+            source_end_ms=750.0,
+        )
+    )
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+    await _wait_until(lambda: pipeline.closed)
+
+    header = {
+        "type": "audio_frame",
+        "protocolVersion": 1,
+        "streamGeneration": generation,
+        "parentSequenceId": 0,
+        "audioFrameId": 0,
+        "audioBytes": 2,
+        "sampleRateHz": 16_000,
+        "channels": 1,
+        "bytesPerSample": 2,
+        "sourceStartMs": 500.0,
+        "sourceEndMs": 750.0,
+    }
+    error = {
+        "type": "error",
+        "message": "translated audio could not be sent to the client",
+    }
+    assert outbound.index(("json", header)) < outbound.index(
+        ("audio_attempt", b"aa")
+    )
+    assert outbound.index(("audio_attempt", b"aa")) < outbound.index(
+        ("json", error)
+    )
+    assert not any(
+        payload.get("type") == "audio_parent_complete"
+        for kind, payload in outbound
+        if kind == "json"
+    )
+    assert session._staged_audio_frame_keys_sent == []
+    assert session._staged_parent_completions_sent == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_v1_header_send_failure_never_sends_unpaired_binary(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+
+    async def fail_header(payload):
+        if payload.get("type") == "audio_frame":
+            raise RuntimeError("socket JSON write failed")
+
+    mock_websocket.send_json.side_effect = fail_header
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+
+    mock_websocket.send_bytes.assert_not_awaited()
+    errors = [
+        call.args[0]
+        for call in mock_websocket.send_json.await_args_list
+        if call.args[0].get("type") == "error"
+    ]
+    assert errors == [
+        {
+            "type": "error",
+            "message": "translated audio could not be sent to the client",
+        }
+    ]
+    assert session._staged_audio_frame_keys_sent == []
+    assert session._staged_parent_completions_sent == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_v1_parent_completion_precedes_structured_failure(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    outbound = []
+
+    async def record_json(payload):
+        outbound.append(("json", payload))
+
+    async def record_audio(payload):
+        outbound.append(("audio", payload))
+
+    mock_websocket.send_json.side_effect = record_json
+    mock_websocket.send_bytes.side_effect = record_audio
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 1, 2))
+    await pipeline.outputs.put(
+        SimpleNamespace(
+            kind=StagedOutputEventKind.ERROR,
+            stage="nmt",
+            error="translation failed",
+        )
+    )
+    await _wait_until(lambda: session.status is SessionStatus.ERROR)
+
+    parent_complete = next(
+        payload
+        for kind, payload in outbound
+        if kind == "json"
+        and payload.get("type") == "audio_parent_complete"
+    )
+    error = {
+        "type": "error",
+        "message": "Staged nmt failed: translation failed",
+    }
+    assert outbound.index(("audio", b"aa")) < outbound.index(
+        ("json", parent_complete)
+    )
+    assert outbound.index(("json", parent_complete)) < outbound.index(
+        ("json", error)
+    )
+    assert not any(
+        payload.get("status") == "completed"
+        for kind, payload in outbound
+        if kind == "json" and payload.get("type") == "status"
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_v1_preserves_end_only_source_range_without_word_times(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline()
+    outbound_json = []
+
+    async def record_json(payload):
+        outbound_json.append(payload)
+
+    mock_websocket.send_json.side_effect = record_json
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+    await session.finish_input()
+    await pipeline.outputs.put(
+        incremental_audio_frame(
+            0,
+            0,
+            b"aa",
+            source_start_ms=None,
+            source_end_ms=750.0,
+        )
+    )
+    await pipeline.outputs.put(
+        incremental_parent_complete(
+            0,
+            1,
+            2,
+            source_start_ms=None,
+            source_end_ms=750.0,
+        )
+    )
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+
+    frame_header = next(
+        payload
+        for payload in outbound_json
+        if payload.get("type") == "audio_frame"
+    )
+    parent_complete = next(
+        payload
+        for payload in outbound_json
+        if payload.get("type") == "audio_parent_complete"
+    )
+    assert frame_header["sourceStartMs"] is None
+    assert frame_header["sourceEndMs"] == 750.0
+    assert parent_complete["sourceStartMs"] is None
+    assert parent_complete["sourceEndMs"] == 750.0
+    mock_websocket.send_bytes.assert_awaited_once_with(b"aa")
 
 
 @pytest.mark.asyncio

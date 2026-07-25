@@ -13,7 +13,11 @@ from config import (
     staged_pipeline_config,
 )
 from riva_client import riva_client
-from websocket_handler import session_manager, SessionStatus
+from websocket_handler import (
+    AUDIO_METADATA_PROTOCOL_VERSION,
+    SessionStatus,
+    session_manager,
+)
 from timing_logger import timing_logger
 
 
@@ -90,6 +94,15 @@ async def get_config():
         "chunkSize": audio_config.chunk_size,
         "channels": audio_config.channels,
         "pipelineMode": staged_pipeline_config.pipeline_mode,
+        "audioMetadataProtocolVersions": (
+            [AUDIO_METADATA_PROTOCOL_VERSION]
+            if (
+                staged_pipeline_config.pipeline_mode == "staged"
+                and staged_pipeline_config.telemetry_schema_version == 3
+                and staged_pipeline_config.tts_incremental_publish_enabled
+            )
+            else []
+        ),
         "modelConfig": {
             "asr": {
                 "endpoint": riva_config.asr_uri,
@@ -263,7 +276,12 @@ async def handle_control_message(session, data: dict) -> None:
 
     if msg_type == "start_stream":
         target_language = data.get("targetLanguage", "es-US")
-        await session.start_stream(target_language)
+        start_kwargs = {}
+        if "audioMetadataProtocolVersion" in data:
+            start_kwargs["audio_metadata_protocol_version"] = data[
+                "audioMetadataProtocolVersion"
+            ]
+        await session.start_stream(target_language, **start_kwargs)
 
     elif msg_type == "stop_stream":
         await session.stop_stream()

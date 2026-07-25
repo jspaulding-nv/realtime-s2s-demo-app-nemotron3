@@ -1,4 +1,5 @@
 // WebSocket message types
+import type { AudioMetadataProtocolVersion } from './audioMetadata';
 
 export type SessionStatus =
   | 'disconnected'
@@ -35,6 +36,7 @@ export type ServerMessage = StatusMessage | ErrorMessage | LevelMessage | PongMe
 export interface StartStreamMessage {
   type: 'start_stream';
   targetLanguage: string;
+  audioMetadataProtocolVersion?: AudioMetadataProtocolVersion;
 }
 
 export interface StopStreamMessage {

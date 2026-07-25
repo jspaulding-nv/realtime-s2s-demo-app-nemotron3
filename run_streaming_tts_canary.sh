@@ -253,6 +253,7 @@ PREFIX_SHA256="$(sha256sum "$PREFIX_WAV" | awk '{print $1}')"
   echo "prefix_sha256=$PREFIX_SHA256"
   echo "incremental_frame_ms=$CANARY_INCREMENTAL_FRAME_MS"
   echo "incremental_atomic_fallback_max_chars=$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS"
+  echo "streaming_audio_metadata_protocol_version=1"
   echo "asr_image=$ASR_IMAGE"
   echo "asr_image_digest=$ASR_IMAGE_DIGEST"
   echo "nmt_image=$NMT_IMAGE"
@@ -375,6 +376,9 @@ if staged.get("ttsResponseChunkTelemetryEnabled") is not True:
     raise SystemExit("response-chunk telemetry is not enabled")
 if staged.get("ttsIncrementalPublishEnabled", False) is not expected_incremental:
     raise SystemExit("incremental-publication flag mismatch")
+expected_metadata_versions = [1] if expected_incremental else []
+if config.get("audioMetadataProtocolVersions") != expected_metadata_versions:
+    raise SystemExit("audio metadata protocol capability mismatch")
 if expected_incremental and staged.get("ttsIncrementalFrameMs") != int(sys.argv[9]):
     raise SystemExit("incremental frame duration mismatch")
 reported_fallback = staged.get("ttsIncrementalAtomicFallbackMaxChars", 0)
@@ -397,11 +401,16 @@ if actual != expected[:6]:
       "$CANARY_INCREMENTAL_FRAME_MS" \
       "$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS"
 
+  metadata_args=()
+  if [[ "$arm" == "streaming" ]]; then
+    metadata_args+=(--audio-metadata-protocol-v1)
+  fi
   PYTHONPATH=".python-packages:backend:." \
     "$PYTHON_BIN" batch_latency_test.py \
       --file "$PREFIX_WAV" \
       --backend "$BACKEND_URL" \
-      --output-dir "$ARM_DIR"
+      --output-dir "$ARM_DIR" \
+      "${metadata_args[@]}"
 
   PYTHONPATH=".python-packages:backend:." \
     "$PYTHON_BIN" analyze_playback_policy.py \
@@ -424,6 +433,15 @@ if actual != expected[:6]:
       "$ARM_DIR/shared-prefix_summary.json" \
       --json-output "$ARM_DIR/streaming_latency_analysis.json" \
       --markdown-output "$ARM_DIR/streaming_latency_analysis.md"
+
+  if [[ "$arm" == "streaming" ]]; then
+    PYTHONPATH=".python-packages:backend:." \
+      "$PYTHON_BIN" analyze_freshness_cap.py \
+        --results-csv "$ARM_DIR/shared-prefix_results.csv" \
+        --summary-json "$ARM_DIR/shared-prefix_summary.json" \
+        --json-output "$ARM_DIR/schema3_freshness_cap_analysis.json" \
+        --markdown-output "$ARM_DIR/schema3_freshness_cap_analysis.md"
+  fi
 
   stop_backend
   echo "=== Completed matched canary arm: $arm ==="

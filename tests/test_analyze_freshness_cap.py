@@ -50,6 +50,50 @@ def _trace():
     )
 
 
+def _source_clock_trace():
+    frames = (
+        ParentAudioFrame(
+            arrival_seconds=1.0,
+            duration_seconds=0.1,
+            audio_bytes=3200,
+            source_index=0,
+            parent_sequence_id=0,
+            audio_frame_id=0,
+            parent_frame_count=1,
+            source_start_ms=None,
+            source_end_ms=500.0,
+        ),
+        ParentAudioFrame(
+            arrival_seconds=1.05,
+            duration_seconds=0.1,
+            audio_bytes=3200,
+            source_index=1,
+            parent_sequence_id=1,
+            audio_frame_id=0,
+            parent_frame_count=1,
+            source_start_ms=600.0,
+            source_end_ms=800.0,
+        ),
+    )
+    return ParentFreshnessTrace(
+        trace_csv="schema3_client_events.csv",
+        summary_json="schema3_capture_summary.json",
+        trace_sha256="c" * 64,
+        summary_sha256="d" * 64,
+        input_end_seconds=2.0,
+        sample_rate_hz=16_000,
+        channels=1,
+        bytes_per_sample=2,
+        frames=frames,
+        input_sample_zero_timestamp_ms=100.0,
+        audio_metadata_protocol_version=1,
+        audio_metadata_stream_generation=7,
+        source_end_to_receipt_availability=(
+            "available_audio_processed_end_offset_not_semantic_boundary"
+        ),
+    )
+
+
 def test_normalize_freshness_options_deduplicates_and_preserves_order():
     assert normalize_freshness_caps(None) == (5.0, 8.0, 10.0)
     assert normalize_freshness_caps([10, 5, 10, 8]) == (10.0, 5.0, 8.0)
@@ -113,6 +157,15 @@ def test_build_analysis_reports_loss_and_residuals_without_paths():
     assert analysis["semantics"]["intentionally_lossy"] is True
     assert analysis["semantics"]["live_browser_support_present"] is False
     assert analysis["semantics"]["cancellation_guard_seconds"] == 0.1
+    assert analysis["source_timing_observation"]["availability"] == (
+        "protocol_not_negotiated"
+    )
+    assert analysis["source_timing_observation"][
+        "semantic_boundary_proven"
+    ] is False
+    assert analysis["source_timing_observation"][
+        "actual_audibility_proven"
+    ] is False
     assert analysis["adaptive_no_drop_baseline"]["chunks_dropped"] == 0
     assert analysis["captured_trace"]["parent_count"] == 2
     assert analysis["captured_trace"][
@@ -152,6 +205,67 @@ def test_build_analysis_reports_loss_and_residuals_without_paths():
     assert "translated text" not in serialized
 
 
+def test_analysis_reports_source_receipt_and_deterministic_scheduled_start():
+    analysis = build_freshness_cap_analysis(
+        _source_clock_trace(),
+        freshness_caps=[5],
+        strategies=["oldest_first"],
+    )
+
+    observation = analysis["source_timing_observation"]
+    assert observation["availability"] == (
+        "available_audio_processed_end_offset_not_semantic_boundary"
+    )
+    assert observation["source_end_offset_basis"] == (
+        "mixed_audio_processed_end_only_and_asr_source_range_end_offsets"
+        "_not_semantic_boundaries"
+    )
+    assert observation["frames_with_audio_processed_end_only"] == 1
+    assert observation["frames_with_asr_source_range"] == 1
+    assert observation["semantic_boundary_proven"] is False
+    assert observation["actual_audibility_proven"] is False
+    assert observation["playback_behavior_changed"] is False
+    assert observation["source_end_to_client_receipt_ms"] == {
+        "sample_count": 2,
+        "p50_ms": 150.0,
+        "p95_ms": 400.0,
+        "max_ms": 400.0,
+    }
+    assert observation[
+        "source_end_to_deterministic_scheduled_playback_start_ms"
+    ] == {
+        "sample_count": 2,
+        "p50_ms": 200.0,
+        "p95_ms": 400.0,
+        "max_ms": 400.0,
+    }
+    assert analysis["semantics"]["audio_metadata_observation_present"] is True
+    assert "observation-only" in " ".join(
+        analysis["semantics"]["live_browser_blockers"]
+    )
+
+
+def test_markdown_labels_source_offsets_as_nonsemantic_and_nonaudibility():
+    markdown = render_freshness_cap_markdown(
+        build_freshness_cap_analysis(
+            _source_clock_trace(),
+            freshness_caps=[5],
+            strategies=["oldest_first"],
+        )
+    )
+
+    assert "Protocol-v1 source-clock observation" in markdown
+    assert "source end to client receipt" in markdown
+    assert "deterministic adaptive no-drop scheduled playback start" in markdown
+    assert "audio_processed_end_only" in markdown
+    assert "do not prove a phrase/punchline boundary" in markdown
+    assert "does not prove physical audibility" in markdown
+    assert "receives validated parent/frame metadata" in markdown
+    assert "parent-completion markers" in markdown
+    assert "retains no cancellable parent-aware queue" in markdown
+    assert "anonymous binary PCM" not in markdown
+
+
 def test_render_markdown_prominently_labels_loss_scope_and_browser_gate():
     markdown = render_freshness_cap_markdown(
         build_freshness_cap_analysis(
@@ -169,6 +283,7 @@ def test_render_markdown_prominently_labels_loss_scope_and_browser_gate():
     assert "No live playback behavior was changed" in markdown
     assert "100 ms cancellation guard" in markdown
     assert "Cancellation-guard sensitivity" in markdown
+    assert "anonymous binary PCM" in markdown
 
 
 def test_parse_cli_args_applies_defaults_dedupes_and_derives_outputs():

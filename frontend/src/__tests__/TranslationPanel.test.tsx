@@ -84,6 +84,14 @@ describe('TranslationPanel playback telemetry', () => {
     ).not.toBeInTheDocument();
   });
 
+  it('keeps the live translation transport on the legacy audio protocol', async () => {
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    render(<TranslationPanel />);
+
+    const options = vi.mocked(useWebSocket).mock.calls.at(-1)?.[0];
+    expect(options?.audioMetadataProtocolVersion).toBeUndefined();
+  });
+
   it('reports current and peak browser queue metrics during translation', async () => {
     vi.useFakeTimers();
     try {

@@ -7,9 +7,15 @@ import {
   type PlaybackMode,
   type PlaybackPolicy,
 } from '../utils/playbackPolicy';
+import type { AudioFrameObservation } from '../types/audioMetadata';
 
 export interface PlaybackScheduleEvent {
   timestampMs: number;
+  schedulePerformanceMs: number;
+  audioContextTimeAtScheduleSeconds: number;
+  scheduledStartContextSeconds: number;
+  scheduledEndContextSeconds: number;
+  projectedScheduledStartClientMs: number;
   audioBytes: number;
   sourceDurationSeconds: number;
   scheduledDurationSeconds: number;
@@ -20,6 +26,7 @@ export interface PlaybackScheduleEvent {
   modeChanged: boolean;
   aboveTarget: boolean;
   aboveLimit: boolean;
+  audioFrame?: AudioFrameObservation;
 }
 
 export interface PlaybackMetrics {
@@ -45,7 +52,10 @@ interface UseAudioPlaybackOptions {
 interface UseAudioPlaybackReturn {
   isPlaying: boolean;
   isMuted: boolean;
-  queueAudio: (audioData: ArrayBuffer) => void;
+  queueAudio: (
+    audioData: ArrayBuffer,
+    observation?: AudioFrameObservation,
+  ) => void;
   start: () => void;
   stop: () => void;
   setMuted: (muted: boolean) => void;
@@ -133,7 +143,10 @@ export function useAudioPlayback({
   }, []);
 
   const queueAudio = useCallback(
-    (audioData: ArrayBuffer) => {
+    (
+      audioData: ArrayBuffer,
+      observation?: AudioFrameObservation,
+    ) => {
       if (!isActiveRef.current) {
         return;
       }
@@ -172,7 +185,9 @@ export function useAudioPlayback({
       // Select a rate from the projected queue depth. The policy deliberately
       // preserves every speech sample; the 10-second limit is an SLA alarm,
       // not a destructive drop boundary.
-      const currentTime = ctx.currentTime;
+      const schedulePerformanceMs = performance.now();
+      const audioContextTimeAtScheduleSeconds = ctx.currentTime;
+      const currentTime = audioContextTimeAtScheduleSeconds;
       const startTime = Math.max(nextStartTimeRef.current, currentTime);
       const waitBeforePlaybackSeconds = Math.max(0, startTime - currentTime);
       const projectedQueueAtNormalRate = waitBeforePlaybackSeconds + bufferDuration;
@@ -186,6 +201,10 @@ export function useAudioPlayback({
         : selectPlaybackRate(0, policy);
       const scheduledDuration = bufferDuration / playbackRate;
       const scheduledEndTime = startTime + scheduledDuration;
+      const projectedScheduledStartClientMs = (
+        schedulePerformanceMs
+        + (startTime - audioContextTimeAtScheduleSeconds) * 1000
+      );
       const queueDepthSeconds = Math.max(0, scheduledEndTime - currentTime);
       const aboveTarget = queueDepthSeconds > policy.targetQueueSeconds;
       const aboveLimit = queueDepthSeconds > policy.limitQueueSeconds;
@@ -220,7 +239,12 @@ export function useAudioPlayback({
       playbackModeRef.current = playbackMode;
 
       onScheduleRef.current?.({
-        timestampMs: performance.now(),
+        timestampMs: schedulePerformanceMs,
+        schedulePerformanceMs,
+        audioContextTimeAtScheduleSeconds,
+        scheduledStartContextSeconds: startTime,
+        scheduledEndContextSeconds: scheduledEndTime,
+        projectedScheduledStartClientMs,
         audioBytes: audioData.byteLength,
         sourceDurationSeconds: bufferDuration,
         scheduledDurationSeconds: scheduledDuration,
@@ -231,6 +255,7 @@ export function useAudioPlayback({
         modeChanged,
         aboveTarget,
         aboveLimit,
+        ...(observation ? { audioFrame: observation } : {}),
       });
     },
     [sampleRate]

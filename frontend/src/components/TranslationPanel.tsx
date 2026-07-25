@@ -135,8 +135,8 @@ export function TranslationPanel() {
     onStatus: (status: SessionStatus, message: string) => {
       dispatch({ type: 'SET_STATUS', status, message });
     },
-    onAudio: (audio: ArrayBuffer) => {
-      queueAudio(audio);
+    onAudio: (audio, observation) => {
+      queueAudio(audio, observation);
     },
     onLevel: (rms: number) => {
       dispatch({ type: 'SET_AUDIO_LEVEL', level: rms });

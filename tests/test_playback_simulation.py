@@ -206,6 +206,8 @@ def _parent_frame(
     audio_frame_id=0,
     parent_frame_count=1,
     source_index=-1,
+    source_start_ms=None,
+    source_end_ms=None,
 ):
     return ParentAudioFrame(
         arrival_seconds=arrival_seconds,
@@ -215,6 +217,8 @@ def _parent_frame(
         parent_frame_count=parent_frame_count,
         audio_bytes=round(duration_seconds * 32_000),
         source_index=source_index,
+        source_start_ms=source_start_ms,
+        source_end_ms=source_end_ms,
     )
 
 
@@ -634,6 +638,50 @@ def test_jump_strategy_reports_residual_when_latest_parent_alone_exceeds_cap():
                 _parent_frame(0, 0.1, 1.0),
             ],
             "strictly increasing",
+        ),
+        (
+            [
+                _parent_frame(
+                    0,
+                    0.0,
+                    1.0,
+                    source_end_ms=-1.0,
+                )
+            ],
+            "source_end_ms",
+        ),
+        (
+            [
+                _parent_frame(
+                    0,
+                    0.0,
+                    1.0,
+                    source_start_ms=20.0,
+                    source_end_ms=10.0,
+                )
+            ],
+            "cannot precede",
+        ),
+        (
+            [
+                _parent_frame(
+                    0,
+                    0.0,
+                    1.0,
+                    audio_frame_id=0,
+                    parent_frame_count=2,
+                    source_end_ms=10.0,
+                ),
+                _parent_frame(
+                    0,
+                    0.1,
+                    1.0,
+                    audio_frame_id=1,
+                    parent_frame_count=2,
+                    source_end_ms=20.0,
+                ),
+            ],
+            "consistent within a parent",
         ),
     ],
 )

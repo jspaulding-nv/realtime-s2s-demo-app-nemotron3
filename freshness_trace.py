@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Load parent-aware PCM arrivals from a validated schema-3 capture.
 
-The live browser protocol currently carries anonymous binary PCM.  A schema-3
-test artifact records the server-side parent/frame identity separately from the
-client receive timestamps, however, so an offline policy replay can join the
-two evidence streams.  This module performs that join fail-closed and returns
-only neutral filenames, hashes, numeric timing, and PCM metadata.
+Legacy captures join anonymous browser PCM positionally only after every
+schema-3 invariant has passed.  Opt-in audio-metadata protocol-v1 captures are
+instead replayed through the strict receiver and reconciled against staged
+send evidence and CSV metadata.  Both paths return only neutral filenames,
+hashes, numeric timing, identity, and PCM metadata.
 """
 
 from __future__ import annotations
@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from audio_metadata_protocol import (
+    AUDIO_METADATA_PROTOCOL_VERSION,
+    AudioMetadataProtocolError,
+    AudioMetadataTracker,
+)
 from playback_simulation import ParentAudioFrame
 
 
@@ -32,6 +37,37 @@ CSV_REQUIRED_COLUMNS = {
     "chunk_index",
     "audio_bytes",
 }
+CSV_AUDIO_METADATA_COLUMNS = {
+    "protocol_version",
+    "stream_generation",
+    "parent_sequence_id",
+    "audio_frame_id",
+    "source_start_ms",
+    "source_end_ms",
+    "source_end_to_receipt_ms",
+}
+CSV_METADATA_TOLERANCE_MS = 0.00051
+FRAME_METADATA_FIELDS = (
+    "protocolVersion",
+    "streamGeneration",
+    "parentSequenceId",
+    "audioFrameId",
+    "audioBytes",
+    "sampleRateHz",
+    "channels",
+    "bytesPerSample",
+    "sourceStartMs",
+    "sourceEndMs",
+)
+PARENT_COMPLETE_METADATA_FIELDS = (
+    "protocolVersion",
+    "streamGeneration",
+    "parentSequenceId",
+    "audioFrameCount",
+    "audioBytes",
+    "sourceStartMs",
+    "sourceEndMs",
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +83,37 @@ class ParentFreshnessTrace:
     channels: int
     bytes_per_sample: int
     frames: tuple[ParentAudioFrame, ...]
+    input_sample_zero_timestamp_ms: float | None = None
+    audio_metadata_protocol_version: int | None = None
+    audio_metadata_stream_generation: int | None = None
+    source_end_to_receipt_availability: str = "protocol_not_negotiated"
+
+
+@dataclass(frozen=True)
+class _ClientPcmReceive:
+    """One privacy-safe CSV client receive row."""
+
+    timestamp_ms: float
+    chunk_index: int
+    audio_bytes: int
+    protocol_version: int | None = None
+    stream_generation: int | None = None
+    parent_sequence_id: int | None = None
+    audio_frame_id: int | None = None
+    source_start_ms: float | None = None
+    source_end_ms: float | None = None
+    source_end_to_receipt_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class _WirePcmReceive:
+    """One PCM receive reconstructed from ordered summary wire evidence."""
+
+    timestamp_ms: float
+    audio_bytes: int
+    order: int
+    metadata: dict[str, Any] | None = None
+    source_end_to_receipt_ms: float | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -98,6 +165,62 @@ def _require_number(
     if minimum is not None and normalized < minimum:
         raise ValueError(f"{field} must be at least {minimum}")
     return normalized
+
+
+def _optional_csv_number(
+    value: str | None,
+    *,
+    path: Path,
+    row_number: int,
+    field: str,
+    nonnegative: bool = True,
+) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{path.name}:{row_number}: {field} must be blank or numeric"
+        ) from exc
+    if not math.isfinite(normalized) or (nonnegative and normalized < 0):
+        raise ValueError(
+            f"{path.name}:{row_number}: {field} must be blank or "
+            + ("finite and non-negative" if nonnegative else "finite")
+        )
+    return normalized
+
+
+def _required_csv_int(
+    value: str | None,
+    *,
+    path: Path,
+    row_number: int,
+    field: str,
+    minimum: int,
+) -> int:
+    try:
+        normalized = int(value) if value is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{path.name}:{row_number}: {field} must be an integer"
+        ) from exc
+    if normalized is None or normalized < minimum:
+        raise ValueError(
+            f"{path.name}:{row_number}: {field} must be at least {minimum}"
+        )
+    return normalized
+
+
+def _numbers_match(
+    left: float | None,
+    right: float | None,
+    *,
+    tolerance: float,
+) -> bool:
+    if left is None or right is None:
+        return left is right
+    return math.isclose(left, right, rel_tol=0.0, abs_tol=tolerance)
 
 
 def _validate_parent_summaries(
@@ -267,12 +390,18 @@ def _validate_frame_layers(
 
 def _load_client_csv(
     path: Path,
-) -> tuple[list[tuple[float, int, int]], float]:
-    received: list[tuple[float, int, int]] = []
+    *,
+    audio_metadata_protocol_version: int | None,
+) -> tuple[list[_ClientPcmReceive], float]:
+    received: list[_ClientPcmReceive] = []
     input_end_values: list[float] = []
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         missing = CSV_REQUIRED_COLUMNS.difference(reader.fieldnames or ())
+        if audio_metadata_protocol_version == AUDIO_METADATA_PROTOCOL_VERSION:
+            missing.update(
+                CSV_AUDIO_METADATA_COLUMNS.difference(reader.fieldnames or ())
+            )
         if missing:
             raise ValueError(
                 f"{path.name}: missing required columns: "
@@ -306,7 +435,86 @@ def _load_client_csv(
                 raise ValueError(
                     f"{path.name}:{row_number}: audio_received bytes must be positive"
                 )
-            received.append((timestamp_ms, chunk_index, audio_bytes))
+            if audio_metadata_protocol_version is None:
+                received.append(
+                    _ClientPcmReceive(
+                        timestamp_ms=timestamp_ms,
+                        chunk_index=chunk_index,
+                        audio_bytes=audio_bytes,
+                    )
+                )
+                continue
+
+            protocol_version = _required_csv_int(
+                row.get("protocol_version"),
+                path=path,
+                row_number=row_number,
+                field="protocol_version",
+                minimum=1,
+            )
+            if protocol_version != AUDIO_METADATA_PROTOCOL_VERSION:
+                raise ValueError(
+                    f"{path.name}:{row_number}: protocol_version must equal 1"
+                )
+            source_start_ms = _optional_csv_number(
+                row.get("source_start_ms"),
+                path=path,
+                row_number=row_number,
+                field="source_start_ms",
+            )
+            source_end_ms = _optional_csv_number(
+                row.get("source_end_ms"),
+                path=path,
+                row_number=row_number,
+                field="source_end_ms",
+            )
+            if (
+                source_start_ms is not None
+                and source_end_ms is not None
+                and source_end_ms < source_start_ms
+            ):
+                raise ValueError(
+                    f"{path.name}:{row_number}: source_end_ms cannot "
+                    "precede source_start_ms"
+                )
+            received.append(
+                _ClientPcmReceive(
+                    timestamp_ms=timestamp_ms,
+                    chunk_index=chunk_index,
+                    audio_bytes=audio_bytes,
+                    protocol_version=protocol_version,
+                    stream_generation=_required_csv_int(
+                        row.get("stream_generation"),
+                        path=path,
+                        row_number=row_number,
+                        field="stream_generation",
+                        minimum=1,
+                    ),
+                    parent_sequence_id=_required_csv_int(
+                        row.get("parent_sequence_id"),
+                        path=path,
+                        row_number=row_number,
+                        field="parent_sequence_id",
+                        minimum=0,
+                    ),
+                    audio_frame_id=_required_csv_int(
+                        row.get("audio_frame_id"),
+                        path=path,
+                        row_number=row_number,
+                        field="audio_frame_id",
+                        minimum=0,
+                    ),
+                    source_start_ms=source_start_ms,
+                    source_end_ms=source_end_ms,
+                    source_end_to_receipt_ms=_optional_csv_number(
+                        row.get("source_end_to_receipt_ms"),
+                        path=path,
+                        row_number=row_number,
+                        field="source_end_to_receipt_ms",
+                        nonnegative=False,
+                    ),
+                )
+            )
 
     if len(input_end_values) != 1:
         raise ValueError(
@@ -314,17 +522,352 @@ def _load_client_csv(
         )
     if not received:
         raise ValueError(f"{path.name}: no client audio_received events found")
-    indexes = [item[1] for item in received]
+    indexes = [item.chunk_index for item in received]
     if indexes != list(range(len(received))):
         raise ValueError(
             f"{path.name}: client audio_received indexes must be contiguous"
         )
-    timestamps = [item[0] for item in received]
+    timestamps = [item.timestamp_ms for item in received]
     if any(later < earlier for earlier, later in zip(timestamps, timestamps[1:])):
         raise ValueError(
             f"{path.name}: client audio_received timestamps must be ordered"
         )
     return received, input_end_values[0]
+
+
+def _load_audio_metadata_observation(
+    summary: dict[str, Any],
+) -> tuple[int | None, dict[str, Any] | None]:
+    raw_observation = summary.get("audio_metadata_observation")
+    if raw_observation is None:
+        return None, None
+    observation = _require_dict(
+        raw_observation,
+        "audio_metadata_observation",
+    )
+    protocol_version = observation.get("protocol_version")
+    if protocol_version is None:
+        return None, observation
+    protocol_version = _require_int(
+        protocol_version,
+        "audio_metadata_observation.protocol_version",
+        minimum=1,
+    )
+    if protocol_version != AUDIO_METADATA_PROTOCOL_VERSION:
+        raise ValueError(
+            "unsupported audio metadata observation protocol version"
+        )
+    return protocol_version, observation
+
+
+def _replay_receive_events(
+    receive_events: list[Any],
+    *,
+    audio_metadata_protocol_version: int | None,
+) -> tuple[
+    list[_WirePcmReceive],
+    tuple[int, float],
+    AudioMetadataTracker | None,
+]:
+    tracker = (
+        AudioMetadataTracker(
+            enabled=True,
+            protocol_version=audio_metadata_protocol_version,
+        )
+        if audio_metadata_protocol_version is not None
+        else None
+    )
+    observed_orders: list[int] = []
+    pcm_receives: list[_WirePcmReceive] = []
+    completed_terminals: list[tuple[int, float]] = []
+
+    for index, raw_event in enumerate(receive_events):
+        event = _require_dict(raw_event, f"websocket_receive_events[{index}]")
+        order = _require_int(
+            event.get("order"),
+            f"websocket_receive_events[{index}].order",
+            minimum=0,
+        )
+        observed_orders.append(order)
+        frame_type = event.get("frame_type")
+
+        if frame_type == "pcm":
+            timestamp_ms = _require_number(
+                event.get("timestamp_ms"),
+                f"websocket_receive_events[{index}].timestamp_ms",
+                minimum=0,
+            )
+            audio_bytes = _require_int(
+                event.get("audio_bytes"),
+                f"websocket_receive_events[{index}].audio_bytes",
+                minimum=1,
+            )
+            metadata: dict[str, Any] | None = None
+            if tracker is not None:
+                try:
+                    metadata = tracker.accept_binary_size(audio_bytes)
+                except AudioMetadataProtocolError as exc:
+                    raise ValueError(
+                        f"websocket_receive_events[{index}] metadata "
+                        f"invalid: {exc}"
+                    ) from exc
+                if metadata is None:
+                    raise ValueError(
+                        "negotiated PCM did not pair with audio metadata"
+                    )
+                captured = {
+                    field: event.get(field) for field in FRAME_METADATA_FIELDS
+                }
+                expected = {
+                    field: metadata[field] for field in FRAME_METADATA_FIELDS
+                }
+                if captured != expected:
+                    raise ValueError(
+                        "PCM metadata does not match its preceding audio_frame"
+                    )
+            pcm_receives.append(
+                _WirePcmReceive(
+                    timestamp_ms=timestamp_ms,
+                    audio_bytes=audio_bytes,
+                    order=order,
+                    metadata=metadata,
+                    source_end_to_receipt_ms=(
+                        _require_number(
+                            event.get("sourceEndToReceiptMs"),
+                            (
+                                f"websocket_receive_events[{index}]"
+                                ".sourceEndToReceiptMs"
+                            ),
+                        )
+                        if event.get("sourceEndToReceiptMs") is not None
+                        else None
+                    ),
+                )
+            )
+            continue
+
+        if frame_type != "control":
+            if tracker is not None:
+                raise ValueError(
+                    f"websocket_receive_events[{index}].frame_type is invalid"
+                )
+            continue
+
+        message_type = event.get("message_type")
+        if tracker is not None:
+            try:
+                if message_type == "audio_frame":
+                    tracker.accept_control(
+                        {
+                            "type": "audio_frame",
+                            **{
+                                field: event.get(field)
+                                for field in FRAME_METADATA_FIELDS
+                            },
+                        }
+                    )
+                elif message_type == "audio_parent_complete":
+                    tracker.accept_control(
+                        {
+                            "type": "audio_parent_complete",
+                            **{
+                                field: event.get(field)
+                                for field in PARENT_COMPLETE_METADATA_FIELDS
+                            },
+                        }
+                    )
+                else:
+                    tracker.accept_control({"type": message_type})
+            except AudioMetadataProtocolError as exc:
+                raise ValueError(
+                    f"websocket_receive_events[{index}] metadata "
+                    f"invalid: {exc}"
+                ) from exc
+        elif message_type in {"audio_frame", "audio_parent_complete"}:
+            raise ValueError(
+                "audio metadata was captured without protocol negotiation"
+            )
+
+        if message_type == "status" and event.get("status") == "completed":
+            completed_terminal = (
+                order,
+                _require_number(
+                    event.get("timestamp_ms"),
+                    f"websocket_receive_events[{index}].timestamp_ms",
+                    minimum=0,
+                ),
+            )
+            if tracker is not None:
+                try:
+                    tracker.assert_terminal_ready()
+                except AudioMetadataProtocolError as exc:
+                    raise ValueError(
+                        f"websocket_receive_events[{index}] metadata "
+                        f"invalid: {exc}"
+                    ) from exc
+            completed_terminals.append(completed_terminal)
+
+    if observed_orders != list(range(len(observed_orders))):
+        raise ValueError("WebSocket receive event order is not contiguous")
+    if len(completed_terminals) != 1:
+        raise ValueError(
+            "exactly one completed WebSocket terminal is required"
+        )
+    completed_order, _ = completed_terminals[0]
+    if any(event.order > completed_order for event in pcm_receives):
+        raise ValueError("WebSocket PCM was received after completed terminal")
+    if any(
+        later.timestamp_ms < earlier.timestamp_ms
+        for earlier, later in zip(pcm_receives, pcm_receives[1:])
+    ):
+        raise ValueError("WebSocket PCM receive timestamps are not ordered")
+    if tracker is not None and not tracker.terminal_received:
+        raise ValueError("audio metadata capture has no completed terminal")
+    return pcm_receives, completed_terminals[0], tracker
+
+
+def _nearest_rank(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
+
+
+def _validate_observation_summary(
+    observation: dict[str, Any],
+    *,
+    tracker: AudioMetadataTracker,
+    pcm_receives: list[_WirePcmReceive],
+    input_sample_zero_timestamp_ms: float,
+) -> str:
+    if observation.get("playback_behavior_changed") is not False:
+        raise ValueError(
+            "audio metadata observation must not change playback behavior"
+        )
+    if observation.get("contains_transcript_or_translation_text") is not False:
+        raise ValueError(
+            "audio metadata observation must not contain transcript or "
+            "translation text"
+        )
+    stream_generation = _require_int(
+        observation.get("stream_generation"),
+        "audio_metadata_observation.stream_generation",
+        minimum=1,
+    )
+    if stream_generation != tracker.stream_generation:
+        raise ValueError(
+            "audio metadata stream generation summary does not reconcile"
+        )
+    if _require_int(
+        observation.get("paired_frames"),
+        "audio_metadata_observation.paired_frames",
+        minimum=0,
+    ) != len(tracker.paired_frames):
+        raise ValueError(
+            "audio metadata paired-frame count does not reconcile"
+        )
+    if _require_int(
+        observation.get("completed_parents"),
+        "audio_metadata_observation.completed_parents",
+        minimum=0,
+    ) != len(tracker.completed_parents):
+        raise ValueError(
+            "audio metadata completed-parent count does not reconcile"
+        )
+
+    source_summary = _require_dict(
+        observation.get("source_end_to_receipt"),
+        "audio_metadata_observation.source_end_to_receipt",
+    )
+    if source_summary.get("clock") != "client_monotonic":
+        raise ValueError("source-end receipt clock must be client_monotonic")
+    if source_summary.get("source_offset_origin") != "input_pcm_sample_zero":
+        raise ValueError(
+            "source-end offsets must originate at input PCM sample zero"
+        )
+    if source_summary.get("semantic_boundary_proven") is not False:
+        raise ValueError("source-end evidence is not a semantic boundary")
+    if source_summary.get("actual_audibility_proven") is not False:
+        raise ValueError("source-end evidence does not prove audibility")
+
+    samples: list[float] = []
+    source_end_frames: list[dict[str, Any]] = []
+    for index, event in enumerate(pcm_receives):
+        metadata = event.metadata
+        if metadata is None:
+            raise ValueError("protocol-v1 PCM is missing replayed metadata")
+        source_end_ms = metadata["sourceEndMs"]
+        observed_delay = event.source_end_to_receipt_ms
+        if source_end_ms is None:
+            if observed_delay is not None:
+                raise ValueError(
+                    "sourceEndToReceiptMs requires a sourceEndMs offset"
+                )
+            continue
+        source_end_frames.append(metadata)
+        expected_delay = (
+            event.timestamp_ms
+            - input_sample_zero_timestamp_ms
+            - source_end_ms
+        )
+        if observed_delay is None or not math.isclose(
+            observed_delay,
+            expected_delay,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                f"wire sourceEndToReceiptMs {index} is inconsistent"
+            )
+        samples.append(expected_delay)
+
+    if not samples:
+        availability = "unavailable_missing_source_end_offsets"
+    elif any(
+        metadata["sourceStartMs"] is None
+        for metadata in source_end_frames
+    ):
+        availability = (
+            "available_audio_processed_end_offset_not_semantic_boundary"
+        )
+    else:
+        availability = "available_asr_source_range_end_offset"
+    if source_summary.get("availability") != availability:
+        raise ValueError(
+            "source-end receipt availability summary does not reconcile"
+        )
+    if _require_int(
+        source_summary.get("sample_count"),
+        "audio_metadata_observation.source_end_to_receipt.sample_count",
+        minimum=0,
+    ) != len(samples):
+        raise ValueError(
+            "source-end receipt sample count does not reconcile"
+        )
+    for field, expected in (
+        ("p50_ms", _nearest_rank(samples, 0.50)),
+        ("p95_ms", _nearest_rank(samples, 0.95)),
+        ("max_ms", max(samples, default=None)),
+    ):
+        observed = source_summary.get(field)
+        if expected is None:
+            if observed is not None:
+                raise ValueError(
+                    f"source-end receipt {field} must be null without samples"
+                )
+        elif not math.isclose(
+            _require_number(
+                observed,
+                f"audio_metadata_observation.source_end_to_receipt.{field}",
+            ),
+            expected,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                f"source-end receipt {field} does not reconcile"
+            )
+    return availability
 
 
 def load_parent_freshness_trace(
@@ -336,9 +879,11 @@ def load_parent_freshness_trace(
 ) -> ParentFreshnessTrace:
     """Join CSV client arrivals to schema-3 parent/frame evidence.
 
-    The join is positional only after every count, identity, byte, timestamp,
-    and completion invariant has been checked.  A malformed or incomplete
-    capture raises ``ValueError`` rather than producing a partial simulation.
+    Legacy evidence is joined positionally only after every count, byte,
+    timestamp, and completion invariant has passed. Protocol-v1 evidence is
+    joined by its replay-validated parent/frame identity. A malformed or
+    incomplete capture raises ``ValueError`` rather than producing a partial
+    simulation.
     """
 
     csv_path = Path(csv_path)
@@ -370,6 +915,10 @@ def load_parent_freshness_trace(
 
     with summary_path.open(encoding="utf-8") as handle:
         summary = _require_dict(json.load(handle), "summary")
+    (
+        audio_metadata_protocol_version,
+        audio_metadata_observation,
+    ) = _load_audio_metadata_observation(summary)
     if summary.get("pipeline_mode") != "staged":
         raise ValueError("freshness replay requires a staged capture")
     integrity = _require_dict(summary.get("staged_integrity"), "staged_integrity")
@@ -392,6 +941,15 @@ def load_parent_freshness_trace(
         raise ValueError("backend config is not telemetry schema 3")
     if staged_config.get("ttsIncrementalPublishEnabled") is not True:
         raise ValueError("backend config did not enable incremental TTS")
+    if (
+        audio_metadata_protocol_version == AUDIO_METADATA_PROTOCOL_VERSION
+        and backend_config.get("audioMetadataProtocolVersions")
+        != [AUDIO_METADATA_PROTOCOL_VERSION]
+    ):
+        raise ValueError(
+            "backend config did not advertise audio metadata protocol "
+            "version 1"
+        )
     sample_rate_hz = _require_int(
         backend_config.get("sampleRate"),
         "backend_config.sampleRate",
@@ -424,76 +982,34 @@ def load_parent_freshness_trace(
         summary.get("websocket_receive_events"),
         "websocket_receive_events",
     )
-    observed_orders: list[int] = []
-    pcm_receives: list[tuple[float, int, int]] = []
-    completed_terminals: list[tuple[int, float]] = []
-    for index, raw_event in enumerate(receive_events):
-        event = _require_dict(raw_event, f"websocket_receive_events[{index}]")
-        order = _require_int(
-            event.get("order"),
-            f"websocket_receive_events[{index}].order",
-            minimum=0,
-        )
-        observed_orders.append(order)
-        if (
-            event.get("frame_type") == "control"
-            and event.get("message_type") == "status"
-            and event.get("status") == "completed"
-        ):
-            completed_terminals.append(
-                (
-                    order,
-                    _require_number(
-                        event.get("timestamp_ms"),
-                        (
-                            f"websocket_receive_events[{index}]"
-                            ".timestamp_ms"
-                        ),
-                        minimum=0,
-                    ),
-                )
-            )
-        if event.get("frame_type") != "pcm":
-            continue
-        timestamp_ms = _require_number(
-            event.get("timestamp_ms"),
-            f"websocket_receive_events[{index}].timestamp_ms",
-            minimum=0,
-        )
-        audio_bytes = _require_int(
-            event.get("audio_bytes"),
-            f"websocket_receive_events[{index}].audio_bytes",
-            minimum=1,
-        )
-        pcm_receives.append((timestamp_ms, audio_bytes, order))
-    if observed_orders != list(range(len(observed_orders))):
-        raise ValueError("WebSocket receive event order is not contiguous")
-    if len(completed_terminals) != 1:
-        raise ValueError(
-            "exactly one completed WebSocket terminal is required"
-        )
-    completed_order, completed_timestamp_ms = completed_terminals[0]
-    if any(order > completed_order for _, _, order in pcm_receives):
-        raise ValueError("WebSocket PCM was received after completed terminal")
-    if [item[1] for item in pcm_receives] != frame_bytes:
+    (
+        pcm_receives,
+        (_, completed_timestamp_ms),
+        metadata_tracker,
+    ) = _replay_receive_events(
+        receive_events,
+        audio_metadata_protocol_version=audio_metadata_protocol_version,
+    )
+    if [item.audio_bytes for item in pcm_receives] != frame_bytes:
         raise ValueError("WebSocket receive PCM bytes disagree with send evidence")
-    if any(
-        later[0] < earlier[0]
-        for earlier, later in zip(pcm_receives, pcm_receives[1:])
-    ):
-        raise ValueError("WebSocket PCM receive timestamps are not ordered")
 
-    csv_receives, csv_input_end_ms = _load_client_csv(csv_path)
+    csv_receives, csv_input_end_ms = _load_client_csv(
+        csv_path,
+        audio_metadata_protocol_version=audio_metadata_protocol_version,
+    )
     if len(csv_receives) != len(frame_keys):
         raise ValueError("CSV client PCM count disagrees with schema-3 evidence")
-    if [item[2] for item in csv_receives] != frame_bytes:
+    if [item.audio_bytes for item in csv_receives] != frame_bytes:
         raise ValueError("CSV client PCM bytes disagree with schema-3 evidence")
     if len(pcm_receives) != len(csv_receives):
         raise ValueError("summary and CSV client PCM counts disagree")
-    for index, ((csv_ms, _, _), (summary_ms, _, _)) in enumerate(
+    for index, (csv_receive, wire_receive) in enumerate(
         zip(csv_receives, pcm_receives)
     ):
-        if abs(csv_ms - summary_ms) > float(timestamp_tolerance_ms):
+        if (
+            abs(csv_receive.timestamp_ms - wire_receive.timestamp_ms)
+            > float(timestamp_tolerance_ms)
+        ):
             raise ValueError(
                 f"summary and CSV client PCM timestamp {index} disagree"
             )
@@ -513,24 +1029,166 @@ def load_parent_freshness_trace(
             "completed WebSocket terminal arrived before input ended"
         )
 
+    input_sample_zero_timestamp_ms: float | None = None
+    audio_metadata_stream_generation: int | None = None
+    source_end_to_receipt_availability = "protocol_not_negotiated"
+    if audio_metadata_protocol_version is not None:
+        if audio_metadata_observation is None or metadata_tracker is None:
+            raise ValueError(
+                "protocol-v1 capture is missing its observation summary"
+            )
+        input_sample_zero_timestamp_ms = _require_number(
+            audio_metadata_observation.get(
+                "input_sample_zero_timestamp_ms"
+            ),
+            "audio_metadata_observation.input_sample_zero_timestamp_ms",
+            minimum=0,
+        )
+        if len(metadata_tracker.paired_frames) != len(frame_keys):
+            raise ValueError(
+                "audio metadata paired-frame count disagrees with staged evidence"
+            )
+        if len(metadata_tracker.completed_parents) != len(parent_shape):
+            raise ValueError(
+                "audio metadata parent completions disagree with staged evidence"
+            )
+
+        for index, (metadata, key, expected_bytes) in enumerate(
+            zip(
+                metadata_tracker.paired_frames,
+                frame_keys,
+                frame_bytes,
+            )
+        ):
+            if (
+                metadata["parentSequenceId"]
+                != key["parent_sequence_id"]
+                or metadata["audioFrameId"] != key["audio_frame_id"]
+            ):
+                raise ValueError(
+                    f"audio metadata frame identity {index} disagrees "
+                    "with staged send evidence"
+                )
+            if metadata["audioBytes"] != expected_bytes:
+                raise ValueError(
+                    f"audio metadata frame bytes {index} disagree with "
+                    "staged send evidence"
+                )
+            if (
+                metadata["sampleRateHz"] != sample_rate_hz
+                or metadata["channels"] != channels
+                or metadata["bytesPerSample"] != bytes_per_sample
+            ):
+                raise ValueError(
+                    f"audio metadata PCM format {index} disagrees with "
+                    "capture configuration"
+                )
+
+        for parent_id, completion in enumerate(
+            metadata_tracker.completed_parents
+        ):
+            expected_count, expected_bytes = parent_shape[parent_id]
+            if (
+                completion["parentSequenceId"] != parent_id
+                or completion["audioFrameCount"] != expected_count
+                or completion["audioBytes"] != expected_bytes
+            ):
+                raise ValueError(
+                    f"audio metadata parent completion {parent_id} "
+                    "disagrees with staged evidence"
+                )
+
+        for index, (csv_receive, wire_receive) in enumerate(
+            zip(csv_receives, pcm_receives)
+        ):
+            metadata = wire_receive.metadata
+            if metadata is None:
+                raise ValueError(
+                    f"protocol-v1 PCM frame {index} is missing metadata"
+                )
+            if (
+                csv_receive.protocol_version
+                != metadata["protocolVersion"]
+                or csv_receive.stream_generation
+                != metadata["streamGeneration"]
+                or csv_receive.parent_sequence_id
+                != metadata["parentSequenceId"]
+                or csv_receive.audio_frame_id
+                != metadata["audioFrameId"]
+            ):
+                raise ValueError(
+                    f"CSV audio metadata identity {index} disagrees "
+                    "with wire evidence"
+                )
+            if not _numbers_match(
+                csv_receive.source_start_ms,
+                metadata["sourceStartMs"],
+                tolerance=CSV_METADATA_TOLERANCE_MS,
+            ) or not _numbers_match(
+                csv_receive.source_end_ms,
+                metadata["sourceEndMs"],
+                tolerance=CSV_METADATA_TOLERANCE_MS,
+            ):
+                raise ValueError(
+                    f"CSV source offsets {index} disagree with wire evidence"
+                )
+            if not _numbers_match(
+                csv_receive.source_end_to_receipt_ms,
+                wire_receive.source_end_to_receipt_ms,
+                tolerance=CSV_METADATA_TOLERANCE_MS,
+            ):
+                raise ValueError(
+                    f"CSV source-end receipt delay {index} disagrees "
+                    "with wire evidence"
+                )
+
+        source_end_to_receipt_availability = (
+            _validate_observation_summary(
+                audio_metadata_observation,
+                tracker=metadata_tracker,
+                pcm_receives=pcm_receives,
+                input_sample_zero_timestamp_ms=(
+                    input_sample_zero_timestamp_ms
+                ),
+            )
+        )
+        audio_metadata_stream_generation = (
+            metadata_tracker.stream_generation
+        )
+
     frames: list[ParentAudioFrame] = []
-    for source_index, (
-        (arrival_ms, _, audio_bytes),
-        key,
-    ) in enumerate(zip(csv_receives, frame_keys)):
+    for source_index, (csv_receive, key, wire_receive) in enumerate(
+        zip(csv_receives, frame_keys, pcm_receives)
+    ):
         parent_id = key["parent_sequence_id"]
+        metadata = wire_receive.metadata
         frames.append(
             ParentAudioFrame(
-                arrival_seconds=arrival_ms / 1000.0,
+                arrival_seconds=(
+                    wire_receive.timestamp_ms
+                    if metadata is not None
+                    else csv_receive.timestamp_ms
+                )
+                / 1000.0,
                 duration_seconds=(
-                    audio_bytes
+                    csv_receive.audio_bytes
                     / (sample_rate_hz * channels * bytes_per_sample)
                 ),
-                audio_bytes=audio_bytes,
+                audio_bytes=csv_receive.audio_bytes,
                 source_index=source_index,
                 parent_sequence_id=parent_id,
                 audio_frame_id=key["audio_frame_id"],
                 parent_frame_count=parent_shape[parent_id][0],
+                source_start_ms=(
+                    metadata["sourceStartMs"]
+                    if metadata is not None
+                    else None
+                ),
+                source_end_ms=(
+                    metadata["sourceEndMs"]
+                    if metadata is not None
+                    else None
+                ),
             )
         )
 
@@ -544,4 +1202,10 @@ def load_parent_freshness_trace(
         channels=channels,
         bytes_per_sample=bytes_per_sample,
         frames=tuple(frames),
+        input_sample_zero_timestamp_ms=input_sample_zero_timestamp_ms,
+        audio_metadata_protocol_version=audio_metadata_protocol_version,
+        audio_metadata_stream_generation=audio_metadata_stream_generation,
+        source_end_to_receipt_availability=(
+            source_end_to_receipt_availability
+        ),
     )

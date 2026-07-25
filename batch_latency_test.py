@@ -37,6 +37,12 @@ import numpy as np
 import requests
 import websockets
 
+from audio_metadata_protocol import (
+    AUDIO_METADATA_PROTOCOL_VERSION,
+    AudioMetadataProtocolError,
+    AudioMetadataTracker,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -70,6 +76,13 @@ class TimingEvent:
     chunk_index: int
     source_position_sec: float
     audio_bytes: int
+    protocol_version: int | None = None
+    stream_generation: int | None = None
+    parent_sequence_id: int | None = None
+    audio_frame_id: int | None = None
+    source_start_ms: float | None = None
+    source_end_ms: float | None = None
+    source_end_to_receipt_ms: float | None = None
 
 
 @dataclass
@@ -91,6 +104,16 @@ class TestResult:
     staged_pipeline: Any = None
     staged_integrity_errors: list[str] = field(default_factory=list)
     websocket_receive_events: list[dict[str, Any]] = field(default_factory=list)
+    audio_metadata_protocol_version: int | None = None
+    audio_metadata_stream_generation: int | None = None
+    input_sample_zero_timestamp_ms: float | None = None
+    audio_metadata_paired_frames: int = 0
+    audio_metadata_completed_parents: int = 0
+    source_end_to_receipt_samples_ms: list[float] = field(default_factory=list)
+    source_end_to_receipt_p50_ms: float | None = None
+    source_end_to_receipt_p95_ms: float | None = None
+    source_end_to_receipt_max_ms: float | None = None
+    source_end_to_receipt_availability: str = "protocol_not_negotiated"
     chunks_sent: int = 0
     audio_responses: int = 0
     total_received_bytes: int = 0
@@ -2310,6 +2333,269 @@ def validate_staged_pipeline_integrity(
     return errors
 
 
+def validate_audio_metadata_observation(result: TestResult) -> list[str]:
+    """Replay captured wire evidence and fail closed on v1 inconsistencies."""
+
+    if result.audio_metadata_protocol_version is None:
+        if any(
+            isinstance(event, dict)
+            and event.get("message_type")
+            in {"audio_frame", "audio_parent_complete"}
+            for event in result.websocket_receive_events
+        ):
+            return [
+                "audio metadata was captured without protocol negotiation"
+            ]
+        return []
+    if (
+        result.audio_metadata_protocol_version
+        != AUDIO_METADATA_PROTOCOL_VERSION
+    ):
+        return ["audio metadata protocol version must equal 1"]
+
+    tracker = AudioMetadataTracker(
+        enabled=True,
+        protocol_version=result.audio_metadata_protocol_version,
+    )
+    errors: list[str] = []
+    observed_orders: list[int] = []
+    completed_terminals = 0
+    frame_fields = (
+        "protocolVersion",
+        "streamGeneration",
+        "parentSequenceId",
+        "audioFrameId",
+        "audioBytes",
+        "sampleRateHz",
+        "channels",
+        "bytesPerSample",
+        "sourceStartMs",
+        "sourceEndMs",
+    )
+    completion_fields = (
+        "protocolVersion",
+        "streamGeneration",
+        "parentSequenceId",
+        "audioFrameCount",
+        "audioBytes",
+        "sourceStartMs",
+        "sourceEndMs",
+    )
+
+    for index, event in enumerate(result.websocket_receive_events):
+        if not isinstance(event, dict):
+            errors.append(
+                f"websocket_receive_events[{index}] must be an object"
+            )
+            continue
+        order = event.get("order")
+        if (
+            not isinstance(order, int)
+            or isinstance(order, bool)
+            or order < 0
+        ):
+            errors.append(
+                f"websocket_receive_events[{index}].order is invalid"
+            )
+        else:
+            observed_orders.append(order)
+        try:
+            if event.get("frame_type") == "pcm":
+                paired = tracker.accept_binary_size(event.get("audio_bytes"))
+                if paired is None:
+                    raise AudioMetadataProtocolError(
+                        "negotiated PCM did not pair with metadata"
+                    )
+                captured = {
+                    field_name: event.get(field_name)
+                    for field_name in frame_fields
+                }
+                if captured != {
+                    field_name: paired[field_name]
+                    for field_name in frame_fields
+                }:
+                    raise AudioMetadataProtocolError(
+                        "PCM metadata does not match its preceding header"
+                    )
+                if (
+                    paired["sourceEndMs"] is not None
+                    and result.input_sample_zero_timestamp_ms is not None
+                ):
+                    expected_delay = (
+                        float(event["timestamp_ms"])
+                        - result.input_sample_zero_timestamp_ms
+                        - paired["sourceEndMs"]
+                    )
+                    observed_delay = event.get(
+                        "sourceEndToReceiptMs"
+                    )
+                    if (
+                        not isinstance(observed_delay, (int, float))
+                        or isinstance(observed_delay, bool)
+                        or not math.isfinite(observed_delay)
+                        or not math.isclose(
+                            float(observed_delay),
+                            expected_delay,
+                            rel_tol=0.0,
+                            abs_tol=1e-6,
+                        )
+                    ):
+                        raise AudioMetadataProtocolError(
+                            "sourceEndToReceiptMs is inconsistent"
+                        )
+                continue
+
+            message_type = event.get("message_type")
+            if message_type == "audio_frame":
+                payload = {
+                    "type": "audio_frame",
+                    **{
+                        field_name: event.get(field_name)
+                        for field_name in frame_fields
+                    },
+                }
+                tracker.accept_control(payload)
+            elif message_type == "audio_parent_complete":
+                payload = {
+                    "type": "audio_parent_complete",
+                    **{
+                        field_name: event.get(field_name)
+                        for field_name in completion_fields
+                    },
+                }
+                tracker.accept_control(payload)
+            else:
+                tracker.accept_control({"type": message_type})
+                if (
+                    message_type == "status"
+                    and event.get("status") == "completed"
+                ):
+                    tracker.assert_terminal_ready()
+                    completed_terminals += 1
+        except (AudioMetadataProtocolError, KeyError, TypeError, ValueError) as exc:
+            errors.append(
+                f"websocket_receive_events[{index}] metadata invalid: {exc}"
+            )
+
+    if observed_orders != list(range(len(observed_orders))):
+        errors.append(
+            "audio metadata receive order must be contiguous from zero"
+        )
+    if completed_terminals != 1:
+        errors.append(
+            "audio metadata capture requires exactly one completed terminal"
+        )
+    if tracker.pending_frame is not None:
+        errors.append("audio metadata capture has a dangling frame header")
+    if tracker.active_parent_sequence_id is not None:
+        errors.append("audio metadata capture has an incomplete parent")
+    if result.audio_metadata_stream_generation != tracker.stream_generation:
+        errors.append(
+            "audio metadata stream generation summary does not reconcile"
+        )
+    if result.audio_metadata_paired_frames != len(tracker.paired_frames):
+        errors.append("audio metadata paired-frame count does not reconcile")
+    if result.audio_metadata_completed_parents != len(
+        tracker.completed_parents
+    ):
+        errors.append(
+            "audio metadata completed-parent count does not reconcile"
+        )
+    if result.audio_metadata_paired_frames != result.audio_responses:
+        errors.append(
+            "every translated PCM response must have one paired frame header"
+        )
+    configured_sample_rate = result.backend_config.get("sampleRate")
+    configured_channels = result.backend_config.get("channels")
+    if any(
+        frame["sampleRateHz"] != configured_sample_rate
+        or frame["channels"] != configured_channels
+        for frame in tracker.paired_frames
+    ):
+        errors.append(
+            "wire PCM format does not match /api/config audio format"
+        )
+    staged = result.staged_pipeline
+    if not isinstance(staged, dict):
+        errors.append(
+            "audio metadata capture requires staged pipeline evidence"
+        )
+    else:
+        send_events = staged.get("websocket_send_events")
+        if not isinstance(send_events, list):
+            errors.append(
+                "audio metadata capture requires WebSocket send evidence"
+            )
+        else:
+            expected_frames = [
+                {
+                    "parentSequenceId": event.get(
+                        "parent_sequence_id"
+                    ),
+                    "audioFrameId": event.get("audio_frame_id"),
+                    "audioBytes": event.get("audio_bytes"),
+                }
+                for event in send_events
+                if isinstance(event, dict)
+            ]
+            observed_frames = [
+                {
+                    "parentSequenceId": frame["parentSequenceId"],
+                    "audioFrameId": frame["audioFrameId"],
+                    "audioBytes": frame["audioBytes"],
+                }
+                for frame in tracker.paired_frames
+            ]
+            if expected_frames != observed_frames:
+                errors.append(
+                    "wire frame metadata does not reconcile with server "
+                    "WebSocket send evidence"
+                )
+        parent_summaries = staged.get(
+            "websocket_completed_parent_summaries"
+        )
+        if not isinstance(parent_summaries, list):
+            errors.append(
+                "audio metadata capture requires server parent-completion "
+                "evidence"
+            )
+        else:
+            expected_parents = [
+                {
+                    "parentSequenceId": parent.get(
+                        "parent_sequence_id"
+                    ),
+                    "audioFrameCount": parent.get("audio_frame_count"),
+                    "audioBytes": parent.get("audio_bytes"),
+                }
+                for parent in parent_summaries
+                if isinstance(parent, dict)
+            ]
+            observed_parents = [
+                {
+                    "parentSequenceId": parent["parentSequenceId"],
+                    "audioFrameCount": parent["audioFrameCount"],
+                    "audioBytes": parent["audioBytes"],
+                }
+                for parent in tracker.completed_parents
+            ]
+            if expected_parents != observed_parents:
+                errors.append(
+                    "wire parent completions do not reconcile with server "
+                    "completion evidence"
+                )
+    if (
+        not isinstance(result.input_sample_zero_timestamp_ms, (int, float))
+        or isinstance(result.input_sample_zero_timestamp_ms, bool)
+        or not math.isfinite(result.input_sample_zero_timestamp_ms)
+        or result.input_sample_zero_timestamp_ms < 0
+    ):
+        errors.append(
+            "audio metadata capture requires an input sample-zero marker"
+        )
+    return errors
+
+
 def validate_capture_result(result: TestResult) -> list[str]:
     """Return operational failures that make a batch capture incomplete."""
     errors: list[str] = []
@@ -2355,6 +2641,7 @@ def validate_capture_result(result: TestResult) -> list[str]:
             abs_tol=1e-6,
         ):
             errors.append("terminal arrival lag is inconsistent with timestamps")
+    errors.extend(validate_audio_metadata_observation(result))
     errors.extend(result.staged_integrity_errors)
     return errors
 
@@ -2443,11 +2730,38 @@ def progress_bar(current: float, total: float, width: int = 20) -> str:
     return bar
 
 
+def nearest_rank(values: list[float], quantile: float) -> float | None:
+    """Return the nearest-rank quantile used by capture summaries."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(quantile * len(ordered)) - 1)
+    return ordered[index]
+
+
 # ---------------------------------------------------------------------------
 # Core test runner
 # ---------------------------------------------------------------------------
-async def run_test(audio_path: str, backend_url: str) -> TestResult:
+async def run_test(
+    audio_path: str,
+    backend_url: str,
+    *,
+    audio_metadata_protocol_version: int | None = None,
+) -> TestResult:
     """Run a single latency test against one audio file."""
+
+    if (
+        audio_metadata_protocol_version is not None
+        and (
+            not isinstance(audio_metadata_protocol_version, int)
+            or isinstance(audio_metadata_protocol_version, bool)
+            or audio_metadata_protocol_version
+            != AUDIO_METADATA_PROTOCOL_VERSION
+        )
+    ):
+        raise ValueError(
+            "audio_metadata_protocol_version must be omitted or equal 1"
+        )
 
     ws_url = backend_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/ws/translate"
@@ -2463,6 +2777,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         duration_sec=duration_sec,
         backend_url=backend_url.rstrip("/"),
         target_language=TARGET_LANGUAGE,
+        audio_metadata_protocol_version=audio_metadata_protocol_version,
     )
     (
         result.backend_config,
@@ -2488,6 +2803,17 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         f"Backend pipeline: {result.pipeline_mode} "
         f"(source: {result.pipeline_mode_source})"
     )
+    if audio_metadata_protocol_version is not None:
+        supported_metadata_versions = result.backend_config.get(
+            "audioMetadataProtocolVersions"
+        )
+        if supported_metadata_versions != [
+            audio_metadata_protocol_version
+        ]:
+            raise RuntimeError(
+                "/api/config does not advertise audio metadata "
+                f"protocol version {audio_metadata_protocol_version}"
+            )
     pcm_bytes = pcm.tobytes()
     total_chunks = (len(pcm_bytes) + CHUNK_BYTES - 1) // CHUNK_BYTES
 
@@ -2499,8 +2825,12 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
     # -- Connect WebSocket --------------------------------------------------
     print(f"Connecting to {ws_url}...", flush=True)
     test_start_time = time.monotonic()
-    client_start_epoch = time.time()
+    client_clock_origin = time.monotonic()
     receive_order = 0
+    metadata_tracker = AudioMetadataTracker(
+        enabled=audio_metadata_protocol_version is not None,
+        protocol_version=audio_metadata_protocol_version,
+    )
 
     def record_receive(
         *,
@@ -2508,11 +2838,13 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         received_at: float,
         control: dict[str, Any] | None = None,
         audio_bytes: int = 0,
+        metadata: dict[str, Any] | None = None,
+        source_end_to_receipt_ms: float | None = None,
     ) -> dict[str, Any]:
         nonlocal receive_order
         event: dict[str, Any] = {
             "order": receive_order,
-            "timestamp_ms": (received_at - client_start_epoch) * 1000,
+            "timestamp_ms": (received_at - client_clock_origin) * 1000,
             "frame_type": frame_type,
             "audio_bytes": audio_bytes,
         }
@@ -2521,6 +2853,24 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             event["status"] = control.get("status")
             if control.get("type") == "error":
                 event["message"] = control.get("message")
+        if metadata is not None:
+            for field_name in (
+                "protocolVersion",
+                "streamGeneration",
+                "parentSequenceId",
+                "audioFrameId",
+                "audioFrameCount",
+                "audioBytes",
+                "sampleRateHz",
+                "channels",
+                "bytesPerSample",
+                "sourceStartMs",
+                "sourceEndMs",
+            ):
+                if field_name in metadata:
+                    event[field_name] = metadata[field_name]
+        if source_end_to_receipt_ms is not None:
+            event["sourceEndToReceiptMs"] = source_end_to_receipt_ms
         result.websocket_receive_events.append(event)
         receive_order += 1
         return event
@@ -2538,26 +2888,33 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
         # Wait for "connected" status
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
         msg = json.loads(raw)
+        metadata_tracker.accept_control(msg)
         record_receive(
             frame_type="control",
-            received_at=time.time(),
+            received_at=time.monotonic(),
             control=msg,
         )
         if msg.get("status") != "connected":
             raise RuntimeError(f"Unexpected initial message: {msg}")
 
         # Send start_stream
-        await ws.send(json.dumps({
+        start_stream_message = {
             "type": "start_stream",
             "targetLanguage": TARGET_LANGUAGE,
-        }))
+        }
+        if audio_metadata_protocol_version is not None:
+            start_stream_message["audioMetadataProtocolVersion"] = (
+                audio_metadata_protocol_version
+            )
+        await ws.send(json.dumps(start_stream_message))
 
         # Wait for "listening"
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
         msg = json.loads(raw)
+        metadata_tracker.accept_control(msg)
         record_receive(
             frame_type="control",
-            received_at=time.time(),
+            received_at=time.monotonic(),
             control=msg,
         )
         if msg.get("status") != "listening":
@@ -2597,13 +2954,16 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             offset = 0
             idx = 0
             loop_start = time.monotonic()
+            result.input_sample_zero_timestamp_ms = (
+                loop_start - client_clock_origin
+            ) * 1000
 
             while offset < len(pcm_bytes):
                 if stream_abort.is_set():
                     break
 
                 chunk = pcm_bytes[offset : offset + CHUNK_BYTES]
-                send_ts = time.time()
+                send_ts = time.monotonic()
 
                 try:
                     await ws.send(chunk)
@@ -2618,7 +2978,7 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                 result.client_events.append(TimingEvent(
                     source="client",
                     stage="chunk_sent",
-                    timestamp_ms=(send_ts - client_start_epoch) * 1000,
+                    timestamp_ms=(send_ts - client_clock_origin) * 1000,
                     chunk_index=idx,
                     source_position_sec=idx * CHUNK_DURATION,
                     audio_bytes=len(chunk),
@@ -2669,11 +3029,47 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                 while True:
                     raw = await ws.recv()
                     if isinstance(raw, bytes):
-                        recv_ts = time.time()
+                        recv_ts = time.monotonic()
+                        try:
+                            paired_metadata = (
+                                metadata_tracker.accept_binary(raw)
+                            )
+                        except AudioMetadataProtocolError as exc:
+                            record_receive(
+                                frame_type="pcm",
+                                received_at=recv_ts,
+                                audio_bytes=len(raw),
+                            )
+                            server_error = (
+                                "audio metadata protocol violation: "
+                                f"{exc}"
+                            )
+                            stream_abort.set()
+                            terminal_received.set()
+                            return
+                        source_end_to_receipt_ms = None
+                        if (
+                            paired_metadata is not None
+                            and paired_metadata["sourceEndMs"] is not None
+                            and result.input_sample_zero_timestamp_ms
+                            is not None
+                        ):
+                            source_end_to_receipt_ms = (
+                                (recv_ts - client_clock_origin) * 1000
+                                - result.input_sample_zero_timestamp_ms
+                                - paired_metadata["sourceEndMs"]
+                            )
+                            result.source_end_to_receipt_samples_ms.append(
+                                source_end_to_receipt_ms
+                            )
                         record_receive(
                             frame_type="pcm",
                             received_at=recv_ts,
                             audio_bytes=len(raw),
+                            metadata=paired_metadata,
+                            source_end_to_receipt_ms=(
+                                source_end_to_receipt_ms
+                            ),
                         )
                         audio_responses += 1
                         total_recv_bytes += len(raw)
@@ -2681,30 +3077,112 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
                         result.client_events.append(TimingEvent(
                             source="client",
                             stage="audio_received",
-                            timestamp_ms=(recv_ts - client_start_epoch) * 1000,
+                            timestamp_ms=(
+                                recv_ts - client_clock_origin
+                            ) * 1000,
                             chunk_index=recv_idx,
                             source_position_sec=total_recv_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE),
                             audio_bytes=len(raw),
+                            protocol_version=(
+                                paired_metadata["protocolVersion"]
+                                if paired_metadata is not None
+                                else None
+                            ),
+                            stream_generation=(
+                                paired_metadata["streamGeneration"]
+                                if paired_metadata is not None
+                                else None
+                            ),
+                            parent_sequence_id=(
+                                paired_metadata["parentSequenceId"]
+                                if paired_metadata is not None
+                                else None
+                            ),
+                            audio_frame_id=(
+                                paired_metadata["audioFrameId"]
+                                if paired_metadata is not None
+                                else None
+                            ),
+                            source_start_ms=(
+                                paired_metadata["sourceStartMs"]
+                                if paired_metadata is not None
+                                else None
+                            ),
+                            source_end_ms=(
+                                paired_metadata["sourceEndMs"]
+                                if paired_metadata is not None
+                                else None
+                            ),
+                            source_end_to_receipt_ms=(
+                                source_end_to_receipt_ms
+                            ),
                         ))
                         recv_idx += 1
                     elif isinstance(raw, str):
                         try:
                             control = json.loads(raw)
                         except json.JSONDecodeError:
+                            try:
+                                metadata_tracker.accept_control({})
+                            except AudioMetadataProtocolError as exc:
+                                server_error = (
+                                    "audio metadata protocol violation: "
+                                    f"{exc}"
+                                )
+                                stream_abort.set()
+                                terminal_received.set()
+                                return
                             record_receive(
                                 frame_type="text",
-                                received_at=time.time(),
+                                received_at=time.monotonic(),
                             )
                             continue
+                        control_received_at = time.monotonic()
+                        try:
+                            normalized_metadata = (
+                                metadata_tracker.accept_control(control)
+                            )
+                        except AudioMetadataProtocolError as exc:
+                            record_receive(
+                                frame_type="control",
+                                received_at=control_received_at,
+                                control=control,
+                            )
+                            server_error = (
+                                "audio metadata protocol violation: "
+                                f"{exc}"
+                            )
+                            stream_abort.set()
+                            terminal_received.set()
+                            return
                         receive_event = record_receive(
                             frame_type="control",
-                            received_at=time.time(),
+                            received_at=control_received_at,
                             control=control,
+                            metadata=normalized_metadata,
                         )
+                        if (
+                            normalized_metadata is not None
+                            and normalized_metadata["type"]
+                            == "audio_parent_complete"
+                        ):
+                            result.audio_metadata_completed_parents = len(
+                                metadata_tracker.completed_parents
+                            )
                         if (
                             control.get("type") == "status"
                             and control.get("status") == "completed"
                         ):
+                            try:
+                                metadata_tracker.assert_terminal_ready()
+                            except AudioMetadataProtocolError as exc:
+                                server_error = (
+                                    "audio metadata protocol violation: "
+                                    f"{exc}"
+                                )
+                                stream_abort.set()
+                                terminal_received.set()
+                                return
                             result.terminal_arrival_timestamp_ms = float(
                                 receive_event["timestamp_ms"]
                             )
@@ -2753,9 +3231,9 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             # Close only the input side so Riva can flush final ASR/NMT/TTS
             # responses while this client keeps receiving translated audio.
             input_end_time = time.monotonic()
-            input_end_epoch = time.time()
+            input_end_epoch = time.monotonic()
             result.input_end_timestamp_ms = (
-                input_end_epoch - client_start_epoch
+                input_end_epoch - client_clock_origin
             ) * 1000
             result.client_events.append(TimingEvent(
                 source="client",
@@ -2880,6 +3358,49 @@ async def run_test(audio_path: str, backend_url: str) -> TestResult:
             result.input_end_timestamp_ms,
         )
 
+    if audio_metadata_protocol_version is not None:
+        result.audio_metadata_stream_generation = (
+            metadata_tracker.stream_generation
+        )
+        result.audio_metadata_paired_frames = len(
+            metadata_tracker.paired_frames
+        )
+        result.audio_metadata_completed_parents = len(
+            metadata_tracker.completed_parents
+        )
+        if result.input_sample_zero_timestamp_ms is None:
+            result.source_end_to_receipt_availability = (
+                "unavailable_missing_input_sample_zero"
+            )
+        elif not result.source_end_to_receipt_samples_ms:
+            result.source_end_to_receipt_availability = (
+                "unavailable_missing_source_end_offsets"
+            )
+        elif any(
+            frame["sourceStartMs"] is None
+            for frame in metadata_tracker.paired_frames
+            if frame["sourceEndMs"] is not None
+        ):
+            result.source_end_to_receipt_availability = (
+                "available_audio_processed_end_offset_not_semantic_boundary"
+            )
+        else:
+            result.source_end_to_receipt_availability = (
+                "available_asr_source_range_end_offset"
+            )
+        result.source_end_to_receipt_p50_ms = nearest_rank(
+            result.source_end_to_receipt_samples_ms,
+            0.50,
+        )
+        result.source_end_to_receipt_p95_ms = nearest_rank(
+            result.source_end_to_receipt_samples_ms,
+            0.95,
+        )
+        result.source_end_to_receipt_max_ms = max(
+            result.source_end_to_receipt_samples_ms,
+            default=None,
+        )
+
     # -- Compute summary stats ----------------------------------------------
     result.chunks_sent = chunks_sent
     result.audio_responses = audio_responses
@@ -3000,12 +3521,51 @@ def generate_csv(result: TestResult, output_path: str):
         writer.writerow([
             "source", "stage", "timestamp_ms",
             "chunk_index", "source_position_sec", "audio_bytes",
+            "protocol_version", "stream_generation",
+            "parent_sequence_id", "audio_frame_id",
+            "source_start_ms", "source_end_ms",
+            "source_end_to_receipt_ms",
         ])
         for ev in all_events:
             writer.writerow([
                 ev.source, ev.stage, f"{ev.timestamp_ms:.2f}",
                 ev.chunk_index, f"{ev.source_position_sec:.3f}",
                 ev.audio_bytes,
+                (
+                    ev.protocol_version
+                    if ev.protocol_version is not None
+                    else ""
+                ),
+                (
+                    ev.stream_generation
+                    if ev.stream_generation is not None
+                    else ""
+                ),
+                (
+                    ev.parent_sequence_id
+                    if ev.parent_sequence_id is not None
+                    else ""
+                ),
+                (
+                    ev.audio_frame_id
+                    if ev.audio_frame_id is not None
+                    else ""
+                ),
+                (
+                    f"{ev.source_start_ms:.3f}"
+                    if ev.source_start_ms is not None
+                    else ""
+                ),
+                (
+                    f"{ev.source_end_ms:.3f}"
+                    if ev.source_end_ms is not None
+                    else ""
+                ),
+                (
+                    f"{ev.source_end_to_receipt_ms:.3f}"
+                    if ev.source_end_to_receipt_ms is not None
+                    else ""
+                ),
             ])
     print(f"Saved: {output_path}")
 
@@ -3035,6 +3595,33 @@ def generate_summary(result: TestResult, output_path: str):
         # Ordered receive-side protocol evidence. This proves where the sole
         # completed terminal occurred relative to every translated PCM frame.
         "websocket_receive_events": result.websocket_receive_events,
+        "audio_metadata_observation": {
+            "protocol_version": result.audio_metadata_protocol_version,
+            "stream_generation": result.audio_metadata_stream_generation,
+            # A client-monotonic offset, never a wall-clock timestamp.
+            "input_sample_zero_timestamp_ms": (
+                result.input_sample_zero_timestamp_ms
+            ),
+            "paired_frames": result.audio_metadata_paired_frames,
+            "completed_parents": result.audio_metadata_completed_parents,
+            "source_end_to_receipt": {
+                "availability": (
+                    result.source_end_to_receipt_availability
+                ),
+                "sample_count": len(
+                    result.source_end_to_receipt_samples_ms
+                ),
+                "p50_ms": result.source_end_to_receipt_p50_ms,
+                "p95_ms": result.source_end_to_receipt_p95_ms,
+                "max_ms": result.source_end_to_receipt_max_ms,
+                "clock": "client_monotonic",
+                "source_offset_origin": "input_pcm_sample_zero",
+                "semantic_boundary_proven": False,
+                "actual_audibility_proven": False,
+            },
+            "playback_behavior_changed": False,
+            "contains_transcript_or_translation_text": False,
+        },
         "input_duration_sec": result.duration_sec,
         "chunks_sent": result.chunks_sent,
         "audio_responses": result.audio_responses,
@@ -3083,7 +3670,11 @@ def check_backend(backend_url: str):
         return False
 
 
-async def run_preflight(backend_url: str) -> bool:
+async def run_preflight(
+    backend_url: str,
+    *,
+    audio_metadata_protocol_version: int | None = None,
+) -> bool:
     """Run pre-flight validation with the local neutral fixture."""
     print("\n=== Pre-flight Validation ===")
     if not Path(PREFLIGHT_FILE).exists():
@@ -3091,7 +3682,16 @@ async def run_preflight(backend_url: str) -> bool:
         return False
 
     try:
-        result = await run_test(PREFLIGHT_FILE, backend_url)
+        if audio_metadata_protocol_version is None:
+            result = await run_test(PREFLIGHT_FILE, backend_url)
+        else:
+            result = await run_test(
+                PREFLIGHT_FILE,
+                backend_url,
+                audio_metadata_protocol_version=(
+                    audio_metadata_protocol_version
+                ),
+            )
     except Exception as e:
         print(f"\nPre-flight FAILED: {e}")
         return False
@@ -3129,7 +3729,13 @@ async def run_preflight(backend_url: str) -> bool:
     return True
 
 
-async def run_batch(files: list[str], backend_url: str, output_dir: str) -> bool:
+async def run_batch(
+    files: list[str],
+    backend_url: str,
+    output_dir: str,
+    *,
+    audio_metadata_protocol_version: int | None = None,
+) -> bool:
     """Run tests on a list of audio files sequentially."""
     total = len(files)
     all_captures_passed = total > 0
@@ -3143,7 +3749,16 @@ async def run_batch(files: list[str], backend_url: str, output_dir: str) -> bool
             continue
 
         try:
-            result = await run_test(fpath, backend_url)
+            if audio_metadata_protocol_version is None:
+                result = await run_test(fpath, backend_url)
+            else:
+                result = await run_test(
+                    fpath,
+                    backend_url,
+                    audio_metadata_protocol_version=(
+                        audio_metadata_protocol_version
+                    ),
+                )
         except Exception as e:
             print(f"\nERROR: {e}")
             all_captures_passed = False
@@ -3209,19 +3824,51 @@ def main():
         "--output-dir", type=str, default="test_results_nemotron",
         help="Directory for new CSV and plot outputs",
     )
+    parser.add_argument(
+        "--audio-metadata-protocol-v1",
+        action="store_true",
+        help=(
+            "Negotiate observation-only parent/frame metadata protocol v1; "
+            "does not change or drop translated audio"
+        ),
+    )
     args = parser.parse_args()
+    metadata_version = (
+        AUDIO_METADATA_PROTOCOL_VERSION
+        if args.audio_metadata_protocol_v1
+        else None
+    )
 
     if not check_backend(args.backend):
         sys.exit(1)
 
     if args.preflight:
-        ok = asyncio.run(run_preflight(args.backend))
+        ok = asyncio.run(
+            run_preflight(
+                args.backend,
+                audio_metadata_protocol_version=metadata_version,
+            )
+        )
         sys.exit(0 if ok else 1)
 
     if args.file:
-        ok = asyncio.run(run_batch([args.file], args.backend, args.output_dir))
+        ok = asyncio.run(
+            run_batch(
+                [args.file],
+                args.backend,
+                args.output_dir,
+                audio_metadata_protocol_version=metadata_version,
+            )
+        )
     else:
-        ok = asyncio.run(run_batch(LONG_FORM_FILES, args.backend, args.output_dir))
+        ok = asyncio.run(
+            run_batch(
+                LONG_FORM_FILES,
+                args.backend,
+                args.output_dir,
+                audio_metadata_protocol_version=metadata_version,
+            )
+        )
     sys.exit(0 if ok else 1)
 
 

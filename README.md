@@ -34,6 +34,8 @@ See the [sanitization policy](docs/SANITIZATION.md) and
   bounded backpressure, pre-commit-only retry, and a tiny-target atomic
   reliability fallback
 - A matched atomic-versus-incremental canary with same-audio publication timing and explicit stochastic-output confounding checks
+- Opt-in audio metadata protocol v1 for strict parent/frame observation,
+  source-offset freshness, and observation-only shadow-policy replay
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -396,7 +398,7 @@ class AudioConfig:
 
 - `GET /` - Health check
 - `GET /api/languages` - List available target languages
-- `GET /api/config` - Get audio configuration, active pipeline mode, staged limits, and declared ASR/NMT/TTS model provenance
+- `GET /api/config` - Get audio configuration, active pipeline mode, staged limits, declared ASR/NMT/TTS model provenance, and supported audio-metadata protocol versions
 - `GET /api/test/export` - Get timing events plus retained staged pipeline evidence
 
 ### WebSocket
@@ -408,6 +410,7 @@ class AudioConfig:
 Client → Server:
 ```json
 {"type": "start_stream", "targetLanguage": "es-US"}
+{"type": "start_stream", "targetLanguage": "es-US", "audioMetadataProtocolVersion": 1}
 {"type": "end_input"}
 {"type": "stop_stream"}
 {"type": "ping"}
@@ -436,6 +439,15 @@ Server → Client:
 {"type": "pong"}
 ```
 Plus binary audio frames (Int16 PCM translated audio)
+
+The second `start_stream` form opts into observation-only protocol v1. It is
+available only for the staged schema-3 incremental-TTS path. In that mode, an
+exact `audio_frame` JSON header immediately precedes every binary PCM frame,
+and `audio_parent_complete` reconciles each parent before the next one begins.
+Omitting the field preserves the legacy wire format. The metadata contains
+only numeric identity, PCM format, and nullable source-media offsets; it does
+not contain transcript or translation text. See
+[Audio metadata observation protocol v1](docs/AUDIO_METADATA_OBSERVATION_V1.md).
 
 ## Original CLI Script
 
@@ -470,6 +482,13 @@ three-sample experiment can then be launched with one command:
 
 ```bash
 python run_long_form_experiment.py
+```
+
+To make the all-three run negotiate observation-only parent/frame metadata,
+use the schema-3 incremental backend and add:
+
+```bash
+python run_long_form_experiment.py --audio-metadata-protocol-v1
 ```
 
 The harness performs its health checks and one-minute preflight, then streams
@@ -514,6 +533,11 @@ capture. Backend and repeat settings are recovered from the manifest; explicit
 values must match. `--output-root`, `--run-id`, and `--skip-preflight` control
 new runs, and `--skip-preflight` cannot alter a resumed run.
 
+The manifest also freezes the audio-metadata protocol choice. A protocol-v1
+run resumes in v1 automatically when the flag is omitted; supplying the flag
+is accepted only when that manifest already records v1. A legacy run cannot be
+upgraded during resume.
+
 New runs also freeze the complete `/api/config.modelConfig` snapshot: ASR,
 NMT, and TTS endpoints, image references, optional digests and profiles, model
 and voice, source/target languages, ASR EOU, and word-time setting. Every
@@ -549,6 +573,14 @@ receives. The summary records completed-terminal arrival lag separately from
 the longer harness polling/settle observation. A backend-keyed local file lock
 prevents two harness processes on the same machine from using the
 single-session backend concurrently.
+
+For a direct observation-only schema-3 capture, add
+`--audio-metadata-protocol-v1` to `batch_latency_test.py`. The harness first
+requires `/api/config.audioMetadataProtocolVersions` to advertise version 1,
+then fails closed on any header/binary, generation, parent, frame, byte, or
+terminal mismatch. Its source-end latency uses a client-monotonic input
+sample-zero marker and is explicitly labeled non-semantic when ASR supplies
+only the `audio_processed` fallback offset.
 
 One repeat represents one live Riva pass through each sample and contains
 about 103.7 minutes (roughly 1 hour 45 minutes) of source audio. A new
@@ -608,15 +640,17 @@ python3 analyze_freshness_cap.py \
     experiment_results/streaming-tts-canary-20260724T232158Z-29cdf4e/streaming/shared-prefix_summary.json
 ```
 
-The loader accepts the positional parent/frame join only after all parent,
-frame, byte, receive-order, timestamp, completion, and input-boundary evidence
-reconciles. The simulation is deliberately lossy and offline; it does not
-change browser playback. Primary results use a 100 ms cancellation guard and
-include 0/50/100/250 ms sensitivity. On the saved five-minute trace, the
-10-second oldest-first policy retained 85.77% of translated audio, reduced
-queue p95 from 17.077 to 8.352 seconds, and reduced listener tail from 27.120
-to 12.672 seconds. It still peaked at 14.059 seconds because an incomplete or
-audible parent cannot be removed whole. See the
+For a protocol-v1 capture, the loader replays the explicit
+`audio_frame`/PCM/`audio_parent_complete` wire order and reconciles it with
+server and CSV evidence. Older schema-v3 captures retain the positional join,
+but only after every parent, frame, byte, receive-order, timestamp, completion,
+and input-boundary invariant passes. The simulation is deliberately lossy and
+offline; it does not change browser playback. Primary results use a 100 ms
+cancellation guard and include 0/50/100/250 ms sensitivity. On the saved
+five-minute trace, the 10-second oldest-first policy retained 85.77% of
+translated audio, reduced queue p95 from 17.077 to 8.352 seconds, and reduced
+listener tail from 27.120 to 12.672 seconds. It still peaked at 14.059 seconds
+because an incomplete or audible parent cannot be removed whole. See the
 [whole-parent freshness-cap report](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md).
 
 The completed staged matrix can also size a post-NMT TTS subsegment experiment
@@ -687,6 +721,7 @@ Detailed guides:
 
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
 - [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
+- [Observation-only parent/frame metadata protocol v1](docs/AUDIO_METADATA_OBSERVATION_V1.md)
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sample acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)

@@ -126,18 +126,26 @@ def _nearest_rank(values: Sequence[float], quantile: float) -> float:
     return ordered[index]
 
 
-def _parent_durations(trace: ParentFreshnessTrace) -> dict[int, float]:
-    durations: dict[int, float] = {}
-    for frame in trace.frames:
-        durations[frame.parent_sequence_id] = (
-            durations.get(frame.parent_sequence_id, 0.0)
-            + frame.duration_seconds
-        )
-    return durations
+def _distribution_ms(values: Sequence[float]) -> dict[str, float | int | None]:
+    """Return a compact nearest-rank distribution without inventing samples."""
+
+    if not values:
+        return {
+            "sample_count": 0,
+            "p50_ms": None,
+            "p95_ms": None,
+            "max_ms": None,
+        }
+    return {
+        "sample_count": len(values),
+        "p50_ms": _nearest_rank(values, 0.50),
+        "p95_ms": _nearest_rank(values, 0.95),
+        "max_ms": max(values),
+    }
 
 
-def _baseline_summary(trace: ParentFreshnessTrace) -> dict[str, Any]:
-    simulation = simulate_playback(
+def _adaptive_no_drop_simulation(trace: ParentFreshnessTrace):
+    return simulate_playback(
         tuple(
             AudioChunk(
                 arrival_seconds=frame.arrival_seconds,
@@ -150,6 +158,20 @@ def _baseline_summary(trace: ParentFreshnessTrace) -> dict[str, Any]:
         input_end_seconds=trace.input_end_seconds,
         adaptive=True,
     )
+
+
+def _parent_durations(trace: ParentFreshnessTrace) -> dict[int, float]:
+    durations: dict[int, float] = {}
+    for frame in trace.frames:
+        durations[frame.parent_sequence_id] = (
+            durations.get(frame.parent_sequence_id, 0.0)
+            + frame.duration_seconds
+        )
+    return durations
+
+
+def _baseline_summary(trace: ParentFreshnessTrace) -> dict[str, Any]:
+    simulation = _adaptive_no_drop_simulation(trace)
     summary = simulation.summary
     return _round_floats(
         {
@@ -178,6 +200,104 @@ def _baseline_summary(trace: ParentFreshnessTrace) -> dict[str, Any]:
             "chunks_dropped": summary.chunks_dropped,
         }
     )
+
+
+def _source_timing_observation(
+    trace: ParentFreshnessTrace,
+) -> dict[str, Any]:
+    """Describe source-clock observations without claiming semantic audibility."""
+
+    source_end_frames = [
+        frame for frame in trace.frames if frame.source_end_ms is not None
+    ]
+    asr_range_frames = [
+        frame
+        for frame in source_end_frames
+        if frame.source_start_ms is not None
+    ]
+    end_only_frames = [
+        frame
+        for frame in source_end_frames
+        if frame.source_start_ms is None
+    ]
+    if end_only_frames and asr_range_frames:
+        offset_basis = (
+            "mixed_audio_processed_end_only_and_asr_source_range_end_offsets"
+            "_not_semantic_boundaries"
+        )
+    elif end_only_frames:
+        offset_basis = (
+            "audio_processed_end_offset_not_semantic_boundary"
+        )
+    elif asr_range_frames:
+        offset_basis = (
+            "asr_source_range_end_offset_not_semantic_boundary"
+        )
+    else:
+        offset_basis = "unavailable_missing_source_end_offsets"
+
+    common: dict[str, Any] = {
+        "availability": trace.source_end_to_receipt_availability,
+        "audio_metadata_protocol_version": (
+            trace.audio_metadata_protocol_version
+        ),
+        "stream_generation": trace.audio_metadata_stream_generation,
+        "clock": "client_monotonic",
+        "source_offset_origin": "input_pcm_sample_zero",
+        "input_sample_zero_timestamp_ms": (
+            trace.input_sample_zero_timestamp_ms
+        ),
+        "sample_unit": "translated_pcm_frame",
+        "source_end_offset_basis": offset_basis,
+        "frames_with_source_end_offset": len(source_end_frames),
+        "frames_with_asr_source_range": len(asr_range_frames),
+        "frames_with_audio_processed_end_only": len(end_only_frames),
+        "semantic_boundary_proven": False,
+        "actual_audibility_proven": False,
+        "playback_behavior_changed": False,
+        "scheduled_start_semantics": (
+            "deterministic adaptive no-drop replay start; not measured "
+            "speaker output or physical audibility"
+        ),
+        "source_end_to_client_receipt_ms": _distribution_ms(()),
+        (
+            "source_end_to_deterministic_scheduled_playback_start_ms"
+        ): _distribution_ms(()),
+    }
+    if trace.audio_metadata_protocol_version is None:
+        common["availability"] = "protocol_not_negotiated"
+        return common
+    if trace.input_sample_zero_timestamp_ms is None:
+        common["availability"] = "unavailable_missing_input_sample_zero"
+        return common
+    if not source_end_frames:
+        common["availability"] = "unavailable_missing_source_end_offsets"
+        return common
+
+    baseline = _adaptive_no_drop_simulation(trace)
+    if len(baseline.schedule) != len(trace.frames):
+        raise ValueError("adaptive no-drop replay frame count is inconsistent")
+    receipt_samples: list[float] = []
+    scheduled_start_samples: list[float] = []
+    for frame, scheduled in zip(trace.frames, baseline.schedule):
+        if frame.source_end_ms is None:
+            continue
+        source_end_clock_ms = (
+            trace.input_sample_zero_timestamp_ms + frame.source_end_ms
+        )
+        receipt_samples.append(
+            frame.arrival_seconds * 1000.0 - source_end_clock_ms
+        )
+        scheduled_start_samples.append(
+            scheduled.start_seconds * 1000.0 - source_end_clock_ms
+        )
+    common["source_end_to_client_receipt_ms"] = _distribution_ms(
+        receipt_samples
+    )
+    common[
+        "source_end_to_deterministic_scheduled_playback_start_ms"
+    ] = _distribution_ms(scheduled_start_samples)
+    return common
 
 
 def _scenario(
@@ -276,6 +396,28 @@ def build_freshness_cap_analysis(
     )
     parent_durations = _parent_durations(trace)
     duration_values = list(parent_durations.values())
+    source_timing_observation = _source_timing_observation(trace)
+    live_browser_blockers = (
+        [
+            (
+                "protocol-v1 metadata is observation-only and does not "
+                "retain or cancel scheduled parent audio"
+            ),
+            (
+                "the browser still schedules PCM immediately without a "
+                "retained parent queue"
+            ),
+        ]
+        if trace.audio_metadata_protocol_version == 1
+        else [
+            "binary PCM currently has no client-visible parent/frame metadata",
+            "parent completion currently has no client-visible marker",
+            (
+                "the browser schedules PCM immediately without a "
+                "retained parent queue"
+            ),
+        ]
+    )
 
     return _round_floats(
         {
@@ -321,15 +463,13 @@ def build_freshness_cap_analysis(
                     "unaccelerated source PCM media duration; it is context, "
                     "not scheduled queue depth"
                 ),
+                "audio_metadata_observation_present": (
+                    trace.audio_metadata_protocol_version == 1
+                ),
+                "source_timing_semantic_boundary_proven": False,
+                "source_timing_actual_audibility_proven": False,
                 "live_browser_support_present": False,
-                "live_browser_blockers": [
-                    "binary PCM currently has no client-visible parent/frame metadata",
-                    "parent completion currently has no client-visible marker",
-                    (
-                        "the browser schedules PCM immediately without a "
-                        "retained parent queue"
-                    ),
-                ],
+                "live_browser_blockers": live_browser_blockers,
                 "privacy": (
                     "output contains hashes, fixed role labels, numeric IDs, "
                     "timing, counts, byte totals, and durations only"
@@ -353,6 +493,7 @@ def build_freshness_cap_analysis(
                     for cap in caps
                 },
             },
+            "source_timing_observation": source_timing_observation,
             "adaptive_no_drop_baseline": _baseline_summary(trace),
             "strategies": {
                 "oldest_first": (
@@ -400,8 +541,45 @@ def render_freshness_cap_markdown(analysis: dict[str, Any]) -> str:
 
     captured = analysis["captured_trace"]
     baseline = analysis["adaptive_no_drop_baseline"]
+    metadata_observed = analysis["semantics"][
+        "audio_metadata_observation_present"
+    ]
     parent_duration = captured["parent_source_pcm_duration_seconds"]
     guard_ms = analysis["semantics"]["cancellation_guard_seconds"] * 1000.0
+    source_timing = analysis["source_timing_observation"]
+    receipt_distribution = source_timing[
+        "source_end_to_client_receipt_ms"
+    ]
+    scheduled_distribution = source_timing[
+        "source_end_to_deterministic_scheduled_playback_start_ms"
+    ]
+    source_timing_lines: list[str] = []
+    if receipt_distribution["sample_count"]:
+        source_timing_lines = [
+            "## Protocol-v1 source-clock observation",
+            "",
+            (
+                "Frame-level source end to client receipt was "
+                f"{receipt_distribution['p50_ms']:.3f} ms p50, "
+                f"{receipt_distribution['p95_ms']:.3f} ms p95, and "
+                f"{receipt_distribution['max_ms']:.3f} ms maximum."
+            ),
+            "",
+            (
+                "Source end to deterministic adaptive no-drop scheduled "
+                f"playback start was {scheduled_distribution['p50_ms']:.3f} "
+                f"ms p50, {scheduled_distribution['p95_ms']:.3f} ms p95, "
+                f"and {scheduled_distribution['max_ms']:.3f} ms maximum."
+            ),
+            "",
+            (
+                "Offset basis: "
+                f"`{source_timing['source_end_offset_basis']}`. These offsets "
+                "do not prove a phrase/punchline boundary, and scheduled "
+                "playback start does not prove physical audibility."
+            ),
+            "",
+        ]
     lines = [
         "# Schema-3 whole-parent freshness-cap simulation",
         "",
@@ -430,6 +608,7 @@ def render_freshness_cap_markdown(analysis: dict[str, Any]) -> str:
             "that safety window."
         ),
         "",
+        *source_timing_lines,
         "## No-drop baseline",
         "",
         (
@@ -517,19 +696,30 @@ def render_freshness_cap_markdown(analysis: dict[str, Any]) -> str:
                 tail=summary["listener_tail_seconds"],
             )
         )
+    if metadata_observed:
+        engineering_gate = (
+            "The observation browser receives validated parent/frame metadata "
+            "and parent-completion markers, but it still schedules PCM "
+            "immediately and retains no cancellable parent-aware queue. It "
+            "therefore cannot enforce these policies. Promotion requires a "
+            "separately gated opt-in short-lookahead scheduler before any live "
+            "loss policy can be tested."
+        )
+    else:
+        engineering_gate = (
+            "The legacy browser cannot enforce these policies: it receives "
+            "anonymous binary PCM, has no parent-completion marker, and "
+            "immediately schedules buffers without retaining a parent-aware "
+            "queue. Promotion therefore requires protocol metadata and an "
+            "opt-in short-lookahead scheduler before any live loss policy can "
+            "be tested."
+        )
     lines.extend(
         [
             "",
             "## Engineering gate",
             "",
-            (
-                "The current browser cannot enforce these policies: it receives "
-                "anonymous binary PCM, has no parent-completion marker, and "
-                "immediately schedules buffers without retaining a parent-aware "
-                "queue. Promotion therefore requires protocol metadata and an "
-                "opt-in short-lookahead scheduler before any live loss policy "
-                "can be tested."
-            ),
+            engineering_gate,
             "",
         ]
     )

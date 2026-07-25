@@ -89,6 +89,128 @@ def valid_staged_summary_fields(*, passed=True, errors=None, queue_size=4):
     }
 
 
+def valid_audio_metadata_summary_fields():
+    frame_metadata = {
+        "protocolVersion": 1,
+        "streamGeneration": 1,
+        "parentSequenceId": 0,
+        "audioFrameId": 0,
+        "audioBytes": 3_200,
+        "sampleRateHz": 16_000,
+        "channels": 1,
+        "bytesPerSample": 2,
+        "sourceStartMs": None,
+        "sourceEndMs": 1_000.0,
+    }
+    backend_config = {
+        "sampleRate": 16_000,
+        "channels": 1,
+        "pipelineMode": "staged",
+        "audioMetadataProtocolVersions": [1],
+        "stagedConfig": {
+            "telemetrySchemaVersion": 3,
+            "ttsIncrementalPublishEnabled": True,
+        },
+        "modelConfig": model_config(),
+    }
+    return {
+        "audio_path": "test_audio/long-form-01.mp3",
+        "backend_url": "http://localhost:8000",
+        "input_duration_sec": 60.0,
+        "chunks_sent": 10,
+        "audio_responses": 1,
+        "total_received_bytes": 3_200,
+        "pipeline_mode": "staged",
+        "backend_config": backend_config,
+        "target_language": "es-US",
+        "staged_pipeline": {
+            "outcome": "complete",
+            "websocket_send_events": [
+                {
+                    "parent_sequence_id": 0,
+                    "audio_frame_id": 0,
+                    "audio_bytes": 3_200,
+                }
+            ],
+            "websocket_completed_parent_summaries": [
+                {
+                    "parent_sequence_id": 0,
+                    "audio_frame_count": 1,
+                    "audio_bytes": 3_200,
+                }
+            ],
+        },
+        "websocket_receive_events": [
+            {
+                "order": 0,
+                "frame_type": "control",
+                "message_type": "status",
+                "status": "listening",
+            },
+            {
+                "order": 1,
+                "frame_type": "control",
+                "message_type": "audio_frame",
+                **frame_metadata,
+            },
+            {
+                "order": 2,
+                "frame_type": "pcm",
+                "message_type": "binary",
+                "timestamp_ms": 1_500.0,
+                "audio_bytes": 3_200,
+                "sourceEndToReceiptMs": 500.0,
+                **frame_metadata,
+            },
+            {
+                "order": 3,
+                "frame_type": "control",
+                "message_type": "audio_parent_complete",
+                "protocolVersion": 1,
+                "streamGeneration": 1,
+                "parentSequenceId": 0,
+                "audioFrameCount": 1,
+                "audioBytes": 3_200,
+                "sourceStartMs": None,
+                "sourceEndMs": 1_000.0,
+            },
+            {
+                "order": 4,
+                "frame_type": "control",
+                "message_type": "status",
+                "status": "completed",
+            },
+        ],
+        "staged_integrity": {
+            "applicable": True,
+            "passed": True,
+            "errors": [],
+        },
+        "audio_metadata_observation": {
+            "protocol_version": 1,
+            "stream_generation": 1,
+            "input_sample_zero_timestamp_ms": 0.0,
+            "paired_frames": 1,
+            "completed_parents": 1,
+            "source_end_to_receipt": {
+                "availability": (
+                    "available_audio_processed_end_offset_not_semantic_boundary"
+                ),
+                "sample_count": 1,
+                "p50_ms": 500.0,
+                "p95_ms": 500.0,
+                "max_ms": 500.0,
+                "clock": "client_monotonic",
+                "source_offset_origin": "input_pcm_sample_zero",
+                "semantic_boundary_proven": False,
+                "actual_audibility_proven": False,
+            },
+            "playback_behavior_changed": False,
+            "contains_transcript_or_translation_text": False,
+        },
+    }
+
+
 def write_valid_csv(path: Path, *, sent=10, received_bytes=(32_000, 32_000)):
     rows = ["source,stage,timestamp_ms,chunk_index,source_position_sec,audio_bytes"]
     rows.extend(
@@ -137,6 +259,43 @@ def test_build_manifest_orders_three_samples_per_repeat(tmp_path):
     assert manifest["pipeline_provenance"] is None
 
 
+def test_build_manifest_persists_observation_protocol_and_plan(
+    tmp_path,
+    capsys,
+):
+    sample = tmp_path / "long-form-01.mp3"
+    sample.write_bytes(b"audio")
+    manifest = experiment.build_manifest(
+        run_id="unit-v1",
+        run_dir=tmp_path / "run",
+        backend_url="http://localhost:8000",
+        repeats=1,
+        skip_preflight=False,
+        files=[sample],
+        include_hashes=False,
+        audio_metadata_protocol_version=1,
+    )
+
+    assert manifest["audio_metadata_protocol_version"] == 1
+    assert manifest["provenance"]["audio_metadata_protocol_version"] == 1
+    assert manifest["provenance"]["audio_metadata_observation_only"] is True
+
+    experiment.print_plan(tmp_path / "run", manifest)
+    assert "Audio metadata: protocol v1 (observation-only)" in capsys.readouterr().out
+
+
+def test_audio_metadata_cli_is_opt_in():
+    assert (
+        experiment.parse_args([]).audio_metadata_protocol_v1 is False
+    )
+    assert (
+        experiment.parse_args(
+            ["--audio-metadata-protocol-v1"]
+        ).audio_metadata_protocol_v1
+        is True
+    )
+
+
 def test_validate_summary_rejects_partial_and_invalid_captures(tmp_path):
     summary = tmp_path / "summary.json"
     write_valid_summary(summary)
@@ -180,6 +339,101 @@ def test_validate_summary_rejects_partial_and_invalid_captures(tmp_path):
         False,
         "staged pipeline raw evidence is missing or invalid",
     )
+
+
+def test_validate_summary_replays_audio_metadata_observation(tmp_path):
+    summary = tmp_path / "summary.json"
+    write_valid_summary(
+        summary,
+        **valid_audio_metadata_summary_fields(),
+    )
+
+    assert experiment.validate_summary(
+        summary,
+        expected_audio_metadata_protocol_version=1,
+    ) == (True, "ok")
+
+    payload = json.loads(summary.read_text(encoding="utf-8"))
+    payload["audio_metadata_observation"]["paired_frames"] = 0
+    summary.write_text(json.dumps(payload), encoding="utf-8")
+    valid, reason = experiment.validate_summary(
+        summary,
+        expected_audio_metadata_protocol_version=1,
+    )
+    assert valid is False
+    assert "paired-frame count does not reconcile" in reason
+
+
+def test_v1_summary_requires_captured_capability_advertisement(tmp_path):
+    summary = tmp_path / "summary.json"
+    fields = valid_audio_metadata_summary_fields()
+    fields["backend_config"]["audioMetadataProtocolVersions"] = []
+    write_valid_summary(
+        summary,
+        **fields,
+    )
+
+    valid, reason = experiment.validate_summary(
+        summary,
+        expected_audio_metadata_protocol_version=1,
+    )
+    assert valid is False
+    assert "does not advertise" in reason
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda observation: observation.update(stream_generation=1),
+        lambda observation: observation.update(
+            input_sample_zero_timestamp_ms=0.0
+        ),
+        lambda observation: observation.update(paired_frames=1),
+        lambda observation: observation.update(completed_parents=1),
+        lambda observation: observation["source_end_to_receipt"].update(
+            availability="unavailable_missing_source_end_offsets"
+        ),
+        lambda observation: observation["source_end_to_receipt"].update(
+            sample_count=1,
+            p50_ms=0.0,
+            p95_ms=0.0,
+            max_ms=0.0,
+        ),
+    ],
+)
+def test_legacy_summary_rejects_mixed_metadata_evidence(mutate):
+    observation = {
+        "protocol_version": None,
+        "stream_generation": None,
+        "input_sample_zero_timestamp_ms": None,
+        "paired_frames": 0,
+        "completed_parents": 0,
+        "source_end_to_receipt": {
+            "availability": "protocol_not_negotiated",
+            "sample_count": 0,
+            "p50_ms": None,
+            "p95_ms": None,
+            "max_ms": None,
+            "clock": "client_monotonic",
+            "source_offset_origin": "input_pcm_sample_zero",
+            "semantic_boundary_proven": False,
+            "actual_audibility_proven": False,
+        },
+        "playback_behavior_changed": False,
+        "contains_transcript_or_translation_text": False,
+    }
+    mutate(observation)
+
+    valid, reason = experiment._validate_saved_audio_metadata_observation(
+        {
+            "backend_config": {"audioMetadataProtocolVersions": []},
+            "audio_metadata_observation": observation,
+        },
+        None,
+    )
+
+    assert valid is False
+    assert "legacy audio metadata observation is inconsistent" in reason
 
 
 def test_validate_result_rejects_staged_integrity_failure():
@@ -251,6 +505,47 @@ def test_capture_artifact_validation_requires_csv_and_summary(tmp_path):
     valid, reason = experiment.capture_artifacts_valid(tmp_path, entry)
     assert valid is False
     assert "hash differs" in reason
+
+
+def test_capture_one_propagates_v1_to_batch_runner(monkeypatch, tmp_path):
+    calls = []
+    result = object()
+
+    async def fake_run_test(*args, **kwargs):
+        calls.append((args, kwargs))
+        return result
+
+    monkeypatch.setattr(experiment, "run_test", fake_run_test)
+    monkeypatch.setattr(experiment, "generate_plot", lambda *_args: None)
+    monkeypatch.setattr(experiment, "generate_csv", lambda *_args: None)
+    monkeypatch.setattr(experiment, "generate_summary", lambda *_args: None)
+    monkeypatch.setattr(experiment, "validate_result", lambda _result: None)
+    audio = tmp_path / "preflight.wav"
+    audio.write_bytes(b"audio")
+
+    asyncio.run(
+        experiment.capture_one(
+            audio,
+            "http://localhost:8000",
+            tmp_path / "v1",
+            audio_metadata_protocol_version=1,
+        )
+    )
+    asyncio.run(
+        experiment.capture_one(
+            audio,
+            "http://localhost:8000",
+            tmp_path / "legacy",
+        )
+    )
+
+    assert calls == [
+        (
+            (str(audio), "http://localhost:8000"),
+            {"audio_metadata_protocol_version": 1},
+        ),
+        ((str(audio), "http://localhost:8000"), {}),
+    ]
 
 
 def test_failed_capture_retains_only_allowlisted_diagnostics(
@@ -361,6 +656,53 @@ def test_resume_settings_must_match_original_matrix():
         raise AssertionError("repeat mismatch should fail")
 
 
+def test_resume_preserves_protocol_and_cannot_upgrade_legacy_manifest():
+    legacy_manifest = {
+        "backend_url": "http://localhost:8000",
+        "requested_repeats": 1,
+        "provenance": {},
+    }
+    assert experiment.manifest_audio_metadata_protocol_version(
+        legacy_manifest
+    ) is None
+    assert experiment._merge_resume_settings(
+        legacy_manifest,
+        backend_url=None,
+        repeats=None,
+    ) == ("http://localhost:8000", 1)
+    with pytest.raises(experiment.ExperimentError, match="protocol mismatch"):
+        experiment._merge_resume_settings(
+            legacy_manifest,
+            backend_url=None,
+            repeats=None,
+            audio_metadata_protocol_v1=True,
+        )
+
+    v1_manifest = {
+        "backend_url": "http://localhost:8000",
+        "requested_repeats": 1,
+        "audio_metadata_protocol_version": 1,
+        "provenance": {
+            "audio_metadata_protocol_version": 1,
+        },
+    }
+    assert experiment._merge_resume_settings(
+        v1_manifest,
+        backend_url=None,
+        repeats=None,
+    ) == ("http://localhost:8000", 1)
+    assert experiment._merge_resume_settings(
+        v1_manifest,
+        backend_url=None,
+        repeats=None,
+        audio_metadata_protocol_v1=True,
+    ) == ("http://localhost:8000", 1)
+
+    v1_manifest["provenance"]["audio_metadata_protocol_version"] = None
+    with pytest.raises(experiment.ExperimentError, match="inconsistent"):
+        experiment.manifest_audio_metadata_protocol_version(v1_manifest)
+
+
 def test_pipeline_provenance_is_frozen_and_rejects_mode_or_config_changes():
     manifest = {"pipeline_provenance": None}
     readiness = {
@@ -382,6 +724,13 @@ def test_pipeline_provenance_is_frozen_and_rejects_mode_or_config_changes():
         "stagedConfig": {"nmtQueueMaxSize": 4, "ttsQueueMaxSize": 4},
         "modelConfig": model_config(),
     }
+    # Capability advertisement was added after legacy manifests existed; it
+    # must not invalidate their frozen model/pipeline provenance.
+    readiness["config"]["audioMetadataProtocolVersions"] = []
+    assert experiment.freeze_or_validate_pipeline_provenance(
+        manifest,
+        readiness,
+    ) == frozen
     readiness["config"]["stagedConfig"]["nmtQueueMaxSize"] = 99
     assert manifest["pipeline_provenance"]["stagedConfig"]["nmtQueueMaxSize"] == 4
 
@@ -542,6 +891,44 @@ def test_staged_backend_readiness_allows_idle_monolithic_client(monkeypatch):
     assert readiness["config"] == responses["http://localhost:8000/api/config"]
 
 
+def test_metadata_readiness_requires_advertised_v1(monkeypatch):
+    config = {
+        "pipelineMode": "staged",
+        "audioMetadataProtocolVersions": [],
+        "stagedConfig": {
+            "telemetrySchemaVersion": 3,
+            "ttsIncrementalPublishEnabled": True,
+        },
+        "modelConfig": model_config(),
+    }
+    responses = {
+        "http://localhost:8000/": {
+            "status": "ok",
+            "pipeline_mode": "staged",
+            "riva_connected": False,
+        },
+        "http://localhost:8000/api/config": config,
+    }
+    monkeypatch.setattr(
+        experiment.requests,
+        "get",
+        lambda url, timeout: ReadinessResponse(responses[url]),
+    )
+
+    with pytest.raises(experiment.ExperimentError, match="does not advertise"):
+        experiment.check_backend_ready(
+            "http://localhost:8000",
+            audio_metadata_protocol_version=1,
+        )
+
+    config["audioMetadataProtocolVersions"] = [1]
+    readiness = experiment.check_backend_ready(
+        "http://localhost:8000",
+        audio_metadata_protocol_version=1,
+    )
+    assert readiness["config"]["audioMetadataProtocolVersions"] == [1]
+
+
 def test_monolithic_backend_readiness_still_requires_connection(monkeypatch):
     monkeypatch.setattr(
         experiment.requests,
@@ -685,3 +1072,90 @@ def test_execute_experiment_checkpoints_sequential_captures(monkeypatch, tmp_pat
         "stagedConfig": None,
         "modelConfig": model_config(),
     }
+
+
+def test_v1_execute_propagates_to_preflight_and_all_three_captures(
+    monkeypatch,
+    tmp_path,
+):
+    files = []
+    for index in range(1, 4):
+        path = tmp_path / f"long-form-{index:02d}.mp3"
+        path.write_bytes(b"audio")
+        files.append(path)
+    run_dir = tmp_path / "run"
+    manifest = experiment.build_manifest(
+        run_id="unit-v1",
+        run_dir=run_dir,
+        backend_url="http://localhost:8000",
+        repeats=1,
+        skip_preflight=False,
+        files=files,
+        include_hashes=False,
+        audio_metadata_protocol_version=1,
+    )
+    observed = []
+
+    def fake_ready(_url, *, audio_metadata_protocol_version):
+        assert audio_metadata_protocol_version == 1
+        return {
+            "status": "ok",
+            "riva_connected": False,
+            "pipeline_mode": "staged",
+            "config": {
+                "pipelineMode": "staged",
+                "audioMetadataProtocolVersions": [1],
+                "stagedConfig": {
+                    "telemetrySchemaVersion": 3,
+                    "ttsIncrementalPublishEnabled": True,
+                },
+                "modelConfig": model_config(),
+            },
+        }
+
+    async def fake_capture(
+        audio_path,
+        _backend_url,
+        _run_dir,
+        entry,
+        _expected_pipeline,
+        *,
+        audio_metadata_protocol_version,
+    ):
+        observed.append(
+            (
+                entry.get("sample", "preflight"),
+                Path(audio_path).name,
+                audio_metadata_protocol_version,
+            )
+        )
+        entry["_captured"] = True
+
+    monkeypatch.setattr(experiment, "check_backend_ready", fake_ready)
+    monkeypatch.setattr(experiment, "capture_and_promote", fake_capture)
+    monkeypatch.setattr(
+        experiment,
+        "capture_artifacts_valid",
+        lambda _run_dir, entry, **_kwargs: (
+            (True, "ok")
+            if entry.get("_captured")
+            else (False, "missing")
+        ),
+    )
+    monkeypatch.setattr(
+        experiment,
+        "write_analysis",
+        lambda _run_dir, _manifest: {
+            "candidate_acceptance": {"all_traces_pass": False}
+        },
+    )
+
+    assert asyncio.run(
+        experiment.execute_experiment(run_dir, manifest)
+    ) == 0
+    assert observed == [
+        ("preflight", "preflight.wav", 1),
+        ("sample_01", "long-form-01.mp3", 1),
+        ("sample_02", "long-form-02.mp3", 1),
+        ("sample_03", "long-form-03.mp3", 1),
+    ]

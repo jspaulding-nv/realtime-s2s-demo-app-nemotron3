@@ -32,6 +32,7 @@ import requests
 
 from analyze_playback_policy import build_analysis, render_markdown
 from batch_latency_test import (
+    AUDIO_METADATA_PROTOCOL_VERSION,
     LONG_FORM_FILES,
     PREFLIGHT_FILE,
     TestResult,
@@ -39,6 +40,7 @@ from batch_latency_test import (
     generate_plot,
     generate_summary,
     run_test,
+    validate_capture_result,
 )
 
 
@@ -47,6 +49,7 @@ DEFAULT_BACKEND = "http://localhost:8000"
 DEFAULT_OUTPUT_ROOT = Path("experiment_results")
 ANALYSIS_JSON = "playback_policy_analysis.json"
 ANALYSIS_MARKDOWN = "playback_policy_analysis.md"
+_EXPECTED_METADATA_UNSPECIFIED = object()
 
 
 class ExperimentError(RuntimeError):
@@ -116,6 +119,55 @@ def _relative_to_repository(path: Path) -> str:
         return str(path.resolve())
 
 
+def _validate_audio_metadata_protocol_version(
+    value: Any,
+) -> int | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value != AUDIO_METADATA_PROTOCOL_VERSION
+    ):
+        raise ExperimentError(
+            "audio metadata protocol version must be omitted or equal 1"
+        )
+    return value
+
+
+def manifest_audio_metadata_protocol_version(
+    manifest: dict[str, Any],
+) -> int | None:
+    """Resolve immutable metadata provenance, including legacy manifests."""
+    top_present = "audio_metadata_protocol_version" in manifest
+    top_level = _validate_audio_metadata_protocol_version(
+        manifest.get("audio_metadata_protocol_version")
+    )
+    provenance = manifest.get("provenance")
+    provenance_present = (
+        isinstance(provenance, dict)
+        and "audio_metadata_protocol_version" in provenance
+    )
+    provenance_value = _validate_audio_metadata_protocol_version(
+        provenance.get("audio_metadata_protocol_version")
+        if isinstance(provenance, dict)
+        else None
+    )
+    if (
+        top_present
+        and provenance_present
+        and top_level != provenance_value
+    ):
+        raise ExperimentError(
+            "manifest audio metadata protocol provenance is inconsistent"
+        )
+    if top_present:
+        return top_level
+    if provenance_present:
+        return provenance_value
+    return None
+
+
 def build_manifest(
     *,
     run_id: str,
@@ -125,9 +177,13 @@ def build_manifest(
     skip_preflight: bool,
     files: Sequence[Path],
     include_hashes: bool = True,
+    audio_metadata_protocol_version: int | None = None,
 ) -> dict[str, Any]:
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
+    _validate_audio_metadata_protocol_version(
+        audio_metadata_protocol_version
+    )
 
     samples = []
     runs = []
@@ -175,6 +231,9 @@ def build_manifest(
         "updated_at_utc": utc_now(),
         "completed_at_utc": None,
         "backend_url": backend_url.rstrip("/"),
+        "audio_metadata_protocol_version": (
+            audio_metadata_protocol_version
+        ),
         # Filled atomically with the first successful backend readiness check.
         # Resumes and every capture summary must match this frozen snapshot.
         "pipeline_provenance": None,
@@ -214,6 +273,12 @@ def build_manifest(
             "native_listener_quality_measured": False,
             "joke_or_marked_phrase_semantic_delay_measured": False,
             "containers_managed_by_harness": False,
+            "audio_metadata_protocol_version": (
+                audio_metadata_protocol_version
+            ),
+            "audio_metadata_observation_only": (
+                audio_metadata_protocol_version is not None
+            ),
         },
     }
 
@@ -418,10 +483,213 @@ def _summary_pipeline_provenance(summary: dict[str, Any]) -> tuple[dict[str, Any
     }, "ok"
 
 
+def _validate_saved_audio_metadata_observation(
+    summary: dict[str, Any],
+    expected_version: Any = _EXPECTED_METADATA_UNSPECIFIED,
+) -> tuple[bool, str]:
+    observation = summary.get("audio_metadata_observation")
+    if expected_version is _EXPECTED_METADATA_UNSPECIFIED:
+        inferred_version = (
+            observation.get("protocol_version")
+            if isinstance(observation, dict)
+            else None
+        )
+        try:
+            expected_version = _validate_audio_metadata_protocol_version(
+                inferred_version
+            )
+        except ExperimentError as exc:
+            return False, str(exc)
+    else:
+        try:
+            expected_version = _validate_audio_metadata_protocol_version(
+                expected_version
+            )
+        except ExperimentError as exc:
+            return False, str(exc)
+
+    if observation is None:
+        if expected_version is None:
+            # Historical legacy summaries predate observation-only metadata.
+            return True, "ok"
+        return False, "audio_metadata_observation is missing"
+    if not isinstance(observation, dict):
+        return False, "audio_metadata_observation is invalid"
+    try:
+        observed_version = _validate_audio_metadata_protocol_version(
+            observation.get("protocol_version")
+        )
+    except ExperimentError as exc:
+        return False, str(exc)
+    if observed_version != expected_version:
+        return False, (
+            "audio metadata protocol differs from manifest: "
+            f"expected {expected_version!r}, got {observed_version!r}"
+        )
+
+    backend_config = summary.get("backend_config")
+    if not isinstance(backend_config, dict):
+        return False, "audio metadata backend_config is missing"
+    if (
+        expected_version is not None
+        and backend_config.get("audioMetadataProtocolVersions")
+        != [expected_version]
+    ):
+        return False, (
+            "captured backend config does not advertise audio metadata "
+            f"protocol version {expected_version}"
+        )
+    if observation.get("playback_behavior_changed") is not False:
+        return False, "audio metadata observation changed playback behavior"
+    if observation.get("contains_transcript_or_translation_text") is not False:
+        return False, "audio metadata observation privacy flag is invalid"
+
+    source_metrics = observation.get("source_end_to_receipt")
+    if not isinstance(source_metrics, dict):
+        return False, "audio metadata source-end observation is invalid"
+    if (
+        source_metrics.get("clock") != "client_monotonic"
+        or source_metrics.get("source_offset_origin")
+        != "input_pcm_sample_zero"
+        or source_metrics.get("semantic_boundary_proven") is not False
+        or source_metrics.get("actual_audibility_proven") is not False
+    ):
+        return False, "audio metadata source-end provenance is invalid"
+    sample_count = source_metrics.get("sample_count")
+    if (
+        not isinstance(sample_count, int)
+        or isinstance(sample_count, bool)
+        or sample_count < 0
+    ):
+        return False, "audio metadata source-end sample count is invalid"
+    availability = source_metrics.get("availability")
+    valid_availability = {
+        "protocol_not_negotiated",
+        "unavailable_missing_input_sample_zero",
+        "unavailable_missing_source_end_offsets",
+        "available_audio_processed_end_offset_not_semantic_boundary",
+        "available_asr_source_range_end_offset",
+    }
+    if availability not in valid_availability or (
+        expected_version is not None
+        and availability == "protocol_not_negotiated"
+    ):
+        return False, "audio metadata source-end availability is invalid"
+    percentile_values = []
+    for field in ("p50_ms", "p95_ms", "max_ms"):
+        value = source_metrics.get(field)
+        if value is not None and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            return False, f"audio metadata source-end {field} is invalid"
+        percentile_values.append(value)
+    if sample_count == 0 and any(
+        value is not None for value in percentile_values
+    ):
+        return False, "audio metadata source-end percentiles require samples"
+    if sample_count > 0 and (
+        any(value is None for value in percentile_values)
+        or not (
+            percentile_values[0]
+            <= percentile_values[1]
+            <= percentile_values[2]
+        )
+    ):
+        return False, "audio metadata source-end percentiles are invalid"
+    if expected_version is None and (
+        observation.get("stream_generation") is not None
+        or observation.get("input_sample_zero_timestamp_ms") is not None
+        or observation.get("paired_frames") != 0
+        or observation.get("completed_parents") != 0
+        or availability != "protocol_not_negotiated"
+        or sample_count != 0
+        or any(value is not None for value in percentile_values)
+    ):
+        return False, "legacy audio metadata observation is inconsistent"
+
+    duration_sec = summary.get("input_duration_sec")
+    if (
+        not isinstance(duration_sec, (int, float))
+        or isinstance(duration_sec, bool)
+        or not math.isfinite(duration_sec)
+        or duration_sec <= 0
+    ):
+        return False, "audio metadata summary input duration is invalid"
+    staged_integrity = summary.get("staged_integrity")
+    staged_errors = (
+        staged_integrity.get("errors", [])
+        if isinstance(staged_integrity, dict)
+        else []
+    )
+    result = TestResult(
+        audio_path=str(summary.get("audio_path", "")),
+        duration_sec=float(duration_sec),
+        backend_url=str(summary.get("backend_url", "")),
+        backend_config=backend_config,
+        target_language=str(summary.get("target_language", "")),
+        pipeline_mode=str(summary.get("pipeline_mode", "")),
+        staged_pipeline=summary.get("staged_pipeline"),
+        staged_integrity_errors=(
+            list(staged_errors) if isinstance(staged_errors, list) else []
+        ),
+        websocket_receive_events=summary.get(
+            "websocket_receive_events",
+            [],
+        ),
+        audio_metadata_protocol_version=observed_version,
+        audio_metadata_stream_generation=observation.get(
+            "stream_generation"
+        ),
+        input_sample_zero_timestamp_ms=observation.get(
+            "input_sample_zero_timestamp_ms"
+        ),
+        audio_metadata_paired_frames=observation.get("paired_frames"),
+        audio_metadata_completed_parents=observation.get(
+            "completed_parents"
+        ),
+        chunks_sent=summary.get("chunks_sent", 0),
+        audio_responses=summary.get("audio_responses", 0),
+        total_received_bytes=summary.get("total_received_bytes", 0),
+        input_completed=summary.get("input_completed") is True,
+        connection_lost=summary.get("connection_lost") is True,
+        drain_timed_out=summary.get("drain_timed_out") is True,
+        translation_completed=summary.get("translation_completed") is True,
+        input_end_timestamp_ms=summary.get("input_end_timestamp_ms", 0),
+        terminal_arrival_timestamp_ms=summary.get(
+            "terminal_arrival_timestamp_ms",
+            0,
+        ),
+        terminal_arrival_lag_sec=summary.get(
+            "terminal_arrival_lag_sec",
+            0,
+        ),
+        server_error=summary.get("server_error", ""),
+    )
+    try:
+        errors = validate_capture_result(result)
+    except (TypeError, ValueError) as exc:
+        return False, f"audio metadata capture validation failed: {exc}"
+    if errors:
+        return False, (
+            "audio metadata capture validation failed: "
+            + "; ".join(str(error) for error in errors)
+        )
+    if sample_count > result.audio_metadata_paired_frames:
+        return False, (
+            "audio metadata source-end samples exceed paired frames"
+        )
+    return True, "ok"
+
+
 def validate_summary(
     path: Path,
     *,
     expected_pipeline: dict[str, Any] | None = None,
+    expected_audio_metadata_protocol_version: Any = (
+        _EXPECTED_METADATA_UNSPECIFIED
+    ),
 ) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"missing summary: {path}"
@@ -502,6 +770,13 @@ def validate_summary(
             f"expected {expected_pipeline!r}, got {pipeline_provenance!r}"
         )
 
+    metadata_valid, reason = _validate_saved_audio_metadata_observation(
+        summary,
+        expected_audio_metadata_protocol_version,
+    )
+    if not metadata_valid:
+        return False, reason
+
     checks = (
         (summary.get("input_completed") is True, "input did not complete"),
         (summary.get("connection_lost") is False, "WebSocket connection was lost"),
@@ -532,10 +807,16 @@ def validate_artifact_set(
     *,
     expected_hashes: dict[str, str] | None = None,
     expected_pipeline: dict[str, Any] | None = None,
+    expected_audio_metadata_protocol_version: Any = (
+        _EXPECTED_METADATA_UNSPECIFIED
+    ),
 ) -> tuple[bool, str]:
     summary_valid, reason = validate_summary(
         summary_path,
         expected_pipeline=expected_pipeline,
+        expected_audio_metadata_protocol_version=(
+            expected_audio_metadata_protocol_version
+        ),
     )
     if not summary_valid:
         return False, reason
@@ -600,6 +881,9 @@ def capture_artifacts_valid(
     entry: dict[str, Any],
     *,
     expected_pipeline: dict[str, Any] | None = None,
+    expected_audio_metadata_protocol_version: Any = (
+        _EXPECTED_METADATA_UNSPECIFIED
+    ),
 ) -> tuple[bool, str]:
     return validate_artifact_set(
         run_dir / entry["csv"],
@@ -607,10 +891,20 @@ def capture_artifacts_valid(
         run_dir / entry["plot"],
         expected_hashes=entry.get("artifact_sha256"),
         expected_pipeline=expected_pipeline,
+        expected_audio_metadata_protocol_version=(
+            expected_audio_metadata_protocol_version
+        ),
     )
 
 
-def check_backend_ready(backend_url: str) -> dict[str, Any]:
+def check_backend_ready(
+    backend_url: str,
+    *,
+    audio_metadata_protocol_version: int | None = None,
+) -> dict[str, Any]:
+    _validate_audio_metadata_protocol_version(
+        audio_metadata_protocol_version
+    )
     root_url = f"{backend_url.rstrip('/')}/"
     try:
         response = requests.get(root_url, timeout=10)
@@ -652,6 +946,15 @@ def check_backend_ready(backend_url: str) -> dict[str, Any]:
     model_config, reason = _validated_model_config(config.get("modelConfig"))
     if model_config is None:
         raise ExperimentError(f"backend configuration {reason}")
+    if (
+        audio_metadata_protocol_version is not None
+        and config.get("audioMetadataProtocolVersions")
+        != [audio_metadata_protocol_version]
+    ):
+        raise ExperimentError(
+            "backend configuration does not advertise audio metadata "
+            f"protocol version {audio_metadata_protocol_version}"
+        )
     payload = dict(payload)
     payload["config"] = config
 
@@ -709,42 +1012,13 @@ def freeze_or_validate_pipeline_provenance(
 
 
 def validate_result(result: TestResult) -> None:
-    failures = []
-    if not result.input_completed:
-        failures.append("input did not complete")
-    if result.connection_lost:
-        failures.append("WebSocket connection was lost")
-    if result.drain_timed_out:
-        failures.append("translated tail drain timed out")
-    if not result.translation_completed:
-        failures.append("Riva did not confirm translated-stream completion")
-    if result.server_error:
-        failures.append(f"backend error: {result.server_error}")
-    if result.audio_responses <= 0 or result.total_received_bytes <= 0:
-        failures.append("no translated audio was received")
-    if result.translation_completed:
-        if result.input_end_timestamp_ms <= 0:
-            failures.append("input end timestamp is missing")
-        if result.terminal_arrival_timestamp_ms <= 0:
-            failures.append("terminal arrival timestamp is missing")
-        elif result.terminal_arrival_timestamp_ms < result.input_end_timestamp_ms:
-            failures.append("completed terminal arrived before end_input")
-        expected_lag = max(
-            0.0,
-            (
-                result.terminal_arrival_timestamp_ms
-                - result.input_end_timestamp_ms
-            )
-            / 1000,
-        )
-        if not math.isclose(
-            result.terminal_arrival_lag_sec,
-            expected_lag,
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        ):
-            failures.append("terminal arrival lag is inconsistent with timestamps")
+    failures = validate_capture_result(result)
     if result.staged_integrity_errors:
+        failures = [
+            failure
+            for failure in failures
+            if failure not in result.staged_integrity_errors
+        ]
         failures.append(
             "staged pipeline integrity failed: "
             + "; ".join(str(error) for error in result.staged_integrity_errors)
@@ -753,7 +1027,13 @@ def validate_result(result: TestResult) -> None:
         raise ExperimentError("; ".join(failures))
 
 
-async def capture_one(audio_path: Path, backend_url: str, output_dir: Path) -> dict[str, str]:
+async def capture_one(
+    audio_path: Path,
+    backend_url: str,
+    output_dir: Path,
+    *,
+    audio_metadata_protocol_version: int | None = None,
+) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
     csv_path = output_dir / f"{stem}_results.csv"
@@ -761,7 +1041,16 @@ async def capture_one(audio_path: Path, backend_url: str, output_dir: Path) -> d
     plot_path = output_dir / f"{stem}_latency.png"
 
     try:
-        result = await run_test(str(audio_path), backend_url)
+        if audio_metadata_protocol_version is None:
+            result = await run_test(str(audio_path), backend_url)
+        else:
+            result = await run_test(
+                str(audio_path),
+                backend_url,
+                audio_metadata_protocol_version=(
+                    audio_metadata_protocol_version
+                ),
+            )
     except Exception:
         try:
             requests.post(f"{backend_url.rstrip('/')}/api/test/stop", timeout=10)
@@ -786,6 +1075,8 @@ async def capture_and_promote(
     run_dir: Path,
     entry: dict[str, Any],
     expected_pipeline: dict[str, Any],
+    *,
+    audio_metadata_protocol_version: int | None = None,
 ) -> None:
     staging_root = run_dir / ".staging"
     staging_root.mkdir(parents=True, exist_ok=True)
@@ -793,12 +1084,29 @@ async def capture_and_promote(
     with tempfile.TemporaryDirectory(prefix=prefix, dir=staging_root) as temporary:
         staging_dir = Path(temporary)
         try:
-            artifacts = await capture_one(audio_path, backend_url, staging_dir)
+            if audio_metadata_protocol_version is None:
+                artifacts = await capture_one(
+                    audio_path,
+                    backend_url,
+                    staging_dir,
+                )
+            else:
+                artifacts = await capture_one(
+                    audio_path,
+                    backend_url,
+                    staging_dir,
+                    audio_metadata_protocol_version=(
+                        audio_metadata_protocol_version
+                    ),
+                )
             valid, reason = validate_artifact_set(
                 Path(artifacts["csv"]),
                 Path(artifacts["summary"]),
                 Path(artifacts["plot"]),
                 expected_pipeline=expected_pipeline,
+                expected_audio_metadata_protocol_version=(
+                    audio_metadata_protocol_version
+                ),
             )
             if not valid:
                 raise ExperimentError(reason)
@@ -833,6 +1141,9 @@ async def capture_and_promote(
         run_dir,
         entry,
         expected_pipeline=expected_pipeline,
+        expected_audio_metadata_protocol_version=(
+            audio_metadata_protocol_version
+        ),
     )
     if not valid:
         raise ExperimentError(f"promoted artifact validation failed: {reason}")
@@ -997,6 +1308,9 @@ def write_analysis(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "backend_url": manifest["backend_url"],
         "git": manifest["git"],
         "pipeline": manifest.get("pipeline_provenance"),
+        "audio_metadata_protocol_version": (
+            manifest_audio_metadata_protocol_version(manifest)
+        ),
         "paired_policy_comparison_from_identical_live_trace": True,
         "browser_web_audio_executed": False,
     }
@@ -1014,6 +1328,7 @@ def _merge_resume_settings(
     *,
     backend_url: str | None,
     repeats: int | None,
+    audio_metadata_protocol_v1: bool = False,
 ) -> tuple[str, int]:
     existing_backend = str(manifest.get("backend_url", DEFAULT_BACKEND))
     if backend_url is not None and backend_url.rstrip("/") != existing_backend.rstrip("/"):
@@ -1025,6 +1340,19 @@ def _merge_resume_settings(
         raise ExperimentError(
             f"resume repeat mismatch: manifest has {existing_repeats}, requested {repeats}"
         )
+    existing_metadata_version = (
+        manifest_audio_metadata_protocol_version(manifest)
+    )
+    if (
+        audio_metadata_protocol_v1
+        and existing_metadata_version
+        != AUDIO_METADATA_PROTOCOL_VERSION
+    ):
+        raise ExperimentError(
+            "resume audio metadata protocol mismatch: manifest uses "
+            f"{existing_metadata_version!r}, requested "
+            f"{AUDIO_METADATA_PROTOCOL_VERSION}"
+        )
     return existing_backend, existing_repeats
 
 
@@ -1034,6 +1362,15 @@ def print_plan(run_dir: Path, manifest: dict[str, Any]) -> None:
     print(f"  Backend: {manifest['backend_url']}")
     print(f"  Preflight: {'yes' if manifest['preflight']['required'] else 'skipped'}")
     print(f"  Repeats: {manifest['requested_repeats']}")
+    metadata_version = manifest_audio_metadata_protocol_version(manifest)
+    print(
+        "  Audio metadata: "
+        + (
+            f"protocol v{metadata_version} (observation-only)"
+            if metadata_version is not None
+            else "legacy raw binary (not negotiated)"
+        )
+    )
     print("  Execution: sequential; one live Riva trace produces fixed + adaptive analysis")
     for entry in manifest["runs"]:
         print(
@@ -1044,12 +1381,23 @@ def print_plan(run_dir: Path, manifest: dict[str, Any]) -> None:
 
 
 async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
+    audio_metadata_protocol_version = (
+        manifest_audio_metadata_protocol_version(manifest)
+    )
     manifest["status"] = "running"
     manifest["completed_at_utc"] = None
     write_manifest(run_dir, manifest)
 
     try:
-        readiness = check_backend_ready(manifest["backend_url"])
+        if audio_metadata_protocol_version is None:
+            readiness = check_backend_ready(manifest["backend_url"])
+        else:
+            readiness = check_backend_ready(
+                manifest["backend_url"],
+                audio_metadata_protocol_version=(
+                    audio_metadata_protocol_version
+                ),
+            )
         pipeline_provenance = freeze_or_validate_pipeline_provenance(
             manifest,
             readiness,
@@ -1063,6 +1411,9 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
                 run_dir,
                 preflight,
                 expected_pipeline=pipeline_provenance,
+                expected_audio_metadata_protocol_version=(
+                    audio_metadata_protocol_version
+                ),
             )
             if valid:
                 preflight["status"] = "completed"
@@ -1084,6 +1435,9 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
                         run_dir,
                         preflight,
                         pipeline_provenance,
+                        audio_metadata_protocol_version=(
+                            audio_metadata_protocol_version
+                        ),
                     )
                 except Exception as exc:
                     preflight["status"] = "failed"
@@ -1098,6 +1452,9 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
                 run_dir,
                 entry,
                 expected_pipeline=pipeline_provenance,
+                expected_audio_metadata_protocol_version=(
+                    audio_metadata_protocol_version
+                ),
             )
             if valid:
                 entry["status"] = "completed"
@@ -1129,11 +1486,17 @@ async def execute_experiment(run_dir: Path, manifest: dict[str, Any]) -> int:
                     run_dir,
                     entry,
                     pipeline_provenance,
+                    audio_metadata_protocol_version=(
+                        audio_metadata_protocol_version
+                    ),
                 )
                 valid, reason = capture_artifacts_valid(
                     run_dir,
                     entry,
                     expected_pipeline=pipeline_provenance,
+                    expected_audio_metadata_protocol_version=(
+                        audio_metadata_protocol_version
+                    ),
                 )
                 if not valid:
                     raise ExperimentError(reason)
@@ -1204,6 +1567,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="skip the one-minute service-path validation",
     )
     parser.add_argument(
+        "--audio-metadata-protocol-v1",
+        action="store_true",
+        help=(
+            "negotiate observation-only audio metadata protocol v1 for "
+            "preflight and every sample"
+        ),
+    )
+    parser.add_argument(
         "--resume-dir",
         type=Path,
         help="continue an existing run using its manifest and valid checkpoints",
@@ -1236,6 +1607,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest,
                 backend_url=args.backend,
                 repeats=args.repeats,
+                audio_metadata_protocol_v1=(
+                    args.audio_metadata_protocol_v1
+                ),
             )
             manifest["backend_url"] = backend_url.rstrip("/")
             manifest["requested_repeats"] = repeats
@@ -1257,6 +1631,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skip_preflight=args.skip_preflight,
                 files=files,
                 include_hashes=not args.dry_run,
+                audio_metadata_protocol_version=(
+                    AUDIO_METADATA_PROTOCOL_VERSION
+                    if args.audio_metadata_protocol_v1
+                    else None
+                ),
             )
 
         print_plan(run_dir, manifest)

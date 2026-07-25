@@ -12,6 +12,9 @@ const mockPlaybackStart = vi.fn();
 const mockPlaybackStop = vi.fn();
 const mockQueueAudio = vi.fn();
 const mockTrackerStartTest = vi.fn();
+const mockLogChunkSent = vi.fn();
+const mockLogAudioReceived = vi.fn();
+const mockLogAudioParentComplete = vi.fn();
 const mockGetPlaybackMetrics = vi.fn<() => PlaybackMetrics>(() => ({
   queueDepthSeconds: 0,
   peakQueueDepthSeconds: 0,
@@ -79,8 +82,9 @@ vi.mock('../hooks/useFileAudioSource', () => ({
 vi.mock('../hooks/useTimingTracker', () => ({
   useTimingTracker: vi.fn(() => ({
     startTest: mockTrackerStartTest,
-    logChunkSent: vi.fn(),
-    logAudioReceived: vi.fn(),
+    logChunkSent: mockLogChunkSent,
+    logAudioReceived: mockLogAudioReceived,
+    logAudioParentComplete: mockLogAudioParentComplete,
     logPlaybackScheduled: vi.fn(),
     logPlaybackQueueSample: vi.fn(),
     getEvents: vi.fn(() => []),
@@ -244,6 +248,59 @@ describe('TestDashboard', () => {
       adaptivePlayback: true,
       onSchedule: expect.any(Function),
     }));
+  });
+
+  it('opts only the test transport into audio metadata v1 and records observations', async () => {
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    render(<TestDashboard />);
+    const options = vi.mocked(useWebSocket).mock.calls.at(-1)?.[0];
+    expect(options).toEqual(expect.objectContaining({
+      audioMetadataProtocolVersion: 1,
+      onAudio: expect.any(Function),
+      onAudioParentComplete: expect.any(Function),
+    }));
+
+    const audio = new ArrayBuffer(4);
+    const frameObservation = {
+      metadata: {
+        type: 'audio_frame' as const,
+        protocolVersion: 1 as const,
+        streamGeneration: 1,
+        parentSequenceId: 0,
+        audioFrameId: 0,
+        audioBytes: 4,
+        sampleRateHz: 16000,
+        channels: 1,
+        bytesPerSample: 2,
+        sourceStartMs: null,
+        sourceEndMs: 300,
+      },
+      binaryReceivedAtMs: 1000,
+    };
+    act(() => options?.onAudio?.(audio, frameObservation));
+    expect(mockLogAudioReceived).toHaveBeenCalledWith(
+      audio.byteLength,
+      frameObservation,
+    );
+    expect(mockQueueAudio).toHaveBeenCalledWith(audio, frameObservation);
+
+    const completionObservation = {
+      metadata: {
+        type: 'audio_parent_complete' as const,
+        protocolVersion: 1 as const,
+        streamGeneration: 1,
+        parentSequenceId: 0,
+        audioFrameCount: 1,
+        audioBytes: 4,
+        sourceStartMs: null,
+        sourceEndMs: 300,
+      },
+      receivedAtMs: 1001,
+    };
+    act(() => options?.onAudioParentComplete?.(completionObservation));
+    expect(mockLogAudioParentComplete).toHaveBeenCalledWith(
+      completionObservation,
+    );
   });
 
   it('can select a fixed 1.00x control before a run starts', async () => {
@@ -510,6 +567,25 @@ describe('TestDashboard', () => {
       expect(disconnect).toHaveBeenCalledTimes(1);
       expect(screen.getByText('Export CSV')).toBeInTheDocument();
     } finally {
+      const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+      const { useWebSocket } = await import('../hooks/useWebSocket');
+      vi.mocked(useFileAudioSource).mockReturnValue({
+        isLoaded: false,
+        isStreaming: false,
+        duration: 0,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming: vi.fn(),
+        stopStreaming: vi.fn(),
+      });
+      vi.mocked(useWebSocket).mockReturnValue({
+        isConnected: false,
+        status: 'disconnected',
+        sendMessage: vi.fn(),
+        sendAudio: vi.fn(),
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+      });
       vi.useRealTimers();
     }
   });
@@ -558,6 +634,76 @@ describe('TestDashboard', () => {
     );
     expect(screen.getByText('Export CSV')).toBeInTheDocument();
     expect(screen.getByText('New Test')).toBeInTheDocument();
+  });
+
+  it('cancels delayed file input when metadata negotiation fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+      const { useWebSocket } = await import('../hooks/useWebSocket');
+      let notifyError: ((message: string) => void) | undefined;
+      const startStreaming = vi.fn();
+      const stopStreaming = vi.fn();
+
+      vi.mocked(useFileAudioSource).mockReturnValue({
+        isLoaded: true,
+        isStreaming: false,
+        duration: 60,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming,
+        stopStreaming,
+      });
+      vi.mocked(useWebSocket).mockImplementation((options) => {
+        notifyError = options.onError;
+        return {
+          isConnected: true,
+          status: 'connected',
+          sendMessage: vi.fn(),
+          sendAudio: vi.fn(),
+          connect: vi.fn(),
+          disconnect: vi.fn(),
+        };
+      });
+
+      render(<TestDashboard />);
+      await act(async () => {
+        fireEvent.click(screen.getByText('Start Test'));
+      });
+
+      await act(async () => {
+        notifyError?.('Audio metadata protocol is unavailable');
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(500);
+      });
+
+      expect(stopStreaming).toHaveBeenCalledTimes(1);
+      expect(startStreaming).not.toHaveBeenCalled();
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Test failed: Audio metadata protocol is unavailable',
+      );
+    } finally {
+      const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+      const { useWebSocket } = await import('../hooks/useWebSocket');
+      vi.mocked(useFileAudioSource).mockReturnValue({
+        isLoaded: false,
+        isStreaming: false,
+        duration: 0,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming: vi.fn(),
+        stopStreaming: vi.fn(),
+      });
+      vi.mocked(useWebSocket).mockReturnValue({
+        isConnected: false,
+        status: 'disconnected',
+        sendMessage: vi.fn(),
+        sendAudio: vi.fn(),
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+      });
+      vi.useRealTimers();
+    }
   });
 
   it('marks a missing server completion as failed at the drain timeout', async () => {

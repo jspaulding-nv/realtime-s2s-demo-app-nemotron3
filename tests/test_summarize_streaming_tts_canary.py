@@ -78,6 +78,7 @@ def _backend_config(*, streaming: bool) -> dict:
         )
     return {
         "pipelineMode": "staged",
+        "audioMetadataProtocolVersions": [1] if streaming else [],
         "sampleRate": 16000,
         "chunkSize": 4800,
         "channels": 1,
@@ -295,6 +296,30 @@ def _summary(prefix: Path, *, streaming: bool) -> dict:
                 ],
             }
         )
+    audio_metadata_observation = {
+        "protocol_version": 1 if streaming else None,
+        "stream_generation": 1 if streaming else None,
+        "input_sample_zero_timestamp_ms": 500.0 if streaming else None,
+        "paired_frames": 2 if streaming else 0,
+        "completed_parents": 1 if streaming else 0,
+        "source_end_to_receipt": {
+            "availability": (
+                "available_asr_source_range_end_offset"
+                if streaming
+                else "protocol_not_negotiated"
+            ),
+            "sample_count": 2 if streaming else 0,
+            "p50_ms": 120.0 if streaming else None,
+            "p95_ms": 130.0 if streaming else None,
+            "max_ms": 130.0 if streaming else None,
+            "clock": "client_monotonic",
+            "source_offset_origin": "input_pcm_sample_zero",
+            "semantic_boundary_proven": False,
+            "actual_audibility_proven": False,
+        },
+        "playback_behavior_changed": False,
+        "contains_transcript_or_translation_text": False,
+    }
     return {
         "audio_path": str(prefix.resolve()),
         "backend_config": _backend_config(streaming=streaming),
@@ -305,6 +330,7 @@ def _summary(prefix: Path, *, streaming: bool) -> dict:
             "errors": [],
         },
         "staged_pipeline": staged,
+        "audio_metadata_observation": audio_metadata_observation,
         "input_duration_sec": 10.0,
         "chunks_sent": 34,
         "audio_responses": 2 if streaming else 1,
@@ -326,7 +352,10 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, dict[str, dict]]:
     prefix.write_bytes(b"shared synthetic prefix")
     digest = hashlib.sha256(prefix.read_bytes()).hexdigest()
     (tmp_path / "run_info.txt").write_text(
-        f"prefix_sha256={digest}\n",
+        (
+            f"prefix_sha256={digest}\n"
+            "streaming_audio_metadata_protocol_version=1\n"
+        ),
         encoding="utf-8",
     )
     values = {}
@@ -500,6 +529,10 @@ def _add_second_parent(input_dir: Path, values: dict[str, dict]) -> None:
         staged["segments_emitted"] = 2
         staged["completed_sequence_ids"] = [0, 1]
         summary["audio_responses"] = 4 if streaming else 2
+        if streaming:
+            observation = summary["audio_metadata_observation"]
+            observation["paired_frames"] = 4
+            observation["completed_parents"] = 2
         summary["total_received_bytes"] = 64000
         summary["output_duration_sec"] = 2.0
         playback["traces"][0]["translated_audio_seconds"] = 2.0
@@ -769,6 +802,49 @@ def test_rejects_inconsistent_incremental_api_flag(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="incremental-publication flag"):
+        build_canary_summary(input_dir)
+
+
+def test_rejects_missing_streaming_metadata_negotiation(
+    tmp_path: Path,
+) -> None:
+    input_dir, values = _write_fixture(tmp_path)
+    summary = copy.deepcopy(values["streaming"]["summary"])
+    summary["audio_metadata_observation"]["protocol_version"] = None
+    (input_dir / "streaming" / "shared-prefix_summary.json").write_text(
+        json.dumps(summary),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must negotiate metadata protocol v1"):
+        build_canary_summary(input_dir)
+
+
+def test_rejects_metadata_frame_reconciliation_mismatch(
+    tmp_path: Path,
+) -> None:
+    input_dir, values = _write_fixture(tmp_path)
+    summary = copy.deepcopy(values["streaming"]["summary"])
+    summary["audio_metadata_observation"]["paired_frames"] = 1
+    (input_dir / "streaming" / "shared-prefix_summary.json").write_text(
+        json.dumps(summary),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="paired-frame count mismatch"):
+        build_canary_summary(input_dir)
+
+
+def test_rejects_atomic_control_metadata_opt_in(tmp_path: Path) -> None:
+    input_dir, values = _write_fixture(tmp_path)
+    summary = copy.deepcopy(values["atomic"]["summary"])
+    summary["audio_metadata_observation"]["protocol_version"] = 1
+    (input_dir / "atomic" / "shared-prefix_summary.json").write_text(
+        json.dumps(summary),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must remain on legacy audio"):
         build_canary_summary(input_dir)
 
 

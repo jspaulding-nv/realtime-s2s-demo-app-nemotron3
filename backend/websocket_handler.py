@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import math
 import os
 import time
 from concurrent.futures import wait
@@ -19,6 +20,8 @@ from timing_logger import timing_logger
 
 
 VERBOSE_CHUNKS = os.getenv("RIVA_VERBOSE_CHUNKS", "0") == "1"
+AUDIO_METADATA_PROTOCOL_VERSION = 1
+_AUDIO_METADATA_PROTOCOL_UNSET = object()
 
 
 def create_staged_pipeline(target_language: str):
@@ -90,6 +93,7 @@ class TranslationSession:
     _staged_cleanup_task: Optional[asyncio.Task] = None
     _staged_generation: int = 0
     _staged_terminal_generation: int = -1
+    _audio_metadata_protocol_version: Optional[int] = None
     _staged_audio_sequence_ids_sent: list[int] = field(default_factory=list)
     _staged_audio_subsegment_keys_sent: list[tuple[int, int, int]] = field(
         default_factory=list
@@ -102,6 +106,14 @@ class TranslationSession:
     _staged_pending_frame_parent: Optional[int] = None
     _staged_pending_frame_count: int = 0
     _staged_pending_frame_bytes: int = 0
+    _staged_pending_frame_sample_rate_hz: Optional[int] = None
+    _staged_pending_frame_channels: Optional[int] = None
+    _staged_pending_frame_bytes_per_sample: Optional[int] = None
+    _staged_pending_frame_source_start_ms: Optional[float] = None
+    _staged_pending_frame_source_end_ms: Optional[float] = None
+    _staged_stream_sample_rate_hz: Optional[int] = None
+    _staged_stream_channels: Optional[int] = None
+    _staged_stream_bytes_per_sample: Optional[int] = None
     _staged_websocket_send_events: list[dict] = field(default_factory=list)
     _last_staged_summary: Optional[dict] = None
 
@@ -187,8 +199,25 @@ class TranslationSession:
             print(f"[WS] Failed to send audio: {exc}")
             return False
 
-    async def start_stream(self, target_language: str) -> None:
+    async def start_stream(
+        self,
+        target_language: str,
+        *,
+        audio_metadata_protocol_version: Any = (
+            _AUDIO_METADATA_PROTOCOL_UNSET
+        ),
+    ) -> None:
         """Start a new translation stream."""
+        try:
+            negotiated_metadata_version = (
+                self._validate_audio_metadata_protocol_request(
+                    audio_metadata_protocol_version
+                )
+            )
+        except ValueError as exc:
+            await self.send_protocol_error(str(exc))
+            return
+
         staged_start = None
         async with self._lock:
             print(f"[WS] start_stream called: target={target_language}, current_status={self.status}")
@@ -215,7 +244,10 @@ class TranslationSession:
             self.target_language = target_language
 
             if self.uses_staged_pipeline:
-                staged_start = await self._start_staged_pipeline(target_language)
+                staged_start = await self._start_staged_pipeline(
+                    target_language,
+                    negotiated_metadata_version,
+                )
             else:
                 await self.send_status(
                     SessionStatus.LISTENING,
@@ -299,6 +331,8 @@ class TranslationSession:
                 generation,
                 f"Failed to start stream: {start_error}",
             )
+            if generation == self._staged_generation:
+                self._audio_metadata_protocol_version = None
             return
 
         listening_sent = await self._send_staged_json(
@@ -324,14 +358,41 @@ class TranslationSession:
                     name="staged-websocket-output",
                 )
 
+    def _validate_audio_metadata_protocol_request(
+        self,
+        requested_version: Any,
+    ) -> Optional[int]:
+        """Negotiate the opt-in observation metadata protocol fail-closed."""
+        if requested_version is _AUDIO_METADATA_PROTOCOL_UNSET:
+            return None
+        if (
+            not isinstance(requested_version, int)
+            or isinstance(requested_version, bool)
+            or requested_version != AUDIO_METADATA_PROTOCOL_VERSION
+        ):
+            raise ValueError(
+                "audioMetadataProtocolVersion must be the integer 1"
+            )
+        if not self.uses_staged_pipeline:
+            raise ValueError(
+                "audio metadata protocol version 1 requires the staged "
+                "schema-3 incremental TTS pipeline"
+            )
+        return requested_version
+
     async def _start_staged_pipeline(
-        self, target_language: str
+        self,
+        target_language: str,
+        audio_metadata_protocol_version: Optional[int],
     ) -> tuple[Any, int, str]:
         """Start direct clients while the caller owns the lifecycle lock."""
         factory = self.staged_pipeline_factory or create_staged_pipeline
         pipeline = None
         self._staged_generation += 1
         generation = self._staged_generation
+        self._audio_metadata_protocol_version = (
+            audio_metadata_protocol_version
+        )
         self._staged_audio_sequence_ids_sent = []
         self._staged_audio_subsegment_keys_sent = []
         self._staged_audio_frame_keys_sent = []
@@ -340,9 +401,31 @@ class TranslationSession:
         self._staged_pending_frame_parent = None
         self._staged_pending_frame_count = 0
         self._staged_pending_frame_bytes = 0
+        self._staged_pending_frame_sample_rate_hz = None
+        self._staged_pending_frame_channels = None
+        self._staged_pending_frame_bytes_per_sample = None
+        self._staged_pending_frame_source_start_ms = None
+        self._staged_pending_frame_source_end_ms = None
+        self._staged_stream_sample_rate_hz = None
+        self._staged_stream_channels = None
+        self._staged_stream_bytes_per_sample = None
         self._staged_websocket_send_events = []
         try:
             pipeline = factory(target_language)
+            if (
+                audio_metadata_protocol_version
+                == AUDIO_METADATA_PROTOCOL_VERSION
+                and getattr(
+                    getattr(pipeline, "config", None),
+                    "tts_incremental_publish_enabled",
+                    False,
+                )
+                is not True
+            ):
+                raise ValueError(
+                    "audio metadata protocol version 1 requires the staged "
+                    "schema-3 incremental TTS pipeline"
+                )
             self._staged_pipeline = pipeline
             await pipeline.start()
             return pipeline, generation, ""
@@ -395,6 +478,7 @@ class TranslationSession:
                 if output.kind is StagedOutputEventKind.AUDIO_FRAME:
                     frame = output.frame
                     audio = frame.audio
+                    source_start_ms, source_end_ms = _source_range(frame)
                     timing_logger.log_audio_from_riva(len(audio))
                     sent = await self._send_staged_audio(
                         generation,
@@ -402,6 +486,19 @@ class TranslationSession:
                         frame.parent_sequence_id,
                         audio_frame_id=frame.audio_frame_id,
                         include_frame=True,
+                        sample_rate_hz=getattr(
+                            frame,
+                            "sample_rate_hz",
+                            None,
+                        ),
+                        channels=getattr(frame, "channels", None),
+                        bytes_per_sample=getattr(
+                            frame,
+                            "bytes_per_sample",
+                            None,
+                        ),
+                        source_start_ms=source_start_ms,
+                        source_end_ms=source_end_ms,
                     )
                     if sent is None:
                         return
@@ -470,6 +567,8 @@ class TranslationSession:
                 self._staged_pipeline = None
             if self._staged_output_task is asyncio.current_task():
                 self._staged_output_task = None
+            if generation == self._staged_generation:
+                self._audio_metadata_protocol_version = None
 
     async def _close_completed_staged_pipeline(
         self, pipeline: Any
@@ -650,6 +749,11 @@ class TranslationSession:
         include_composite: bool = False,
         audio_frame_id: Optional[int] = None,
         include_frame: bool = False,
+        sample_rate_hz: Optional[int] = None,
+        channels: Optional[int] = None,
+        bytes_per_sample: Optional[int] = None,
+        source_start_ms: Optional[float] = None,
+        source_end_ms: Optional[float] = None,
     ) -> Optional[bool]:
         """Send current-generation PCM before any terminal message.
 
@@ -692,12 +796,82 @@ class TranslationSession:
                     or audio_frame_id != self._staged_pending_frame_count
                 ):
                     return False
+                if self._audio_metadata_protocol_version is not None:
+                    try:
+                        _validate_pcm_metadata(
+                            sample_rate_hz,
+                            channels,
+                            bytes_per_sample,
+                        )
+                        _validate_source_range(
+                            source_start_ms,
+                            source_end_ms,
+                        )
+                    except ValueError:
+                        return False
+                    if len(audio) % (channels * bytes_per_sample):
+                        return False
+                    if (
+                        self._staged_stream_sample_rate_hz is not None
+                        and (
+                            sample_rate_hz
+                            != self._staged_stream_sample_rate_hz
+                            or channels != self._staged_stream_channels
+                            or bytes_per_sample
+                            != self._staged_stream_bytes_per_sample
+                        )
+                    ):
+                        return False
+                    if self._staged_pending_frame_parent is not None and (
+                        sample_rate_hz
+                        != self._staged_pending_frame_sample_rate_hz
+                        or channels != self._staged_pending_frame_channels
+                        or bytes_per_sample
+                        != self._staged_pending_frame_bytes_per_sample
+                        or source_start_ms
+                        != self._staged_pending_frame_source_start_ms
+                        or source_end_ms
+                        != self._staged_pending_frame_source_end_ms
+                    ):
+                        return False
+                    header = {
+                        "type": "audio_frame",
+                        "protocolVersion": (
+                            self._audio_metadata_protocol_version
+                        ),
+                        "streamGeneration": generation,
+                        "parentSequenceId": sequence_id,
+                        "audioFrameId": audio_frame_id,
+                        "audioBytes": len(audio),
+                        "sampleRateHz": sample_rate_hz,
+                        "channels": channels,
+                        "bytesPerSample": bytes_per_sample,
+                        "sourceStartMs": source_start_ms,
+                        "sourceEndMs": source_end_ms,
+                    }
+                    if not await self._send_json_unlocked(header):
+                        return False
             if not await self._send_audio_unlocked(audio):
                 return False
             timing_logger.log_audio_sent_to_client(len(audio))
             if include_frame:
+                if self._staged_stream_sample_rate_hz is None:
+                    self._staged_stream_sample_rate_hz = sample_rate_hz
+                    self._staged_stream_channels = channels
+                    self._staged_stream_bytes_per_sample = bytes_per_sample
                 if self._staged_pending_frame_parent is None:
                     self._staged_pending_frame_parent = sequence_id
+                    self._staged_pending_frame_sample_rate_hz = (
+                        sample_rate_hz
+                    )
+                    self._staged_pending_frame_channels = channels
+                    self._staged_pending_frame_bytes_per_sample = (
+                        bytes_per_sample
+                    )
+                    self._staged_pending_frame_source_start_ms = (
+                        source_start_ms
+                    )
+                    self._staged_pending_frame_source_end_ms = source_end_ms
                 self._staged_audio_frame_keys_sent.append(
                     (sequence_id, audio_frame_id)
                 )
@@ -751,6 +925,14 @@ class TranslationSession:
             "atomic_fallback_applied",
             None,
         )
+        sample_rate_hz = getattr(completion, "sample_rate_hz", None)
+        channels = getattr(completion, "channels", None)
+        bytes_per_sample = getattr(
+            completion,
+            "bytes_per_sample",
+            None,
+        )
+        source_start_ms, source_end_ms = _source_range(completion)
         if (
             not isinstance(parent_sequence_id, int)
             or isinstance(parent_sequence_id, bool)
@@ -779,6 +961,48 @@ class TranslationSession:
                 or self._staged_pending_frame_bytes != audio_bytes
             ):
                 return False
+            if self._audio_metadata_protocol_version is not None:
+                try:
+                    _validate_pcm_metadata(
+                        sample_rate_hz,
+                        channels,
+                        bytes_per_sample,
+                    )
+                    _validate_source_range(
+                        source_start_ms,
+                        source_end_ms,
+                    )
+                except ValueError:
+                    return False
+                if audio_bytes % (channels * bytes_per_sample):
+                    return False
+                if (
+                    sample_rate_hz
+                    != self._staged_pending_frame_sample_rate_hz
+                    or channels != self._staged_pending_frame_channels
+                    or bytes_per_sample
+                    != self._staged_pending_frame_bytes_per_sample
+                    or source_start_ms
+                    != self._staged_pending_frame_source_start_ms
+                    or source_end_ms
+                    != self._staged_pending_frame_source_end_ms
+                ):
+                    return False
+                if not await self._send_json_unlocked(
+                    {
+                        "type": "audio_parent_complete",
+                        "protocolVersion": (
+                            self._audio_metadata_protocol_version
+                        ),
+                        "streamGeneration": generation,
+                        "parentSequenceId": parent_sequence_id,
+                        "audioFrameCount": audio_frame_count,
+                        "audioBytes": audio_bytes,
+                        "sourceStartMs": source_start_ms,
+                        "sourceEndMs": source_end_ms,
+                    }
+                ):
+                    return False
             summary = {
                 "parent_sequence_id": parent_sequence_id,
                 "audio_frame_count": audio_frame_count,
@@ -791,6 +1015,11 @@ class TranslationSession:
             self._staged_pending_frame_parent = None
             self._staged_pending_frame_count = 0
             self._staged_pending_frame_bytes = 0
+            self._staged_pending_frame_sample_rate_hz = None
+            self._staged_pending_frame_channels = None
+            self._staged_pending_frame_bytes_per_sample = None
+            self._staged_pending_frame_source_start_ms = None
+            self._staged_pending_frame_source_end_ms = None
             return True
 
     async def _send_staged_json(
@@ -1021,6 +1250,15 @@ class TranslationSession:
         self._staged_pending_frame_parent = None
         self._staged_pending_frame_count = 0
         self._staged_pending_frame_bytes = 0
+        self._staged_pending_frame_sample_rate_hz = None
+        self._staged_pending_frame_channels = None
+        self._staged_pending_frame_bytes_per_sample = None
+        self._staged_pending_frame_source_start_ms = None
+        self._staged_pending_frame_source_end_ms = None
+        self._staged_stream_sample_rate_hz = None
+        self._staged_stream_channels = None
+        self._staged_stream_bytes_per_sample = None
+        self._audio_metadata_protocol_version = None
         self._staged_websocket_send_events = []
         return True
 
@@ -1034,6 +1272,10 @@ class TranslationSession:
         self._staged_generation += 1
         if preserve_terminal and terminal_was_claimed:
             self._staged_terminal_generation = self._staged_generation
+        self._audio_metadata_protocol_version = None
+        self._staged_stream_sample_rate_hz = None
+        self._staged_stream_channels = None
+        self._staged_stream_bytes_per_sample = None
         pipeline = self._staged_pipeline
         output_task = self._staged_output_task
         if pipeline is not None:
@@ -1078,6 +1320,7 @@ class TranslationSession:
                     # A control-level stop still owns one fresh terminal
                     # generation, even when no model stream is active.
                     self._staged_generation += 1
+                    self._audio_metadata_protocol_version = None
                 staged_stop_generation = self._staged_generation
             else:
                 send_monolithic_stopped = True
@@ -1149,6 +1392,7 @@ class TranslationSession:
         """Best-effort legacy close; manager cleanup uses awaited ``aclose``."""
         self._closed = True
         self._awaiting_completion = False
+        self._audio_metadata_protocol_version = None
         if self.chunk_iterator:
             self.chunk_iterator.stop()
             self.chunk_iterator = None
@@ -1314,6 +1558,61 @@ def _validate_audio_frame_key(
             or value < 0
         ):
             raise ValueError(f"{name} must be a non-negative integer")
+
+
+def _source_range(value: Any) -> tuple[Optional[float], Optional[float]]:
+    """Return privacy-safe source timing from a synthesized payload."""
+    translation = getattr(value, "translation", None)
+    carrier = getattr(translation, "segment", None)
+    if carrier is None:
+        carrier = value
+    return (
+        getattr(carrier, "source_start_ms", None),
+        getattr(carrier, "source_end_ms", None),
+    )
+
+
+def _validate_pcm_metadata(
+    sample_rate_hz: Any,
+    channels: Any,
+    bytes_per_sample: Any,
+) -> None:
+    for name, value in (
+        ("sample_rate_hz", sample_rate_hz),
+        ("channels", channels),
+        ("bytes_per_sample", bytes_per_sample),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer")
+
+
+def _validate_source_range(
+    source_start_ms: Any,
+    source_end_ms: Any,
+) -> None:
+    for name, value in (
+        ("source_start_ms", source_start_ms),
+        ("source_end_ms", source_end_ms),
+    ):
+        if value is None:
+            continue
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be non-negative and finite")
+    if (
+        source_start_ms is not None
+        and source_end_ms is not None
+        and source_end_ms < source_start_ms
+    ):
+        raise ValueError("source_end_ms cannot precede source_start_ms")
 
 
 class SessionManager:

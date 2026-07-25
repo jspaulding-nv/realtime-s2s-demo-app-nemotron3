@@ -47,6 +47,7 @@ export function TestDashboard() {
 
   const testStartTimeRef = useRef(0);
   const driftUpdateTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastReceiveChangeRef = useRef(0);
   const drainStartTimeRef = useRef(0);
   const phaseRef = useRef<TestPhase>('idle');
@@ -104,6 +105,7 @@ export function TestDashboard() {
   // WebSocket for audio transport
   const ws = useWebSocket({
     url: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/translate`,
+    audioMetadataProtocolVersion: 1,
     onStatus: (status: SessionStatus, message: string) => {
       if (
         status === 'completed'
@@ -132,15 +134,19 @@ export function TestDashboard() {
         void finishTestRef.current?.('failed', message);
       }
     },
-    onAudio: (audio: ArrayBuffer) => {
+    onAudio: (audio, observation) => {
       audioLogCountRef.current += 1;
       if (audioLogCountRef.current <= 5 || audioLogCountRef.current % 50 === 0) {
         console.log(`[TestDashboard] onAudio #${audioLogCountRef.current}: ${audio.byteLength} bytes`);
       }
-      trackerRef.current.logAudioReceived(audio.byteLength);
+      trackerRef.current.logAudioReceived(audio.byteLength, observation);
       lastReceiveChangeRef.current = performance.now();
       // Queue translated audio for output playback
-      outputPlaybackRef.current.queueAudio(audio);
+      outputPlaybackRef.current.queueAudio(audio, observation);
+    },
+    onAudioParentComplete: (observation) => {
+      trackerRef.current.logAudioParentComplete(observation);
+      lastReceiveChangeRef.current = performance.now();
     },
   });
 
@@ -150,13 +156,13 @@ export function TestDashboard() {
 
   // File audio source
   const fileSource = useFileAudioSource({
-    onChunk: (chunk: ArrayBuffer) => {
+    onChunk: (chunk, observation) => {
       chunkLogCountRef.current += 1;
       if (chunkLogCountRef.current <= 5 || chunkLogCountRef.current % 50 === 0) {
         console.log(`[TestDashboard] onChunk #${chunkLogCountRef.current}: ${chunk.byteLength} bytes`);
       }
       wsRef.current.sendAudio(chunk);
-      trackerRef.current.logChunkSent(chunk.byteLength);
+      trackerRef.current.logChunkSent(chunk.byteLength, observation);
       // Queue input audio for input playback monitoring
       inputPlaybackRef.current.queueAudio(chunk);
     },
@@ -244,6 +250,10 @@ export function TestDashboard() {
   // -- Start test --
   const handleStart = useCallback(async () => {
     console.log('[TestDashboard] handleStart called');
+    if (fileStartTimerRef.current !== null) {
+      clearTimeout(fileStartTimerRef.current);
+      fileStartTimerRef.current = null;
+    }
     setDriftData([]);
     driftDataRef.current = [];
     queueSamplesRef.current = [];
@@ -299,7 +309,14 @@ export function TestDashboard() {
       console.log('[TestDashboard] WS connected during running phase, sending start_stream');
       wsRef.current.sendMessage({ type: 'start_stream', targetLanguage: 'es-US' });
       console.log('[TestDashboard] Will start file streaming in 500ms');
-      setTimeout(() => {
+      fileStartTimerRef.current = setTimeout(() => {
+        fileStartTimerRef.current = null;
+        if (
+          phaseRef.current !== 'running'
+          || serverTerminalStateRef.current !== 'pending'
+        ) {
+          return;
+        }
         console.log('[TestDashboard] Starting file streaming now');
         fileSourceRef.current.startStreaming();
       }, 500);
@@ -307,6 +324,12 @@ export function TestDashboard() {
     if (phase !== 'running' && phase !== 'draining') {
       hasStartedStreamRef.current = false;
     }
+    return () => {
+      if (fileStartTimerRef.current !== null) {
+        clearTimeout(fileStartTimerRef.current);
+        fileStartTimerRef.current = null;
+      }
+    };
   }, [phase, ws.isConnected]);
 
   // -- Periodic drift updates during running + draining --
@@ -329,6 +352,10 @@ export function TestDashboard() {
     if (finishStartedRef.current) return;
     finishStartedRef.current = true;
     console.log('[TestDashboard] finishTest called');
+    if (fileStartTimerRef.current !== null) {
+      clearTimeout(fileStartTimerRef.current);
+      fileStartTimerRef.current = null;
+    }
     wsRef.current.sendMessage({ type: 'stop_stream' });
     wsRef.current.disconnect();
     metrics.disconnect();

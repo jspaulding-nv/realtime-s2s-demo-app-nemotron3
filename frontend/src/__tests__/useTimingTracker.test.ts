@@ -125,6 +125,11 @@ describe('useTimingTracker', () => {
 
     act(() => result.current.logPlaybackScheduled({
       timestampMs: performance.now(),
+      schedulePerformanceMs: performance.now(),
+      audioContextTimeAtScheduleSeconds: 10,
+      scheduledStartContextSeconds: 15.2,
+      scheduledEndContextSeconds: 15.295238,
+      projectedScheduledStartClientMs: performance.now() + 5200,
       audioBytes: 3200,
       sourceDurationSeconds: 0.1,
       scheduledDurationSeconds: 0.095238,
@@ -166,5 +171,201 @@ describe('useTimingTracker', () => {
         adaptivePlaybackEnabled: false,
       }),
     ]);
+  });
+
+  it('records a validated input ledger and same-clock frame delays', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1000,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logChunkSent(9600, {
+      chunkIndex: 1,
+      sampleRateHz: 16000,
+      sourceSampleStart: 4800,
+      sourceSampleEndExclusive: 9600,
+      emittedAtMs: 1300,
+      inputSampleZeroClientMs: 1000,
+    }));
+
+    const audioFrame = {
+      metadata: {
+        type: 'audio_frame' as const,
+        protocolVersion: 1 as const,
+        streamGeneration: 4,
+        parentSequenceId: 2,
+        audioFrameId: 3,
+        audioBytes: 3200,
+        sampleRateHz: 16000,
+        channels: 1,
+        bytesPerSample: 2,
+        sourceStartMs: null,
+        sourceEndMs: 500,
+      },
+      binaryReceivedAtMs: 1800,
+    };
+    act(() => result.current.logAudioReceived(3200, audioFrame));
+    act(() => result.current.logPlaybackScheduled({
+      timestampMs: 1801,
+      schedulePerformanceMs: 1801,
+      audioContextTimeAtScheduleSeconds: 10,
+      scheduledStartContextSeconds: 12,
+      scheduledEndContextSeconds: 12.1,
+      projectedScheduledStartClientMs: 3801,
+      audioBytes: 3200,
+      sourceDurationSeconds: 0.1,
+      scheduledDurationSeconds: 0.1,
+      waitBeforePlaybackSeconds: 2,
+      queueDepthSeconds: 2.1,
+      playbackRate: 1,
+      playbackMode: 'normal',
+      modeChanged: false,
+      aboveTarget: false,
+      aboveLimit: false,
+      audioFrame,
+    }));
+    act(() => result.current.logAudioParentComplete({
+      metadata: {
+        type: 'audio_parent_complete',
+        protocolVersion: 1,
+        streamGeneration: 4,
+        parentSequenceId: 2,
+        audioFrameCount: 4,
+        audioBytes: 12800,
+        sourceStartMs: null,
+        sourceEndMs: 500,
+      },
+      receivedAtMs: 1900,
+    }));
+
+    const [
+      firstChunk,
+      secondChunk,
+      received,
+      scheduled,
+      parentComplete,
+    ] = result.current.getEvents();
+    expect(firstChunk).toMatchObject({
+      stage: 'chunk_sent',
+      inputSampleZeroClientMs: 1000,
+      inputChunkEmittedClientMs: 1000,
+      inputSourceSampleStart: 0,
+      inputSourceSampleEndExclusive: 4800,
+      inputSampleRateHz: 16000,
+      inputLedgerValid: true,
+    });
+    expect(secondChunk).toMatchObject({
+      inputSourceSampleStart: 4800,
+      inputSourceSampleEndExclusive: 9600,
+      inputLedgerValid: true,
+    });
+    expect(received).toMatchObject({
+      audioMetadataProtocolVersion: 1,
+      streamGeneration: 4,
+      parentSequenceId: 2,
+      audioFrameId: 3,
+      sourceStartMs: null,
+      sourceEndMs: 500,
+      sourceTimingBasis: 'audio_processed/nonsemantic',
+      binaryReceiptClientMs: 1800,
+      sourceEndBoundaryClientMs: 1500,
+      sourceEndToBinaryReceiptMs: 300,
+    });
+    expect(scheduled).toMatchObject({
+      schedulePerformanceClientMs: 1801,
+      audioContextTimeAtScheduleSec: 10,
+      scheduledStartContextSec: 12,
+      scheduledEndContextSec: 12.1,
+      projectedScheduledStartClientMs: 3801,
+      sourceEndToBinaryReceiptMs: 300,
+      sourceEndToProjectedScheduledStartMs: 2301,
+    });
+    expect(parentComplete).toMatchObject({
+      stage: 'audio_parent_complete',
+      parentSequenceId: 2,
+      audioFrameCount: 4,
+      audioBytes: 12800,
+      parentCompleteReceivedClientMs: 1900,
+      sourceEndToParentCompleteMs: 400,
+    });
+  });
+
+  it('leaves source-boundary delays unavailable after a broken ledger', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+    act(() => result.current.logChunkSent(9600, {
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 1,
+      sourceSampleEndExclusive: 4801,
+      emittedAtMs: 1000,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logAudioReceived(3200, {
+      metadata: {
+        type: 'audio_frame',
+        protocolVersion: 1,
+        streamGeneration: 1,
+        parentSequenceId: 0,
+        audioFrameId: 0,
+        audioBytes: 3200,
+        sampleRateHz: 16000,
+        channels: 1,
+        bytesPerSample: 2,
+        sourceStartMs: null,
+        sourceEndMs: 100,
+      },
+      binaryReceivedAtMs: 1500,
+    }));
+
+    const [chunk, received] = result.current.getEvents();
+    expect(chunk.inputLedgerValid).toBe(false);
+    expect(received.sourceTimingBasis).toBe(
+      'audio_processed/nonsemantic',
+    );
+    expect(received.sourceEndBoundaryClientMs).toBeUndefined();
+    expect(received.sourceEndToBinaryReceiptMs).toBeUndefined();
+  });
+
+  it('does not project a source boundary beyond the recorded sample ledger', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+    act(() => result.current.logChunkSent(9600, {
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1000,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logAudioReceived(3200, {
+      metadata: {
+        type: 'audio_frame',
+        protocolVersion: 1,
+        streamGeneration: 1,
+        parentSequenceId: 0,
+        audioFrameId: 0,
+        audioBytes: 3200,
+        sampleRateHz: 16000,
+        channels: 1,
+        bytesPerSample: 2,
+        sourceStartMs: null,
+        sourceEndMs: 500,
+      },
+      binaryReceivedAtMs: 1600,
+    }));
+
+    const received = result.current.getEvents()[1];
+    expect(received.sourceTimingBasis).toBe(
+      'audio_processed/nonsemantic',
+    );
+    expect(received.sourceEndBoundaryClientMs).toBeUndefined();
+    expect(received.sourceEndToBinaryReceiptMs).toBeUndefined();
   });
 });

@@ -203,6 +203,54 @@ async def test_config_reports_schema_v2_only_for_enabled_tts_subsegmentation(
 
 
 @pytest.mark.asyncio
+async def test_config_advertises_audio_metadata_v1_for_schema_v3_staged(
+    client: AsyncClient,
+):
+    with (
+        patch("main.staged_pipeline_config.pipeline_mode", "staged"),
+        patch(
+            "main.staged_pipeline_config.tts_incremental_publish_enabled",
+            True,
+        ),
+    ):
+        response = await client.get("/api/config")
+
+    assert response.status_code == 200
+    assert response.json()["audioMetadataProtocolVersions"] == [1]
+    assert response.json()["stagedConfig"]["telemetrySchemaVersion"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pipeline_mode", "incremental_publish_enabled"),
+    [
+        ("staged", False),
+        ("monolithic", False),
+        ("monolithic", True),
+    ],
+)
+async def test_config_does_not_advertise_audio_metadata_outside_schema_v3_staged(
+    client: AsyncClient,
+    pipeline_mode,
+    incremental_publish_enabled,
+):
+    with (
+        patch(
+            "main.staged_pipeline_config.pipeline_mode",
+            pipeline_mode,
+        ),
+        patch(
+            "main.staged_pipeline_config.tts_incremental_publish_enabled",
+            incremental_publish_enabled,
+        ),
+    ):
+        response = await client.get("/api/config")
+
+    assert response.status_code == 200
+    assert response.json()["audioMetadataProtocolVersions"] == []
+
+
+@pytest.mark.asyncio
 async def test_monolithic_lifespan_keeps_eager_connection():
     with (
         patch("main.staged_pipeline_config.pipeline_mode", "monolithic"),
@@ -225,6 +273,42 @@ async def test_ping_control_uses_session_serialized_pong_sender():
     await handle_control_message(session, {"type": "ping"})
 
     session.send_pong.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_start_control_forwards_explicit_audio_metadata_version():
+    session = MagicMock()
+    session.start_stream = AsyncMock()
+
+    await handle_control_message(
+        session,
+        {
+            "type": "start_stream",
+            "targetLanguage": "es-US",
+            "audioMetadataProtocolVersion": 1,
+        },
+    )
+
+    session.start_stream.assert_awaited_once_with(
+        "es-US",
+        audio_metadata_protocol_version=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_control_preserves_legacy_call_when_metadata_is_absent():
+    session = MagicMock()
+    session.start_stream = AsyncMock()
+
+    await handle_control_message(
+        session,
+        {
+            "type": "start_stream",
+            "targetLanguage": "es-US",
+        },
+    )
+
+    session.start_stream.assert_awaited_once_with("es-US")
 
 
 @pytest.mark.asyncio

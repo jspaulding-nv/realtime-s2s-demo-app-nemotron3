@@ -139,6 +139,33 @@ testing.
 These measurements separate queue residence from inference time and make the
 dominant source of delay actionable.
 
+### Source-end observation protocol
+
+The opt-in schema-3 metadata protocol now carries each frame's parent/frame
+identity, PCM format, and nullable source-media start/end offsets. A
+real-time-paced file client can anchor input PCM sample zero in its own
+monotonic clock and calculate:
+
+```text
+source-end-to-client-receipt
+  = binary receipt - (input sample-zero marker + sourceEndMs)
+```
+
+The browser can project the same source end to the scheduled playback start by
+sampling `performance.now()` with `AudioContext.currentTime`. This is a
+same-client-clock projection; it does not mix backend monotonic time with
+browser time.
+
+When `sourceStartMs` is null and `sourceEndMs` is finite, the end is the ASR
+adapter's coarse `audio_processed` fallback. Report it as a processed-source
+offset, not as an utterance or punchline boundary. A scheduled playback start
+is also not proof of DAC or acoustic audibility.
+
+See
+[`AUDIO_METADATA_OBSERVATION_V1.md`](AUDIO_METADATA_OBSERVATION_V1.md)
+for the wire contract, fail-closed invariants, capture fields, and rollout
+gates.
+
 ## Current known results
 
 The pinned Nemotron runs from July 8, 2026 produced these fixed-rate listener

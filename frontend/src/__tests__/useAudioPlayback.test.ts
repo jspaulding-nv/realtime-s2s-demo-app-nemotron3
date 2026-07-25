@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useAudioPlayback } from '../hooks/useAudioPlayback';
+import type { AudioFrameObservation } from '../types/audioMetadata';
 
 // --- Mock Web Audio API ---
 
@@ -222,6 +223,49 @@ describe('useAudioPlayback', () => {
     act(() => result.current.queueAudio(pcm));
 
     expect(createdSources[0].onended).toBeTypeOf('function');
+  });
+
+  it('forwards observed frame identity without changing audio scheduling', () => {
+    const onSchedule = vi.fn();
+    const observation: AudioFrameObservation = {
+      metadata: {
+        type: 'audio_frame',
+        protocolVersion: 1,
+        streamGeneration: 7,
+        parentSequenceId: 3,
+        audioFrameId: 2,
+        audioBytes: 3200,
+        sampleRateHz: 16000,
+        channels: 1,
+        bytesPerSample: 2,
+        sourceStartMs: null,
+        sourceEndMs: 1234,
+      },
+      binaryReceivedAtMs: 42,
+    };
+    const { result } = renderHook(() => useAudioPlayback({ onSchedule }));
+    act(() => result.current.start());
+    vi.spyOn(performance, 'now').mockReturnValue(250);
+
+    const pcm = new Int16Array(1600).buffer;
+    act(() => result.current.queueAudio(pcm, observation));
+
+    expect(createdSources[0].start).toHaveBeenCalledWith(0);
+    expect(createdSources[0].playbackRate.value).toBe(1);
+    expect(onSchedule).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audioBytes: pcm.byteLength,
+        sourceDurationSeconds: 0.1,
+        playbackRate: 1,
+        audioFrame: observation,
+        timestampMs: 250,
+        schedulePerformanceMs: 250,
+        audioContextTimeAtScheduleSeconds: 0,
+        scheduledStartContextSeconds: 0,
+        scheduledEndContextSeconds: 0.1,
+        projectedScheduledStartClientMs: 250,
+      }),
+    );
   });
 
   // --- Playback position tracking ---

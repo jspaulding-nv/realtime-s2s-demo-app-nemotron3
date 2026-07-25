@@ -142,6 +142,8 @@ class ParentAudioFrame:
     parent_frame_count: int
     audio_bytes: int = 0
     source_index: int = -1
+    source_start_ms: float | None = None
+    source_end_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -616,6 +618,7 @@ def _validate_parent_audio_frames(
     previous_arrival = -math.inf
     previous_parent: int | None = None
     previous_parent_frame_count = 0
+    previous_source_range: tuple[float | None, float | None] | None = None
     next_audio_frame_id = 0
     parent_order: list[int] = []
 
@@ -665,6 +668,25 @@ def _validate_parent_audio_frames(
             raise ValueError(
                 "source_index must be an integer greater than or equal to -1"
             )
+        for field_name, source_offset_ms in (
+            ("source_start_ms", frame.source_start_ms),
+            ("source_end_ms", frame.source_end_ms),
+        ):
+            if source_offset_ms is not None and (
+                not isinstance(source_offset_ms, (int, float))
+                or isinstance(source_offset_ms, bool)
+                or not math.isfinite(source_offset_ms)
+                or source_offset_ms < 0
+            ):
+                raise ValueError(
+                    f"{field_name} must be null or a finite non-negative number"
+                )
+        if (
+            frame.source_start_ms is not None
+            and frame.source_end_ms is not None
+            and frame.source_end_ms < frame.source_start_ms
+        ):
+            raise ValueError("source_end_ms cannot precede source_start_ms")
         if audio_frame_id >= parent_frame_count:
             raise ValueError(
                 "audio_frame_id must be less than parent_frame_count"
@@ -692,10 +714,21 @@ def _validate_parent_audio_frames(
             parent_order.append(parent_sequence_id)
             previous_parent = parent_sequence_id
             previous_parent_frame_count = parent_frame_count
+            previous_source_range = (
+                frame.source_start_ms,
+                frame.source_end_ms,
+            )
             next_audio_frame_id = 0
         elif parent_frame_count != previous_parent_frame_count:
             raise ValueError(
                 "parent_frame_count must be consistent within a parent"
+            )
+        elif previous_source_range != (
+            frame.source_start_ms,
+            frame.source_end_ms,
+        ):
+            raise ValueError(
+                "source offsets must be consistent within a parent"
             )
 
         if audio_frame_id != next_audio_frame_id:

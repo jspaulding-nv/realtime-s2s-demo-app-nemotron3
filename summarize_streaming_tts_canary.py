@@ -25,6 +25,7 @@ SOURCE_TIME_DIGITS = 3
 MATCH_TOLERANCE_SECONDS = 1e-6
 MATERIAL_AUDIO_DIFFERENCE_PERCENT = 1.0
 INTENDED_CONFIG_DIFFERENCES = (
+    "audioMetadataProtocolVersions",
     "stagedConfig.telemetrySchemaVersion",
     "stagedConfig.ttsIncrementalPublishEnabled",
     "stagedConfig.ttsIncrementalFrameMs",
@@ -167,6 +168,10 @@ def _run_info(path: Path) -> dict[str, str]:
             "run_info: incremental_atomic_fallback_max_chars must be "
             "a non-negative integer"
         )
+    if result.get("streaming_audio_metadata_protocol_version") != "1":
+        raise ValueError(
+            "run_info: streaming_audio_metadata_protocol_version must be 1"
+        )
     return result
 
 
@@ -179,6 +184,14 @@ def _backend_provenance(
 ) -> dict[str, Any]:
     if config.get("pipelineMode") != "staged":
         raise ValueError(f"{label}: backend pipeline mode must be staged")
+    expected_metadata_versions = [1] if incremental else []
+    if (
+        config.get("audioMetadataProtocolVersions")
+        != expected_metadata_versions
+    ):
+        raise ValueError(
+            f"{label}: audio metadata protocol capability mismatch"
+        )
     for field in ("sampleRate", "chunkSize", "channels"):
         _integer(config.get(field), field=field, label=label, positive=True)
 
@@ -258,6 +271,7 @@ def _backend_provenance(
         )
 
     projection = copy.deepcopy(config)
+    projection.pop("audioMetadataProtocolVersions", None)
     projection_staged = projection["stagedConfig"]
     for field in (
         "telemetrySchemaVersion",
@@ -1022,6 +1036,195 @@ def _playback_metrics(
     return result, copy.deepcopy(policy)
 
 
+def _audio_metadata_observation(
+    root: dict[str, Any],
+    *,
+    incremental: bool,
+    audio_messages: int,
+    parent_count: int,
+    label: str,
+) -> dict[str, Any]:
+    observation = _object(
+        root.get("audio_metadata_observation"),
+        field="audio_metadata_observation",
+        label=label,
+    )
+    freshness = _object(
+        observation.get("source_end_to_receipt"),
+        field="audio_metadata_observation.source_end_to_receipt",
+        label=label,
+    )
+    if observation.get("playback_behavior_changed") is not False:
+        raise ValueError(
+            f"{label}: metadata observation must not change playback"
+        )
+    if observation.get("contains_transcript_or_translation_text") is not False:
+        raise ValueError(
+            f"{label}: metadata observation text privacy flag failed"
+        )
+    if freshness.get("semantic_boundary_proven") is not False:
+        raise ValueError(
+            f"{label}: metadata observation cannot claim a semantic boundary"
+        )
+    if freshness.get("actual_audibility_proven") is not False:
+        raise ValueError(
+            f"{label}: metadata observation cannot claim actual audibility"
+        )
+
+    if not incremental:
+        if (
+            observation.get("protocol_version") is not None
+            or observation.get("stream_generation") is not None
+            or observation.get("input_sample_zero_timestamp_ms") is not None
+            or observation.get("paired_frames") != 0
+            or observation.get("completed_parents") != 0
+            or freshness.get("availability")
+            != "protocol_not_negotiated"
+            or freshness.get("sample_count") != 0
+            or any(
+                freshness.get(field) is not None
+                for field in ("p50_ms", "p95_ms", "max_ms")
+            )
+        ):
+            raise ValueError(
+                f"{label}: atomic control must remain on legacy audio"
+            )
+        return {
+            "protocol_version": None,
+            "negotiated": False,
+            "wire_integrity_passed": True,
+            "paired_frames": 0,
+            "completed_parents": 0,
+            "source_end_to_receipt": {
+                "availability": "protocol_not_negotiated",
+                "sample_count": 0,
+                "p50_ms": None,
+                "p95_ms": None,
+                "max_ms": None,
+                "semantic_boundary_proven": False,
+                "actual_audibility_proven": False,
+            },
+        }
+
+    if observation.get("protocol_version") != 1:
+        raise ValueError(
+            f"{label}: streaming arm must negotiate metadata protocol v1"
+        )
+    generation = _integer(
+        observation.get("stream_generation"),
+        field="audio_metadata_observation.stream_generation",
+        label=label,
+        positive=True,
+    )
+    _number(
+        observation.get("input_sample_zero_timestamp_ms"),
+        field="audio_metadata_observation.input_sample_zero_timestamp_ms",
+        label=label,
+    )
+    paired_frames = _integer(
+        observation.get("paired_frames"),
+        field="audio_metadata_observation.paired_frames",
+        label=label,
+        positive=True,
+    )
+    completed_parents = _integer(
+        observation.get("completed_parents"),
+        field="audio_metadata_observation.completed_parents",
+        label=label,
+        positive=True,
+    )
+    if paired_frames != audio_messages:
+        raise ValueError(
+            f"{label}: metadata paired-frame count mismatch"
+        )
+    if completed_parents != parent_count:
+        raise ValueError(
+            f"{label}: metadata completed-parent count mismatch"
+        )
+    if freshness.get("clock") != "client_monotonic":
+        raise ValueError(
+            f"{label}: metadata freshness clock is invalid"
+        )
+    if freshness.get("source_offset_origin") != "input_pcm_sample_zero":
+        raise ValueError(
+            f"{label}: metadata source-offset origin is invalid"
+        )
+    availability = freshness.get("availability")
+    allowed_availability = {
+        "available_asr_source_range_end_offset",
+        "available_audio_processed_end_offset_not_semantic_boundary",
+        "unavailable_missing_source_end_offsets",
+        "unavailable_missing_input_sample_zero",
+    }
+    if availability not in allowed_availability:
+        raise ValueError(
+            f"{label}: metadata freshness availability is invalid"
+        )
+    sample_count = _integer(
+        freshness.get("sample_count"),
+        field="audio_metadata_observation.source_end_to_receipt.sample_count",
+        label=label,
+    )
+    if sample_count > paired_frames:
+        raise ValueError(
+            f"{label}: metadata freshness sample count exceeds frame count"
+        )
+    distributions: dict[str, float | None]
+    if sample_count:
+        distributions = {
+            field: _number(
+                freshness.get(f"{field}_ms"),
+                field=(
+                    "audio_metadata_observation.source_end_to_receipt."
+                    f"{field}_ms"
+                ),
+                label=label,
+                nonnegative=False,
+            )
+            for field in ("p50", "p95", "max")
+        }
+        if not (
+            distributions["p50"]
+            <= distributions["p95"]
+            <= distributions["max"]
+        ):
+            raise ValueError(
+                f"{label}: metadata freshness distribution is unordered"
+            )
+        if not str(availability).startswith("available_"):
+            raise ValueError(
+                f"{label}: metadata freshness samples require availability"
+            )
+    else:
+        distributions = {"p50": None, "p95": None, "max": None}
+        if any(
+            freshness.get(f"{field}_ms") is not None
+            for field in ("p50", "p95", "max")
+        ):
+            raise ValueError(
+                f"{label}: unavailable metadata freshness must have null metrics"
+            )
+
+    return {
+        "protocol_version": 1,
+        "negotiated": True,
+        "stream_generation": generation,
+        "wire_integrity_passed": True,
+        "input_sample_zero_recorded": True,
+        "paired_frames": paired_frames,
+        "completed_parents": completed_parents,
+        "source_end_to_receipt": {
+            "availability": availability,
+            "sample_count": sample_count,
+            "p50_ms": distributions["p50"],
+            "p95_ms": distributions["p95"],
+            "max_ms": distributions["max"],
+            "semantic_boundary_proven": False,
+            "actual_audibility_proven": False,
+        },
+    }
+
+
 def _load_arm(
     arm_dir: Path,
     *,
@@ -1150,6 +1353,13 @@ def _load_arm(
         raise ValueError(f"{arm_name}: atomic message count mismatch")
     if incremental and staged.get("audio_frames_produced") != audio_messages:
         raise ValueError(f"{arm_name}: streaming frame count mismatch")
+    audio_metadata = _audio_metadata_observation(
+        root,
+        incremental=incremental,
+        audio_messages=audio_messages,
+        parent_count=parent_count,
+        label=arm_name,
+    )
 
     sample_rate = config["sampleRate"]
     channels = config["channels"]
@@ -1211,6 +1421,7 @@ def _load_arm(
             field="playback_tail_sec",
             label=arm_name,
         ),
+        "audio_metadata_observation": audio_metadata,
         "tts": tts,
         "playback": playback,
         "_match": {
@@ -1451,6 +1662,7 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
                 "parent_segmentation_matched": True,
                 "nmt_parent_structure_matched": True,
                 "incremental_atomic_fallback_threshold_matched": True,
+                "atomic_legacy_and_streaming_metadata_v1_verified": True,
                 "incremental_atomic_fallback_max_chars": (
                     expected_fallback_max_chars
                 ),
@@ -1518,6 +1730,15 @@ def build_canary_summary(input_dir: Path) -> dict[str, Any]:
                     "fallback parents are excluded."
                 ),
             },
+            "audience_freshness_observation": {
+                **streaming["audio_metadata_observation"][
+                    "source_end_to_receipt"
+                ],
+                "classification": (
+                    "same_client_clock_source_offset_to_pcm_receipt"
+                ),
+                "scheduled_playback_or_actual_audibility_measured": False,
+            },
             "interpretation": {
                 "positive_reduction_is_better_for_latency_or_queue_metrics": True,
                 "audio_byte_and_duration_differences_are_not_quality_proof": True,
@@ -1535,6 +1756,10 @@ def _percent(value: Any) -> str:
     return "n/a" if value is None else f"{float(value):.1f}%"
 
 
+def _milliseconds(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):.3f}ms"
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
     """Render a compact comparison without copying identifying evidence."""
 
@@ -1545,6 +1770,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     comparability = summary["audio_output_comparability"]
     playback_conclusion = summary["cross_arm_playback_conclusion"]
     primary = summary["primary_incremental_evidence"]
+    freshness = summary["audience_freshness_observation"]
     warning = (
         "Cross-arm playback queue and tail results are **inconclusive**: "
         "translated-audio duration differed materially, so those deltas mix "
@@ -1588,6 +1814,19 @@ def render_markdown(summary: dict[str, Any]) -> str:
         warning,
         "",
         primary_statement,
+        "",
+        (
+            "Metadata-v1 source-end to client PCM receipt: p50 {p50}, "
+            "p95 {p95}, max {maximum} across {count} frame(s) "
+            "({availability}). This same-client-clock observation is not a "
+            "semantic punchline boundary or proof of acoustic audibility."
+        ).format(
+            p50=_milliseconds(freshness["p50_ms"]),
+            p95=_milliseconds(freshness["p95_ms"]),
+            maximum=_milliseconds(freshness["max_ms"]),
+            count=freshness["sample_count"],
+            availability=freshness["availability"],
+        ),
         "",
         "| Metric | Atomic | Incremental | Incremental benefit |",
         "|---|---:|---:|---:|",

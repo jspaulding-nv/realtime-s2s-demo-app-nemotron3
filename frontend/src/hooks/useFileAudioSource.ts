@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { FileAudioChunkObservation } from '../types/timing';
 
-interface UseFileAudioSourceOptions {
+export interface UseFileAudioSourceOptions {
   sampleRate?: number;
   chunkSize?: number;
-  onChunk: (chunk: ArrayBuffer) => void;
+  onChunk: (
+    chunk: ArrayBuffer,
+    observation: FileAudioChunkObservation,
+  ) => void;
   onComplete?: () => void;
 }
 
-interface UseFileAudioSourceReturn {
+export interface UseFileAudioSourceReturn {
   isLoaded: boolean;
   isStreaming: boolean;
   duration: number;
@@ -82,6 +86,7 @@ export function useFileAudioSource({
 
     const chunkIntervalMs = (chunkSize / sampleRate) * 1000; // 300ms
     let expectedTime = performance.now() + chunkIntervalMs;
+    let inputSampleZeroClientMs: number | null = null;
 
     function sendNext() {
       if (!isStreamingRef.current) return;
@@ -106,7 +111,20 @@ export function useFileAudioSource({
       }
       // Zero-pad if last chunk is shorter (already zeros from Int16Array constructor)
 
-      onChunkRef.current(int16Array.buffer);
+      const emittedAtMs = performance.now();
+      if (inputSampleZeroClientMs === null) {
+        inputSampleZeroClientMs = emittedAtMs;
+      }
+      onChunkRef.current(int16Array.buffer, {
+        chunkIndex: idx,
+        sampleRateHz: sampleRate,
+        sourceSampleStart: start,
+        // The server processes the padded PCM frame, so this ledger follows
+        // transmitted samples rather than only non-padding file samples.
+        sourceSampleEndExclusive: start + chunkSize,
+        emittedAtMs,
+        inputSampleZeroClientMs,
+      });
 
       chunkIndexRef.current = idx + 1;
       setPosition((idx + 1) * chunkSize / sampleRate);

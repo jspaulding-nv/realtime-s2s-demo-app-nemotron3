@@ -1016,6 +1016,45 @@ wire metadata plus observation-only browser telemetry, followed by an opt-in
 short-lookahead scheduler. See
 [Schema-3 whole-parent freshness-cap simulation](SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md).
 
+## July 25, 2026: observation-only parent/frame metadata
+
+The staged schema-3 incremental-TTS path now advertises audio metadata protocol
+version 1 and accepts an explicit per-stream opt-in. Under the existing
+serialized WebSocket send lock, every translated PCM frame is preceded by an
+exact numeric `audio_frame` header, and every parent ends with an
+`audio_parent_complete` marker that reconciles frame and byte totals. Legacy
+clients continue to receive anonymous binary PCM. The main translation screen
+remains legacy; only the test dashboard and CLI evidence clients opt in.
+
+Backend, Python, and browser receivers fail closed on missing, extra,
+misordered, mismatched, cross-generation, incomplete, or post-terminal
+evidence. Protocol fields exclude text and wall-clock identity. Raw capture
+artifacts remain private because they also contain operational paths and
+endpoints.
+
+The real-time file harness anchors input PCM sample zero and records a
+contiguous source-sample ledger. It can therefore report source-end to binary
+receipt in one client-monotonic clock. The browser additionally records
+Web Audio scheduling coordinates and a projected scheduled start without
+changing rate, order, buffering, or playback. End-only `audio_processed`
+offsets are labeled non-semantic; scheduled start is not claimed as physical
+audibility. A synchronized phrase marker and output loopback are still needed
+to measure the audience's English-joke to Spanish-audio delay directly.
+
+The long-form runner persists protocol choice in immutable manifest provenance,
+propagates it through preflight and all three samples, validates saved wire and
+summary evidence on resume, and rejects legacy-to-v1 upgrades. The freshness
+analyzer prefers explicit version-1 wire identity while retaining strict
+backward compatibility for older positional schema-3 captures. Its 10-second
+oldest-first parent policy remains a counterfactual: no live audio is dropped.
+
+Before live capture, the complete backend suite passed 416 tests, the root
+Python suite passed 316 tests with one optional local-artifact test skipped
+(732 passing Python tests combined), and the frontend passed 118 tests plus
+TypeScript build and lint. Protocol,
+privacy, clock, rollout, and reproduction details are in
+[Audio metadata observation protocol v1](AUDIO_METADATA_OBSERVATION_V1.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1037,7 +1076,7 @@ short-lookahead scheduler. See
 - [x] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
 - [x] Sweep no-drop playback capacity on the completed matched traces
 - [x] Simulate 5/8/10-second whole-parent freshness/loss tradeoffs on schema 3
-- [ ] Add opt-in parent/frame wire metadata and observation-only browser telemetry
+- [x] Add opt-in parent/frame wire metadata and observation-only browser telemetry
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries
