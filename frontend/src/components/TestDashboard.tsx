@@ -157,11 +157,23 @@ export function TestDashboard() {
   // File audio source
   const fileSource = useFileAudioSource({
     onChunk: (chunk, observation) => {
+      const sent = wsRef.current?.sendAudio(chunk) ?? false;
+      if (!sent) {
+        if (serverTerminalStateRef.current === 'pending') {
+          const message = 'Audio capture stopped because a chunk could not be sent.';
+          serverTerminalStateRef.current = 'error';
+          fileSourceRef.current?.stopStreaming();
+          if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
+            void finishTestRef.current?.('failed', message);
+          }
+        }
+        return;
+      }
+
       chunkLogCountRef.current += 1;
       if (chunkLogCountRef.current <= 5 || chunkLogCountRef.current % 50 === 0) {
         console.log(`[TestDashboard] onChunk #${chunkLogCountRef.current}: ${chunk.byteLength} bytes`);
       }
-      wsRef.current.sendAudio(chunk);
       trackerRef.current.logChunkSent(chunk.byteLength, observation);
       // Queue input audio for input playback monitoring
       inputPlaybackRef.current.queueAudio(chunk);
@@ -372,13 +384,21 @@ export function TestDashboard() {
       clearTimeout(fileStartTimerRef.current);
       fileStartTimerRef.current = null;
     }
-    wsRef.current.sendMessage({ type: 'stop_stream' });
-    wsRef.current.disconnect();
-    metrics.disconnect();
-
-    // Stop both playback instances
-    inputPlaybackRef.current.stop();
-    outputPlaybackRef.current.stop();
+    const runCleanupStep = (label: string, step: () => void) => {
+      try {
+        step();
+      } catch (error) {
+        console.error(`[TestDashboard] ${label} failed during cleanup:`, error);
+      }
+    };
+    runCleanupStep(
+      'stop_stream control',
+      () => { wsRef.current.sendMessage({ type: 'stop_stream' }); },
+    );
+    runCleanupStep('WebSocket disconnect', () => wsRef.current.disconnect());
+    runCleanupStep('metrics disconnect', () => metrics.disconnect());
+    runCleanupStep('input playback stop', () => inputPlaybackRef.current.stop());
+    runCleanupStep('output playback stop', () => outputPlaybackRef.current.stop());
 
     try {
       await fetch('/api/test/stop', { method: 'POST' });

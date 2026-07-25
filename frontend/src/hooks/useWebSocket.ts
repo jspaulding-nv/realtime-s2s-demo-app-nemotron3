@@ -27,8 +27,8 @@ export interface UseWebSocketOptions {
 export interface UseWebSocketReturn {
   isConnected: boolean;
   status: SessionStatus;
-  sendMessage: (message: ClientMessage) => void;
-  sendAudio: (audio: ArrayBuffer) => void;
+  sendMessage: (message: ClientMessage) => boolean;
+  sendAudio: (audio: ArrayBuffer) => boolean;
   connect: () => void;
   disconnect: () => void;
 }
@@ -314,38 +314,71 @@ export function useWebSocket({
   }, [finishMetadataProtocol]);
 
   const sendMessage = useCallback((message: ClientMessage) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      let outboundMessage = message;
-      if (
-        message.type === 'start_stream'
-        && audioMetadataProtocolVersion === AUDIO_METADATA_PROTOCOL_VERSION
-      ) {
-        const protocol = metadataProtocolRef.current;
-        if (!protocol) {
-          reportMetadataProtocolError(
-            new Error('version 1 receiver is unavailable'),
-          );
-          return;
-        }
-        protocol.errorReported = false;
-        try {
-          protocol.receiver.beginStream();
-        } catch (error) {
-          reportMetadataProtocolError(error);
-          return;
-        }
-        outboundMessage = {
-          ...message,
-          audioMetadataProtocolVersion: AUDIO_METADATA_PROTOCOL_VERSION,
-        };
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    let outboundMessage = message;
+    if (
+      message.type === 'start_stream'
+      && audioMetadataProtocolVersion === AUDIO_METADATA_PROTOCOL_VERSION
+    ) {
+      const protocol = metadataProtocolRef.current;
+      if (!protocol) {
+        reportMetadataProtocolError(
+          new Error('version 1 receiver is unavailable'),
+        );
+        return false;
       }
-      wsRef.current.send(JSON.stringify(outboundMessage));
+      protocol.errorReported = false;
+      try {
+        protocol.receiver.beginStream();
+      } catch (error) {
+        reportMetadataProtocolError(error);
+        return false;
+      }
+      outboundMessage = {
+        ...message,
+        audioMetadataProtocolVersion: AUDIO_METADATA_PROTOCOL_VERSION,
+      };
+    }
+
+    try {
+      socket.send(JSON.stringify(outboundMessage));
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const transportMessage = (
+        `WebSocket ${message.type} send failed: ${detail}`
+      );
+      console.error(transportMessage);
+      setStatus('error');
+      onErrorRef.current?.(transportMessage);
+      return false;
     }
   }, [audioMetadataProtocolVersion, reportMetadataProtocolError]);
 
   const sendAudio = useCallback((audio: ArrayBuffer) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(audio);
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      const message = 'Audio chunk was not sent because the WebSocket is not open.';
+      console.error(message);
+      setStatus('error');
+      onErrorRef.current?.(message);
+      return false;
+    }
+
+    try {
+      socket.send(audio);
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const message = `Audio chunk send failed: ${detail}`;
+      console.error(message);
+      setStatus('error');
+      onErrorRef.current?.(message);
+      return false;
     }
   }, []);
 

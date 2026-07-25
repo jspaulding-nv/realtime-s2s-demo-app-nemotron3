@@ -3,6 +3,8 @@ export interface FileAudioChunkObservation {
   sampleRateHz: number;
   sourceSampleStart: number;
   sourceSampleEndExclusive: number;
+  inputPcmSha256: string;
+  inputPcmSampleCount: number;
   emittedAtMs: number;
   inputSampleZeroClientMs: number;
 }
@@ -42,6 +44,8 @@ export interface ClientTimingEvent {
   inputSourceSampleStart?: number;
   inputSourceSampleEndExclusive?: number;
   inputSampleRateHz?: number;
+  inputPcmSha256?: string;
+  inputPcmSampleCount?: number;
   inputLedgerValid?: boolean;
   sourceEndBoundaryClientMs?: number;
   sourceEndToBinaryReceiptMs?: number;

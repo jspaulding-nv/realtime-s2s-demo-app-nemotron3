@@ -166,6 +166,42 @@ See
 for the wire contract, fail-closed invariants, capture fields, and rollout
 gates.
 
+### Semantic source-event parent envelope
+
+The implemented
+[`analyze_semantic_event_latency.py`](../analyze_semantic_event_latency.py)
+gate is the next evidence layer above generic source ranges. Two independent
+reviewers identify an anonymous semantic moment as an exact source PCM sample.
+A private sidecar binds that marker to the SHA-256 of one Test Dashboard CSV
+and to the digest and padded sample count of the exact Int16 PCM bytes the
+browser transmitted. The analyzer then resolves the sample to one fully
+reconciled attributed parent, or to an identical-range punctuation sibling
+group, and reports the conservative interval through translated-frame receipt,
+parent completion, projected first playback, and projected final playback.
+
+Formal captures now release each complete input chunk at its source-end
+deadline. The browser and CLI anchor sample zero before the first wait, use
+absolute 300 ms deadlines, retain timer lateness, and finish immediately after
+the final transmitted chunk. The analyzer independently rejects old
+start-boundary captures, which could otherwise create up to one chunk of
+look-ahead bias.
+
+Several distinct markers may share one parent envelope. Reports assign a
+stable anonymous candidate-group ID and show marker and unique-group counts
+separately; marker status counts are not independent parent-level trials.
+
+The gate has three outcomes for an explicit SLA:
+
+- **PASS:** the entire candidate parent envelope projects to finish by the SLA;
+- **FAIL:** even the first candidate frame projects to start after the SLA; or
+- **INCONCLUSIVE:** the unknown target landmark could fall on either side.
+
+This is deliberately not an exact Spanish-punchline or physical-audibility
+claim. Those require a reviewed target-language sample and, ultimately, a
+common-clock digital loopback or two-channel physical recording. See
+[`SEMANTIC_EVENT_LATENCY_GATE.md`](SEMANTIC_EVENT_LATENCY_GATE.md) for the
+sidecar schema, command, invariants, and promotion path.
+
 ## Current known results
 
 The pinned Nemotron runs from July 8, 2026 produced these fixed-rate listener

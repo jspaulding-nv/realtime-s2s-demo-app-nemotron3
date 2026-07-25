@@ -33,6 +33,8 @@ export function exportTimingDataAsCSV(
     'input_source_sample_start',
     'input_source_sample_end_exclusive',
     'input_sample_rate_hz',
+    'input_pcm_sha256',
+    'input_pcm_sample_count',
     'input_ledger_valid',
     'source_end_boundary_client_ms',
     'source_end_to_binary_receipt_ms',
@@ -83,6 +85,8 @@ export function exportTimingDataAsCSV(
         e.inputSourceSampleStart ?? '',
         e.inputSourceSampleEndExclusive ?? '',
         e.inputSampleRateHz ?? '',
+        e.inputPcmSha256 ?? '',
+        e.inputPcmSampleCount ?? '',
         e.inputLedgerValid === undefined ? '' : String(e.inputLedgerValid),
         e.sourceEndBoundaryClientMs?.toFixed(3) ?? '',
         e.sourceEndToBinaryReceiptMs?.toFixed(3) ?? '',
@@ -108,7 +112,7 @@ export function exportTimingDataAsCSV(
         e.audio_bytes_len,
         '', '', '', '', '', '', '',
         '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-        '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '',
       ].join(','),
     );
   }

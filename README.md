@@ -36,6 +36,8 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A matched atomic-versus-incremental canary with same-audio publication timing and explicit stochastic-output confounding checks
 - Opt-in audio metadata protocol v1 for strict parent/frame observation,
   source-offset freshness, and observation-only shadow-policy replay
+- A fail-closed, transcript-free semantic source-event analyzer that binds
+  reviewed source samples to conservative translated-parent playback envelopes
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -79,8 +81,11 @@ but the subsequent matched live canary showed that every 40-, 45-, and
 relative to the unsplit control. Post-NMT splitting therefore remains disabled.
 Incremental PCM publication removed some avoidable response buffering, and the
 current observation gate can associate each output frame with a source parent.
-The next gate is a synchronized semantic source-event marker that measures a
-known source moment through translated receipt and scheduled playback.
+The repository now includes a transcript-free semantic source-event gate that
+binds a reviewed source sample to its conservative translated-parent receipt
+and projected-playback envelope. A clean live capture with reviewed markers is
+the next experiment; exact target-language landmark and physical-audibility
+measurements remain later evidence tiers.
 
 ## Architecture
 
@@ -155,6 +160,7 @@ realtime-s2s-demo-app/
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
 ├── analyze_freshness_cap.py # Parent-aware lossy queue counterfactual
+├── analyze_semantic_event_latency.py # Source-event parent-envelope gate
 ├── freshness_trace.py      # Fail-closed schema-v3 evidence join
 ├── playback_simulation.py  # No-drop and whole-parent queue simulators
 ├── run_streaming_tts_canary.sh # Matched atomic/schema-v3 live canary
@@ -585,6 +591,27 @@ terminal mismatch. Its source-end latency uses a client-monotonic input
 sample-zero marker and is explicitly labeled non-semantic when ASR supplies
 only the `audio_processed` fallback offset.
 
+For the audience-latency gate, capture a protocol-v1 Test Dashboard CSV with
+ASR word timing enabled, bind two-reviewer anonymous source markers to the
+exact CSV SHA-256 plus the SHA-256 and padded sample count of the transmitted
+Int16 PCM, and run:
+
+```bash
+python analyze_semantic_event_latency.py \
+  --results-csv experiment_results/semantic-event-gate/timing-export.csv \
+  --markers-json experiment_results/semantic-event-gate/source-markers.json \
+  --max-latency-seconds 10 \
+  --json-output experiment_results/semantic-event-gate/report.json \
+  --markdown-output experiment_results/semantic-event-gate/report.md
+```
+
+The analyzer independently rejects PCM identity mismatches,
+early/start-boundary input pacing, and incomplete protocol evidence. Its
+PASS/FAIL/INCONCLUSIVE result bounds the entire candidate translated-parent
+playback envelope; it does not claim the exact Spanish landmark or physical
+audibility. See the
+[semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md).
+
 One repeat represents one live Riva pass through each sample and contains
 about 103.7 minutes (roughly 1 hour 45 minutes) of source audio. A new
 experiment also adds a single one-minute preflight, and every capture adds its
@@ -726,6 +753,7 @@ Detailed guides:
 - [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
 - [Observation-only parent/frame metadata protocol v1](docs/AUDIO_METADATA_OBSERVATION_V1.md)
 - [Protocol-v1 60-second formal canary](docs/AUDIO_METADATA_60S_CANARY_2026-07-25.md)
+- [Semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md)
 - [Bounded-playback experiment plan](docs/BOUNDED_PLAYBACK_EXPERIMENT.md)
 - [July 22 three-sample acceptance results](docs/ACCEPTANCE_RUN_2026-07-22.md)
 - [Staged pipeline foundation and live smoke](docs/STAGED_PIPELINE_FOUNDATION.md)

@@ -2,6 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useTimingTracker } from '../hooks/useTimingTracker';
 
+const INPUT_PCM = {
+  inputPcmSha256: '0'.repeat(64),
+  inputPcmSampleCount: 9600,
+};
+
 describe('useTimingTracker', () => {
   it('returns a stable object reference (useMemo)', () => {
     const { result, rerender } = renderHook(() => useTimingTracker());
@@ -178,19 +183,21 @@ describe('useTimingTracker', () => {
     act(() => result.current.startTest());
 
     act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
       chunkIndex: 0,
       sampleRateHz: 16000,
       sourceSampleStart: 0,
       sourceSampleEndExclusive: 4800,
-      emittedAtMs: 1000,
+      emittedAtMs: 1300,
       inputSampleZeroClientMs: 1000,
     }));
     act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
       chunkIndex: 1,
       sampleRateHz: 16000,
       sourceSampleStart: 4800,
       sourceSampleEndExclusive: 9600,
-      emittedAtMs: 1300,
+      emittedAtMs: 1600,
       inputSampleZeroClientMs: 1000,
     }));
 
@@ -254,10 +261,12 @@ describe('useTimingTracker', () => {
     expect(firstChunk).toMatchObject({
       stage: 'chunk_sent',
       inputSampleZeroClientMs: 1000,
-      inputChunkEmittedClientMs: 1000,
+      inputChunkEmittedClientMs: 1300,
       inputSourceSampleStart: 0,
       inputSourceSampleEndExclusive: 4800,
       inputSampleRateHz: 16000,
+      inputPcmSha256: INPUT_PCM.inputPcmSha256,
+      inputPcmSampleCount: INPUT_PCM.inputPcmSampleCount,
       inputLedgerValid: true,
     });
     expect(secondChunk).toMatchObject({
@@ -300,11 +309,12 @@ describe('useTimingTracker', () => {
     const { result } = renderHook(() => useTimingTracker());
     act(() => result.current.startTest());
     act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
       chunkIndex: 0,
       sampleRateHz: 16000,
       sourceSampleStart: 1,
       sourceSampleEndExclusive: 4801,
-      emittedAtMs: 1000,
+      emittedAtMs: 1301,
       inputSampleZeroClientMs: 1000,
     }));
     act(() => result.current.logAudioReceived(3200, {
@@ -337,11 +347,12 @@ describe('useTimingTracker', () => {
     const { result } = renderHook(() => useTimingTracker());
     act(() => result.current.startTest());
     act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
       chunkIndex: 0,
       sampleRateHz: 16000,
       sourceSampleStart: 0,
       sourceSampleEndExclusive: 4800,
-      emittedAtMs: 1000,
+      emittedAtMs: 1300,
       inputSampleZeroClientMs: 1000,
     }));
     act(() => result.current.logAudioReceived(3200, {
@@ -367,5 +378,144 @@ describe('useTimingTracker', () => {
     );
     expect(received.sourceEndBoundaryClientMs).toBeUndefined();
     expect(received.sourceEndToBinaryReceiptMs).toBeUndefined();
+  });
+
+  it('rejects a chunk emitted before its source-end boundary', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1298,
+      inputSampleZeroClientMs: 1000,
+    }));
+
+    expect(result.current.getEvents()[0]).toMatchObject({
+      stage: 'chunk_sent',
+      inputSampleZeroClientMs: 1000,
+      inputChunkEmittedClientMs: 1298,
+      inputLedgerValid: false,
+    });
+  });
+
+  it('accepts sub-millisecond timer rounding at the source boundary', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1299.5,
+      inputSampleZeroClientMs: 1000,
+    }));
+
+    expect(result.current.getEvents()[0].inputLedgerValid).toBe(true);
+  });
+
+  it('accepts late chunks and retains their real source-boundary delay', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1600,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 1,
+      sampleRateHz: 16000,
+      sourceSampleStart: 4800,
+      sourceSampleEndExclusive: 9600,
+      emittedAtMs: 1700,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logAudioReceived(3200, {
+      metadata: {
+        type: 'audio_frame',
+        protocolVersion: 1,
+        streamGeneration: 1,
+        parentSequenceId: 0,
+        audioFrameId: 0,
+        audioBytes: 3200,
+        sampleRateHz: 16000,
+        channels: 1,
+        bytesPerSample: 2,
+        sourceStartMs: null,
+        sourceEndMs: 500,
+      },
+      binaryReceivedAtMs: 2000,
+    }));
+
+    const [first, second, received] = result.current.getEvents();
+    expect(first.inputLedgerValid).toBe(true);
+    expect(second.inputLedgerValid).toBe(true);
+    expect(received).toMatchObject({
+      sourceEndBoundaryClientMs: 1500,
+      sourceEndToBinaryReceiptMs: 500,
+    });
+  });
+
+  it('invalidates a ledger when its PCM digest or total changes', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1300,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      inputPcmSha256: '1'.repeat(64),
+      chunkIndex: 1,
+      sampleRateHz: 16000,
+      sourceSampleStart: 4800,
+      sourceSampleEndExclusive: 9600,
+      emittedAtMs: 1600,
+      inputSampleZeroClientMs: 1000,
+    }));
+
+    expect(result.current.getEvents().map((event) => (
+      event.inputLedgerValid
+    ))).toEqual([true, false]);
+
+    act(() => result.current.startTest());
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1300,
+      inputSampleZeroClientMs: 1000,
+    }));
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      inputPcmSampleCount: 14400,
+      chunkIndex: 1,
+      sampleRateHz: 16000,
+      sourceSampleStart: 4800,
+      sourceSampleEndExclusive: 9600,
+      emittedAtMs: 1600,
+      inputSampleZeroClientMs: 1000,
+    }));
+    expect(result.current.getEvents().map((event) => (
+      event.inputLedgerValid
+    ))).toEqual([true, false]);
   });
 });

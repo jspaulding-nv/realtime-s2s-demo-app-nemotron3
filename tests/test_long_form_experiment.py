@@ -55,6 +55,18 @@ def write_valid_summary(path: Path, **overrides):
             "pipelineMode": "monolithic",
             "modelConfig": model_config(),
         },
+        "input_pacing": {
+            "mode": "chunk_end_boundary_v1",
+            "chunk_duration_ms": 300.0,
+            "source_sample_zero_clock": "client_monotonic",
+            "deadline_basis": (
+                "source_sample_zero_plus_one_based_chunk_duration"
+            ),
+            "source_sample_zero_timestamp_ms": 0.0,
+            "observed_chunk_count": 10,
+            "min_emission_minus_deadline_ms": 0.0,
+            "max_emission_minus_deadline_ms": 0.0,
+        },
         "input_end_timestamp_ms": 3000.0,
         "terminal_arrival_timestamp_ms": 3500.0,
         "terminal_arrival_lag_sec": 0.5,
@@ -214,7 +226,7 @@ def valid_audio_metadata_summary_fields():
 def write_valid_csv(path: Path, *, sent=10, received_bytes=(32_000, 32_000)):
     rows = ["source,stage,timestamp_ms,chunk_index,source_position_sec,audio_bytes"]
     rows.extend(
-        f"client,chunk_sent,{index * 300},{index},{index * 0.3},9600"
+        f"client,chunk_sent,{(index + 1) * 300},{index},{index * 0.3},9600"
         for index in range(sent)
     )
     rows.extend(
@@ -381,6 +393,75 @@ def test_v1_summary_requires_captured_capability_advertisement(tmp_path):
     assert "does not advertise" in reason
 
 
+def test_v1_summary_requires_input_pacing_provenance(tmp_path):
+    summary = tmp_path / "summary.json"
+    write_valid_summary(
+        summary,
+        **valid_audio_metadata_summary_fields(),
+        input_pacing=None,
+    )
+
+    valid, reason = experiment.validate_summary(
+        summary,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert "requires input pacing provenance" in reason
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason_fragment"),
+    [
+        (
+            lambda pacing: pacing.pop("deadline_basis"),
+            "provenance fields are invalid",
+        ),
+        (
+            lambda pacing: pacing.update(observed_chunk_count=9),
+            "does not match chunks_sent",
+        ),
+        (
+            lambda pacing: pacing.update(
+                min_emission_minus_deadline_ms=-0.1
+            ),
+            "contains an early chunk emission",
+        ),
+        (
+            lambda pacing: pacing.update(
+                max_emission_minus_deadline_ms=float("inf")
+            ),
+            "emission margins are invalid",
+        ),
+        (
+            lambda pacing: pacing.update(
+                source_sample_zero_timestamp_ms=1.0
+            ),
+            "does not match the observation",
+        ),
+    ],
+)
+def test_v1_summary_rejects_malformed_or_inconsistent_pacing_evidence(
+    tmp_path,
+    mutation,
+    reason_fragment,
+):
+    summary = tmp_path / "summary.json"
+    fields = valid_audio_metadata_summary_fields()
+    write_valid_summary(summary, **fields)
+    payload = json.loads(summary.read_text(encoding="utf-8"))
+    mutation(payload["input_pacing"])
+    summary.write_text(json.dumps(payload), encoding="utf-8")
+
+    valid, reason = experiment.validate_summary(
+        summary,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert reason_fragment in reason
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -505,6 +586,50 @@ def test_capture_artifact_validation_requires_csv_and_summary(tmp_path):
     valid, reason = experiment.capture_artifacts_valid(tmp_path, entry)
     assert valid is False
     assert "hash differs" in reason
+
+
+def test_v1_artifact_resume_replays_pacing_evidence_against_csv(tmp_path):
+    csv_path = tmp_path / "capture_results.csv"
+    summary_path = tmp_path / "capture_summary.json"
+    plot_path = tmp_path / "capture_latency.png"
+    write_valid_csv(csv_path, received_bytes=(3_200,))
+    write_valid_summary(
+        summary_path,
+        **valid_audio_metadata_summary_fields(),
+    )
+    plot_path.write_bytes(b"plot")
+
+    assert experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    ) == (True, "ok")
+
+    rows = csv_path.read_text(encoding="utf-8").splitlines()
+    rows[1] = rows[1].replace(",300,0,", ",299,0,")
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    valid, reason = experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+    assert valid is False
+    assert "early chunk emission" in reason
+
+    write_valid_csv(csv_path, received_bytes=(3_200,))
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    payload["input_pacing"]["max_emission_minus_deadline_ms"] = 1.0
+    summary_path.write_text(json.dumps(payload), encoding="utf-8")
+    valid, reason = experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+    assert valid is False
+    assert "do not match the client event ledger" in reason
 
 
 def test_capture_one_propagates_v1_to_batch_runner(monkeypatch, tmp_path):

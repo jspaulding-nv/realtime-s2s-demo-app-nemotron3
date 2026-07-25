@@ -268,6 +268,96 @@ describe('useAudioPlayback', () => {
     );
   });
 
+  // --- Client-clock playback projection ---
+
+  it('keeps contiguous projections despite AudioContext/performance clock jitter', () => {
+    const onSchedule = vi.fn();
+    let nowMs = 1000.25;
+    vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    const { result } = renderHook(() => useAudioPlayback({ onSchedule }));
+    act(() => result.current.start());
+
+    const pcm = new Int16Array(1600).buffer;
+    act(() => result.current.queueAudio(pcm));
+
+    // Simulate independently quantized clocks before the next contiguous
+    // AudioContext buffer is scheduled.
+    mockCtxCurrentTime = 0.001;
+    nowMs = 1001.125;
+    act(() => result.current.queueAudio(pcm));
+
+    const first = onSchedule.mock.calls[0][0];
+    const second = onSchedule.mock.calls[1][0];
+    expect(createdSources[0].start).toHaveBeenCalledWith(0);
+    expect(createdSources[1].start).toHaveBeenCalledWith(0.1);
+    expect(second.projectedScheduledStartClientMs).toBe(
+      first.projectedScheduledStartClientMs
+        + first.scheduledDurationSeconds * 1000,
+    );
+  });
+
+  it('reanchors the projected start to performance time after a true underrun', () => {
+    const onSchedule = vi.fn();
+    let nowMs = 2000;
+    vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    const { result } = renderHook(() => useAudioPlayback({ onSchedule }));
+    act(() => result.current.start());
+
+    const pcm = new Int16Array(1600).buffer;
+    act(() => result.current.queueAudio(pcm));
+
+    mockCtxCurrentTime = 0.25;
+    nowMs = 2250;
+    act(() => result.current.queueAudio(pcm));
+
+    expect(createdSources[1].start).toHaveBeenCalledWith(0.25);
+    expect(
+      onSchedule.mock.calls[1][0].projectedScheduledStartClientMs,
+    ).toBe(2250);
+  });
+
+  it('does not carry a projected end across a stop/start restart', () => {
+    const onSchedule = vi.fn();
+    let nowMs = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    const { result } = renderHook(() => useAudioPlayback({ onSchedule }));
+    act(() => result.current.start());
+    act(() => result.current.queueAudio(new Int16Array(16000).buffer));
+
+    act(() => result.current.stop());
+    mockCtxCurrentTime = 0.2;
+    nowMs = 1100;
+    act(() => result.current.start());
+    act(() => result.current.queueAudio(new Int16Array(1600).buffer));
+
+    expect(
+      onSchedule.mock.calls[1][0].projectedScheduledStartClientMs,
+    ).toBe(1100);
+  });
+
+  it('projects exact contiguous spacing at adaptive 1.05x playback', () => {
+    const onSchedule = vi.fn();
+    let nowMs = 500;
+    vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    const { result } = renderHook(() =>
+      useAudioPlayback({ adaptivePlayback: true, onSchedule }),
+    );
+    act(() => result.current.start());
+
+    act(() => result.current.queueAudio(new Int16Array(80000).buffer));
+    mockCtxCurrentTime = 0.001;
+    nowMs = 501.25;
+    act(() => result.current.queueAudio(new Int16Array(1600).buffer));
+
+    const first = onSchedule.mock.calls[0][0];
+    const second = onSchedule.mock.calls[1][0];
+    expect(first.playbackRate).toBe(1.05);
+    expect(second.playbackRate).toBe(1.05);
+    expect(second.projectedScheduledStartClientMs).toBe(
+      first.projectedScheduledStartClientMs + (5 / 1.05) * 1000,
+    );
+  });
+
   // --- Playback position tracking ---
 
   it('getPlaybackPosition returns 0 before any audio finishes', () => {

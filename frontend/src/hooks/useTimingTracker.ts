@@ -42,6 +42,10 @@ const CHUNK_SIZE = 4800;
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SAMPLE = 2; // Int16
 const SOURCE_LEDGER_TOLERANCE_MS = 0.001;
+// Browser timers and performance.now() can differ by a sub-millisecond
+// rounding step. Larger early sends invalidate the source-time ledger.
+const INPUT_EMISSION_EARLY_TOLERANCE_MS = 1;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 function sourceTimingBasis(range: AudioSourceRange): SourceTimingBasis {
   if (range.sourceStartMs !== null && range.sourceEndMs !== null) {
@@ -68,6 +72,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
   const inputLedgerValidRef = useRef(false);
   const inputSampleZeroClientMsRef = useRef<number | null>(null);
   const inputSampleRateHzRef = useRef<number | null>(null);
+  const inputPcmSha256Ref = useRef<string | null>(null);
+  const inputPcmSampleCountRef = useRef<number | null>(null);
   const inputLastSampleEndRef = useRef(0);
   const inputLastEmittedAtMsRef = useRef<number | null>(null);
 
@@ -83,6 +89,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
     inputLedgerValidRef.current = false;
     inputSampleZeroClientMsRef.current = null;
     inputSampleRateHzRef.current = null;
+    inputPcmSha256Ref.current = null;
+    inputPcmSampleCountRef.current = null;
     inputLastSampleEndRef.current = 0;
     inputLastEmittedAtMsRef.current = null;
     testStartRef.current = performance.now();
@@ -124,19 +132,28 @@ export function useTimingTracker(): UseTimingTrackerReturn {
         && Number.isSafeInteger(observation.sourceSampleEndExclusive)
         && observation.sourceSampleEndExclusive
           > observation.sourceSampleStart
+        && Number.isSafeInteger(observation.inputPcmSampleCount)
+        && observation.inputPcmSampleCount > 0
+        && observation.sourceSampleEndExclusive
+          <= observation.inputPcmSampleCount
+      );
+      const digestIsValid = SHA256_PATTERN.test(
+        observation.inputPcmSha256,
       );
       const isFirst = !inputLedgerStartedRef.current;
       const firstIsValid = (
         isFirst
         && observation.chunkIndex === 0
         && observation.sourceSampleStart === 0
-        && observation.inputSampleZeroClientMs === observation.emittedAtMs
       );
       const continuationIsValid = (
         !isFirst
         && inputLedgerValidRef.current
         && observation.chunkIndex === idx
         && observation.sampleRateHz === inputSampleRateHzRef.current
+        && observation.inputPcmSha256 === inputPcmSha256Ref.current
+        && observation.inputPcmSampleCount
+          === inputPcmSampleCountRef.current
         && observation.sourceSampleStart === inputLastSampleEndRef.current
         && observation.inputSampleZeroClientMs
           === inputSampleZeroClientMsRef.current
@@ -150,10 +167,23 @@ export function useTimingTracker(): UseTimingTrackerReturn {
         - observation.sourceSampleStart
       );
       const bytesMatchLedger = audioBytes === sampleCount * BYTES_PER_SAMPLE;
+      const sourceEndBoundaryClientMs = (
+        observation.inputSampleZeroClientMs
+        + (
+          observation.sourceSampleEndExclusive
+          / observation.sampleRateHz
+        ) * 1000
+      );
+      const emissionIsNotEarly = (
+        observation.emittedAtMs + INPUT_EMISSION_EARLY_TOLERANCE_MS
+        >= sourceEndBoundaryClientMs
+      );
       const valid = (
         finiteNumbers
         && integerLedger
+        && digestIsValid
         && bytesMatchLedger
+        && emissionIsNotEarly
         && (firstIsValid || continuationIsValid)
       );
 
@@ -165,6 +195,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
             observation.inputSampleZeroClientMs
           );
           inputSampleRateHzRef.current = observation.sampleRateHz;
+          inputPcmSha256Ref.current = observation.inputPcmSha256;
+          inputPcmSampleCountRef.current = observation.inputPcmSampleCount;
         }
         inputLastSampleEndRef.current = observation.sourceSampleEndExclusive;
         inputLastEmittedAtMsRef.current = observation.emittedAtMs;
@@ -185,6 +217,8 @@ export function useTimingTracker(): UseTimingTrackerReturn {
           observation.sourceSampleEndExclusive
         ),
         inputSampleRateHz: observation.sampleRateHz,
+        inputPcmSha256: observation.inputPcmSha256,
+        inputPcmSampleCount: observation.inputPcmSampleCount,
         inputLedgerValid: valid,
       };
     } else {
