@@ -19,6 +19,412 @@ ASR_TIMING_BASES = frozenset(
     }
 )
 
+ASR_BOUNDARY_PRESENCE_PRESENT = "present"
+ASR_BOUNDARY_PRESENCE_ABSENT = "absent"
+ASR_BOUNDARY_PRESENCE_UNOBSERVABLE = "unobservable"
+ASR_BOUNDARY_PRESENCES = frozenset(
+    {
+        ASR_BOUNDARY_PRESENCE_PRESENT,
+        ASR_BOUNDARY_PRESENCE_ABSENT,
+        ASR_BOUNDARY_PRESENCE_UNOBSERVABLE,
+    }
+)
+ASR_BOUNDARY_NUMERIC_CLASSES = (
+    "not_available",
+    "unparseable",
+    "nonfinite",
+    "negative",
+    "zero",
+    "positive",
+)
+ASR_WORD_TIMING_RELATIONS = frozenset(
+    {
+        "end_after_start",
+        "equal",
+        "end_before_start",
+        "not_comparable",
+    }
+)
+ASR_WORD_TIMING_SHAPES = (
+    "valid",
+    "absent_boundary",
+    "unparseable_boundary",
+    "nonfinite_boundary",
+    "negative_boundary",
+    "zero_length",
+    "reversed",
+)
+
+
+@dataclass(frozen=True)
+class ASRBoundaryObservation:
+    """One raw timing scalar without transcript or token content."""
+
+    presence: str
+    numeric_class: str
+    finite_value_ms: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.presence not in ASR_BOUNDARY_PRESENCES:
+            raise ValueError(f"unsupported boundary presence: {self.presence!r}")
+        if self.numeric_class not in ASR_BOUNDARY_NUMERIC_CLASSES:
+            raise ValueError(
+                f"unsupported boundary numeric class: {self.numeric_class!r}"
+            )
+        if (
+            self.presence == ASR_BOUNDARY_PRESENCE_ABSENT
+            and self.numeric_class != "not_available"
+        ):
+            raise ValueError(
+                "an absent boundary cannot carry an observed numeric class"
+            )
+        finite_class = self.numeric_class in {"negative", "zero", "positive"}
+        if finite_class != (self.finite_value_ms is not None):
+            raise ValueError(
+                "finite_value_ms must exist exactly for finite numeric classes"
+            )
+        if self.finite_value_ms is None:
+            return
+        if (
+            not isinstance(self.finite_value_ms, (int, float))
+            or isinstance(self.finite_value_ms, bool)
+        ):
+            raise ValueError("finite_value_ms must be numeric")
+        _validate_finite("finite_value_ms", self.finite_value_ms)
+        if (
+            (self.numeric_class == "negative" and self.finite_value_ms >= 0)
+            or (self.numeric_class == "zero" and self.finite_value_ms != 0)
+            or (self.numeric_class == "positive" and self.finite_value_ms <= 0)
+        ):
+            raise ValueError(
+                "finite_value_ms does not match its numeric class"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "presence": self.presence,
+            "numeric_class": self.numeric_class,
+        }
+        if self.finite_value_ms is not None:
+            payload["finite_value_ms"] = self.finite_value_ms
+        return payload
+
+
+@dataclass(frozen=True)
+class ASRWordTimingEntry:
+    """Privacy-safe timing shape for one word entry."""
+
+    word_index: int
+    start: ASRBoundaryObservation
+    end: ASRBoundaryObservation
+    numeric_relation: str
+    shape: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.word_index, int)
+            or isinstance(self.word_index, bool)
+            or self.word_index < 0
+        ):
+            raise ValueError("word_index must be a non-negative integer")
+        _validate_word_timing_shape(
+            start=self.start,
+            end=self.end,
+            numeric_relation=self.numeric_relation,
+            shape=self.shape,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "word_index": self.word_index,
+            "start": self.start.to_dict(),
+            "end": self.end.to_dict(),
+            "numeric_relation": self.numeric_relation,
+            "shape": self.shape,
+        }
+
+
+@dataclass(frozen=True)
+class ASRWordTimingEnvelope:
+    """Raw first-start/last-end envelope for one ASR result."""
+
+    start_word_index: int
+    end_word_index: int
+    start: ASRBoundaryObservation
+    end: ASRBoundaryObservation
+    numeric_relation: str
+    shape: str
+    usable: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.usable, bool):
+            raise ValueError("usable must be boolean")
+        for name, value in (
+            ("start_word_index", self.start_word_index),
+            ("end_word_index", self.end_word_index),
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.end_word_index < self.start_word_index:
+            raise ValueError("end_word_index cannot precede start_word_index")
+        _validate_word_timing_shape(
+            start=self.start,
+            end=self.end,
+            numeric_relation=self.numeric_relation,
+            shape=self.shape,
+        )
+        if self.usable != (self.shape == "valid"):
+            raise ValueError("only a valid word-timing envelope is usable")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "start_word_index": self.start_word_index,
+            "end_word_index": self.end_word_index,
+            "start": self.start.to_dict(),
+            "end": self.end.to_dict(),
+            "numeric_relation": self.numeric_relation,
+            "shape": self.shape,
+            "usable": self.usable,
+        }
+
+
+@dataclass(frozen=True)
+class ASRWordTimingShapeCounts:
+    """Fixed counters for all mutually exclusive word-entry shapes."""
+
+    valid: int = 0
+    absent_boundary: int = 0
+    unparseable_boundary: int = 0
+    nonfinite_boundary: int = 0
+    negative_boundary: int = 0
+    zero_length: int = 0
+    reversed: int = 0
+
+    def __post_init__(self) -> None:
+        _validate_counter_values(self.to_dict())
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            shape: getattr(self, shape)
+            for shape in ASR_WORD_TIMING_SHAPES
+        }
+
+
+@dataclass(frozen=True)
+class ASRBoundaryNumericClassCounts:
+    """Fixed counters for raw boundary numeric classes."""
+
+    not_available: int = 0
+    unparseable: int = 0
+    nonfinite: int = 0
+    negative: int = 0
+    zero: int = 0
+    positive: int = 0
+
+    def __post_init__(self) -> None:
+        _validate_counter_values(self.to_dict())
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            numeric_class: getattr(self, numeric_class)
+            for numeric_class in ASR_BOUNDARY_NUMERIC_CLASSES
+        }
+
+
+@dataclass(frozen=True)
+class ASRBoundaryPresenceCounts:
+    """Fixed counters for observable versus unobservable field presence."""
+
+    present: int = 0
+    absent: int = 0
+    unobservable: int = 0
+
+    def __post_init__(self) -> None:
+        _validate_counter_values(self.to_dict())
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            presence: getattr(self, presence)
+            for presence in sorted(ASR_BOUNDARY_PRESENCES)
+        }
+
+
+@dataclass(frozen=True)
+class ASRWordTimingShapeDiagnostics:
+    """Transcript-free raw timing shape for every returned word entry."""
+
+    word_entry_count: int
+    no_word_entries: bool
+    envelope: Optional[ASRWordTimingEnvelope]
+    entry_shape_counts: ASRWordTimingShapeCounts
+    start_numeric_class_counts: ASRBoundaryNumericClassCounts
+    end_numeric_class_counts: ASRBoundaryNumericClassCounts
+    start_presence_counts: ASRBoundaryPresenceCounts
+    end_presence_counts: ASRBoundaryPresenceCounts
+    anomalies: Tuple[ASRWordTimingEntry, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.word_entry_count, int)
+            or isinstance(self.word_entry_count, bool)
+            or self.word_entry_count < 0
+        ):
+            raise ValueError("word_entry_count must be a non-negative integer")
+        if not isinstance(self.no_word_entries, bool):
+            raise ValueError("no_word_entries must be boolean")
+        if self.no_word_entries != (self.word_entry_count == 0):
+            raise ValueError("no_word_entries must match word_entry_count")
+        if (self.envelope is None) != self.no_word_entries:
+            raise ValueError("envelope must exist exactly when words exist")
+        if self.envelope is not None and (
+            self.envelope.start_word_index != 0
+            or self.envelope.end_word_index != self.word_entry_count - 1
+        ):
+            raise ValueError("envelope must span the first and last word entries")
+        count_groups = (
+            self.entry_shape_counts.to_dict(),
+            self.start_numeric_class_counts.to_dict(),
+            self.end_numeric_class_counts.to_dict(),
+            self.start_presence_counts.to_dict(),
+            self.end_presence_counts.to_dict(),
+        )
+        if any(
+            sum(group.values()) != self.word_entry_count
+            for group in count_groups
+        ):
+            raise ValueError("each timing counter group must cover every word entry")
+        anomaly_indices = tuple(item.word_index for item in self.anomalies)
+        if (
+            anomaly_indices != tuple(sorted(set(anomaly_indices)))
+            or any(index >= self.word_entry_count for index in anomaly_indices)
+            or any(item.shape == "valid" for item in self.anomalies)
+        ):
+            raise ValueError("timing anomalies must be unique, ordered, and invalid")
+        expected_anomaly_count = (
+            self.word_entry_count - self.entry_shape_counts.valid
+        )
+        if len(self.anomalies) != expected_anomaly_count:
+            raise ValueError("anomalies must contain every non-valid word entry")
+        anomaly_shape_counts = {
+            shape: sum(item.shape == shape for item in self.anomalies)
+            for shape in ASR_WORD_TIMING_SHAPES
+            if shape != "valid"
+        }
+        entry_shape_counts = self.entry_shape_counts.to_dict()
+        if any(
+            anomaly_shape_counts[shape] != entry_shape_counts[shape]
+            for shape in anomaly_shape_counts
+        ):
+            raise ValueError(
+                "anomaly shapes must match the non-valid entry counters"
+            )
+        for counter, boundary_name, attribute, categories in (
+            (
+                self.start_numeric_class_counts.to_dict(),
+                "start",
+                "numeric_class",
+                ASR_BOUNDARY_NUMERIC_CLASSES,
+            ),
+            (
+                self.end_numeric_class_counts.to_dict(),
+                "end",
+                "numeric_class",
+                ASR_BOUNDARY_NUMERIC_CLASSES,
+            ),
+            (
+                self.start_presence_counts.to_dict(),
+                "start",
+                "presence",
+                ASR_BOUNDARY_PRESENCES,
+            ),
+            (
+                self.end_presence_counts.to_dict(),
+                "end",
+                "presence",
+                ASR_BOUNDARY_PRESENCES,
+            ),
+        ):
+            anomaly_counts = {
+                category: sum(
+                    getattr(getattr(item, boundary_name), attribute)
+                    == category
+                    for item in self.anomalies
+                )
+                for category in categories
+            }
+            if any(
+                anomaly_counts[category] > counter[category]
+                for category in categories
+            ):
+                raise ValueError(
+                    "boundary counters cannot undercount anomaly observations"
+                )
+            forbidden_for_valid = (
+                (
+                    {
+                        "not_available",
+                        "unparseable",
+                        "nonfinite",
+                        "negative",
+                    }
+                    | ({"zero"} if boundary_name == "end" else set())
+                )
+                if attribute == "numeric_class"
+                else {"absent"}
+            )
+            if any(
+                counter[category] != anomaly_counts[category]
+                for category in forbidden_for_valid
+            ):
+                raise ValueError(
+                    "valid-entry residual counters contain impossible "
+                    "boundary categories"
+                )
+        if self.envelope is not None and (
+            self.start_numeric_class_counts.to_dict()[
+                self.envelope.start.numeric_class
+            ]
+            == 0
+            or self.end_numeric_class_counts.to_dict()[
+                self.envelope.end.numeric_class
+            ]
+            == 0
+            or self.start_presence_counts.to_dict()[
+                self.envelope.start.presence
+            ]
+            == 0
+            or self.end_presence_counts.to_dict()[
+                self.envelope.end.presence
+            ]
+            == 0
+        ):
+            raise ValueError(
+                "boundary counters must include the envelope observations"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "word_entry_count": self.word_entry_count,
+            "no_word_entries": self.no_word_entries,
+            "envelope": (
+                self.envelope.to_dict() if self.envelope is not None else None
+            ),
+            "counts": {
+                "entry_shape": self.entry_shape_counts.to_dict(),
+                "start_numeric_class": (
+                    self.start_numeric_class_counts.to_dict()
+                ),
+                "end_numeric_class": self.end_numeric_class_counts.to_dict(),
+                "start_presence": self.start_presence_counts.to_dict(),
+                "end_presence": self.end_presence_counts.to_dict(),
+            },
+            "anomalies": [item.to_dict() for item in self.anomalies],
+        }
+
 
 class EmissionReason(str, Enum):
     """Why buffered ASR text became a translation segment."""
@@ -65,6 +471,9 @@ class ASRTranscript:
     first_word_start_ms: Optional[float] = None
     last_word_end_ms: Optional[float] = None
     timing_basis: str = "unavailable"
+    word_timing_shape_diagnostics: Optional[
+        ASRWordTimingShapeDiagnostics
+    ] = None
 
     def __post_init__(self) -> None:
         _validate_nonnegative_finite(
@@ -79,6 +488,7 @@ class ASRTranscript:
             first_word_start_ms=self.first_word_start_ms,
             last_word_end_ms=self.last_word_end_ms,
             timing_basis=self.timing_basis,
+            word_timing_shape_diagnostics=self.word_timing_shape_diagnostics,
         )
 
 
@@ -96,6 +506,9 @@ class AsrFinal:
     first_word_start_ms: Optional[float] = None
     last_word_end_ms: Optional[float] = None
     timing_basis: str = "unavailable"
+    word_timing_shape_diagnostics: Optional[
+        ASRWordTimingShapeDiagnostics
+    ] = None
 
     def __post_init__(self) -> None:
         if self.final_id < 0:
@@ -110,6 +523,7 @@ class AsrFinal:
             first_word_start_ms=self.first_word_start_ms,
             last_word_end_ms=self.last_word_end_ms,
             timing_basis=self.timing_basis,
+            word_timing_shape_diagnostics=self.word_timing_shape_diagnostics,
         )
 
     @classmethod
@@ -131,6 +545,9 @@ class AsrFinal:
             first_word_start_ms=transcript.first_word_start_ms,
             last_word_end_ms=transcript.last_word_end_ms,
             timing_basis=transcript.timing_basis,
+            word_timing_shape_diagnostics=(
+                transcript.word_timing_shape_diagnostics
+            ),
         )
 
 
@@ -953,6 +1370,9 @@ def _validate_asr_timing_diagnostics(
     first_word_start_ms: Optional[float],
     last_word_end_ms: Optional[float],
     timing_basis: str,
+    word_timing_shape_diagnostics: Optional[
+        ASRWordTimingShapeDiagnostics
+    ],
 ) -> None:
     if (
         not isinstance(word_count, int)
@@ -962,6 +1382,13 @@ def _validate_asr_timing_diagnostics(
         raise ValueError("word_count must be a non-negative integer")
     if timing_basis not in ASR_TIMING_BASES:
         raise ValueError(f"unsupported ASR timing basis: {timing_basis!r}")
+    if (
+        word_timing_shape_diagnostics is not None
+        and word_timing_shape_diagnostics.word_entry_count != word_count
+    ):
+        raise ValueError(
+            "word timing shape diagnostics must match word_count"
+        )
     if first_word_start_ms is not None:
         _validate_nonnegative_finite(
             "first_word_start_ms", first_word_start_ms
@@ -983,6 +1410,18 @@ def _validate_asr_timing_diagnostics(
             raise ValueError(
                 "word_offsets timing requires words and complete offsets"
             )
+        if word_timing_shape_diagnostics is not None:
+            envelope = word_timing_shape_diagnostics.envelope
+            if (
+                envelope is None
+                or not envelope.usable
+                or envelope.start.finite_value_ms
+                != first_word_start_ms
+                or envelope.end.finite_value_ms != last_word_end_ms
+            ):
+                raise ValueError(
+                    "word_offsets timing must match the raw timing envelope"
+                )
         return
     if timing_basis == ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS:
         if word_count == 0 or complete_offsets:
@@ -990,11 +1429,120 @@ def _validate_asr_timing_diagnostics(
                 "incomplete_word_offsets timing requires words and a "
                 "missing boundary"
             )
+        if (
+            word_timing_shape_diagnostics is not None
+            and (
+                word_timing_shape_diagnostics.envelope is None
+                or word_timing_shape_diagnostics.envelope.usable
+            )
+        ):
+            raise ValueError(
+                "incomplete_word_offsets requires an unusable raw envelope"
+            )
+        if word_timing_shape_diagnostics is not None:
+            envelope = word_timing_shape_diagnostics.envelope
+            if envelope is None:
+                raise ValueError(
+                    "incomplete_word_offsets requires a raw envelope"
+                )
+            expected_first = (
+                envelope.start.finite_value_ms
+                if envelope.start.numeric_class in {"zero", "positive"}
+                else None
+            )
+            expected_last = (
+                envelope.end.finite_value_ms
+                if envelope.end.numeric_class in {"zero", "positive"}
+                else None
+            )
+            if (
+                expected_first is not None
+                and expected_last is not None
+                and expected_last <= expected_first
+            ):
+                expected_last = None
+            if (
+                first_word_start_ms != expected_first
+                or last_word_end_ms != expected_last
+            ):
+                raise ValueError(
+                    "incomplete word offsets must match the raw envelope"
+                )
         return
     if word_count or first_word_start_ms is not None or last_word_end_ms is not None:
         raise ValueError(
             f"{timing_basis} timing cannot carry word-offset diagnostics"
         )
+
+
+def _validate_counter_values(values: Dict[str, int]) -> None:
+    if any(
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        for value in values.values()
+    ):
+        raise ValueError("timing counters must be non-negative integers")
+
+
+def _validate_word_timing_shape(
+    *,
+    start: ASRBoundaryObservation,
+    end: ASRBoundaryObservation,
+    numeric_relation: str,
+    shape: str,
+) -> None:
+    if not isinstance(start, ASRBoundaryObservation) or not isinstance(
+        end, ASRBoundaryObservation
+    ):
+        raise ValueError("word timing boundaries must be typed observations")
+    if numeric_relation not in ASR_WORD_TIMING_RELATIONS:
+        raise ValueError(
+            f"unsupported word timing relation: {numeric_relation!r}"
+        )
+    if shape not in ASR_WORD_TIMING_SHAPES:
+        raise ValueError(f"unsupported word timing shape: {shape!r}")
+    expected_relation, expected_shape = _expected_word_timing_shape(
+        start,
+        end,
+    )
+    if (
+        numeric_relation != expected_relation
+        or shape != expected_shape
+    ):
+        raise ValueError(
+            "word timing relation and shape must match the observations"
+        )
+
+
+def _expected_word_timing_shape(
+    start: ASRBoundaryObservation,
+    end: ASRBoundaryObservation,
+) -> Tuple[str, str]:
+    numeric_classes = {start.numeric_class, end.numeric_class}
+    if "not_available" in numeric_classes:
+        return "not_comparable", "absent_boundary"
+    if "unparseable" in numeric_classes:
+        return "not_comparable", "unparseable_boundary"
+    if "nonfinite" in numeric_classes:
+        return "not_comparable", "nonfinite_boundary"
+    start_value = start.finite_value_ms
+    end_value = end.finite_value_ms
+    if start_value is None or end_value is None:
+        return "not_comparable", "unparseable_boundary"
+    if end_value > start_value:
+        relation = "end_after_start"
+    elif end_value == start_value:
+        relation = "equal"
+    else:
+        relation = "end_before_start"
+    if "negative" in numeric_classes:
+        return relation, "negative_boundary"
+    if relation == "equal":
+        return relation, "zero_length"
+    if relation == "end_before_start":
+        return relation, "reversed"
+    return relation, "valid"
 
 
 def _validate_subsequence_identity(

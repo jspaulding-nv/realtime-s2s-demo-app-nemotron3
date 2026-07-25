@@ -1258,6 +1258,37 @@ The transcript-free ignored report has SHA-256
 Detailed sanitized findings and the service-team escalation package are in
 `docs/ASR_FINAL_ATTRIBUTION_GATE_2026-07-25.md`.
 
+### Privacy-safe word-timing-shape diagnostic
+
+A separate one-run diagnostic now captures why an ASR final's raw word timing
+cannot form a positive-duration first-start/last-end envelope. It classifies every word
+entry and the result envelope by boundary presence, numeric class, numeric
+relation, and mutually exclusive timing shape. Invalid entries retain only
+their zero-based index and timing observations; transcript, token, and
+translation content remain excluded.
+
+For the installed proto3 word timing scalars, zero has unobservable field
+presence after decoding. The diagnostic therefore records zero as an observed
+numeric class with `presence=unobservable`; it does not claim that zero means
+missing or unset.
+
+The runner performs one exact-PCM, real-time replay with runtime attestation
+before and after capture. It writes a failed current-attempt checkpoint before
+long-running work so an interruption cannot expose stale completed evidence.
+The capture also binds the source WAV before, while opening it for streaming,
+and after the replay. Runtime continuity includes a one-way fingerprint of the
+container ID, start time, and restart count, so a same-image restart or
+replacement cannot compare equal.
+Its schema explicitly marks the output diagnostic-only and ineligible for
+qualification, and forbids formal `gate` or `passed` fields. The unchanged
+formal acceptance criterion still requires two complete runs and zero
+incomplete word envelopes. Its evidence implementation now also binds the
+computed padded PCM, registered English/800 ms client configuration,
+container-instance continuity, and concurrent output ownership.
+
+No live result is claimed yet. Run and interpretation instructions are in
+[ASR Word-Timing-Shape Diagnostic](ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1288,6 +1319,8 @@ Detailed sanitized findings and the service-team escalation package are in
   exact long-form padded PCM
 - [ ] Pass two real-time ASR final-attribution qualification runs on the exact
   long-form padded PCM (blocked by 13 deterministic incomplete finals per run)
+- [ ] Run and review one privacy-safe ASR word-timing-shape diagnostic before
+  deciding whether to repeat the formal two-run qualification
 - [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
 - [ ] Run protocol v1 across all three long-form samples

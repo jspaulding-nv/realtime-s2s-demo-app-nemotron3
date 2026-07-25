@@ -13,6 +13,13 @@ This result blocks a formal semantic source-event browser gate. It does not
 measure transcription accuracy, translation quality, target-language
 audibility, or end-to-end audience latency by itself.
 
+The formal gate remains failed. The next registered action is one
+diagnostic-only real-time replay using the privacy-safe raw word-timing-shape
+instrumentation described in
+[ASR Word-Timing-Shape Diagnostic](ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md).
+That single replay is not qualification evidence and must complete before
+deciding whether the unchanged formal two-run gate should be rerun.
+
 ## Registered configuration
 
 | Item | Registered value |
@@ -105,11 +112,14 @@ arbitrary filename, endpoint string, or local container name.
    this ASR qualification. Exact source attribution is still incomplete.
 2. Provide the sanitized counts, repeated final IDs, model version/digest,
    profile hash, EOU, and report hash to the ASR service team. Ask whether
-   every nonempty final is expected to carry a complete positive word-time
+   every nonempty final is expected to carry a complete positive-duration word-time
    envelope when word offsets are requested.
-3. If more diagnosis is requested, add privacy-safe raw timing-shape counters
-   that distinguish absent, zero-length, reversed, and valid word entries.
-   Do not retain token or transcript text.
+3. Run exactly one privacy-safe word-timing-shape diagnostic. It distinguishes
+   absent, unparseable, nonfinite, negative, zero-length, reversed, and valid
+   word entries without retaining token or transcript text. Proto3 scalar
+   zero is recorded with unobservable presence; it is not labeled missing.
+   Review that result before deciding whether another formal two-run
+   qualification is justified.
 4. Do not silently synthesize a missing source start from neighboring finals.
    Any conservative fallback must be separately specified, reviewed, and
    preregistered. A word-derived start plus an `audio_processed` end could
@@ -121,11 +131,22 @@ arbitrary filename, endpoint string, or local container name.
    formal semantic measurement; it does not by itself solve accumulated
    audience delay.
 
+The diagnostic command and schema are documented in
+[ASR Word-Timing-Shape Diagnostic](ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md).
+Do not substitute its one run for either replay required below.
+
 ## Reproduction command
 
 Run from the reviewed merged branch with the configured environment loaded:
 
 ```bash
+set -a
+source .env
+set +a
+export RIVA_ASR_WORD_TIMES=1
+export RIVA_SOURCE_LANGUAGE=en-US
+export RIVA_EOU_MS=800
+
 python3 asr_final_attribution_gate.py \
   --file test_audio/long-form-03-30min.wav \
   --uri 127.0.0.1:50052 \

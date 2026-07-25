@@ -1,4 +1,10 @@
 import asyncio
+import json
+import os
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,9 +13,19 @@ import pytest
 from direct_asr_client import (
     DirectASRClient,
     DirectASRStreamClosed,
+    _classify_word_timing_shapes,
     iter_transcript_results,
 )
-from staged_models import ASRStreamEvent, ASRStreamEventKind, ASRTranscript, AsrFinal
+from staged_models import (
+    ASRBoundaryNumericClassCounts,
+    ASRBoundaryObservation,
+    ASRStreamEvent,
+    ASRStreamEventKind,
+    ASRTranscript,
+    ASRWordTimingEnvelope,
+    ASRWordTimingShapeCounts,
+    AsrFinal,
+)
 
 
 def response(*results):
@@ -80,6 +96,32 @@ def test_response_parser_prefers_word_timing_envelope():
     assert event.first_word_start_ms == 250
     assert event.last_word_end_ms == 900
     assert event.timing_basis == "word_offsets"
+    diagnostics = event.word_timing_shape_diagnostics.to_dict()
+    assert diagnostics["envelope"]["shape"] == "valid"
+    assert diagnostics["counts"]["entry_shape"]["valid"] == 2
+    assert diagnostics["anomalies"] == []
+
+
+def test_response_parser_skips_shape_diagnostics_for_timed_interims():
+    words = [
+        SimpleNamespace(start_time=250, end_time=400),
+        SimpleNamespace(start_time=450, end_time=900),
+    ]
+
+    event = next(
+        iter_transcript_results(
+            [response(result("Interim.", words=words))],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    assert event.is_final is False
+    assert event.source_start_ms == 250
+    assert event.source_end_ms == 900
+    assert event.first_word_start_ms == 250
+    assert event.last_word_end_ms == 900
+    assert event.timing_basis == "word_offsets"
+    assert event.word_timing_shape_diagnostics is None
 
 
 def test_response_parser_keeps_missing_word_start_fail_closed():
@@ -161,6 +203,387 @@ def test_response_parser_rejects_default_zero_length_word_envelope():
     assert event.source_start_ms is None
     assert event.source_end_ms == 1_250
     assert event.timing_basis == "incomplete_word_offsets"
+    diagnostics = event.word_timing_shape_diagnostics.to_dict()
+    assert diagnostics["envelope"]["shape"] == "zero_length"
+    assert diagnostics["anomalies"][0]["shape"] == "zero_length"
+
+
+def proto3_word_info(*, start_time=0, end_time=0):
+    descriptor = SimpleNamespace(
+        fields_by_name={
+            "start_time": SimpleNamespace(has_presence=False),
+            "end_time": SimpleNamespace(has_presence=False),
+        }
+    )
+    return SimpleNamespace(
+        DESCRIPTOR=descriptor,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+def test_proto3_word_info_zero_scalars_have_unobservable_presence():
+    word = proto3_word_info()
+
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Default protobuf fields.",
+                        is_final=True,
+                        words=[word],
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    diagnostics = event.word_timing_shape_diagnostics.to_dict()
+    envelope = diagnostics["envelope"]
+    assert envelope["start"] == {
+        "presence": "unobservable",
+        "numeric_class": "zero",
+        "finite_value_ms": 0,
+    }
+    assert envelope["end"] == {
+        "presence": "unobservable",
+        "numeric_class": "zero",
+        "finite_value_ms": 0,
+    }
+    assert envelope["shape"] == "zero_length"
+
+
+def test_proto3_word_info_positive_start_zero_end_is_raw_reversed():
+    word = proto3_word_info(start_time=100)
+
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Zero or unset end.",
+                        is_final=True,
+                        words=[word],
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    envelope = event.word_timing_shape_diagnostics.to_dict()["envelope"]
+    assert envelope["start"]["presence"] == "unobservable"
+    assert envelope["start"]["numeric_class"] == "positive"
+    assert envelope["end"]["presence"] == "unobservable"
+    assert envelope["end"]["numeric_class"] == "zero"
+    assert envelope["numeric_relation"] == "end_before_start"
+    assert envelope["shape"] == "reversed"
+
+
+def test_installed_word_info_descriptor_and_zero_values_match_assumption():
+    script = """
+import json
+try:
+    import riva.client
+    from direct_asr_client import _classify_word_timing_shapes
+except ImportError:
+    raise SystemExit(77)
+word = riva.client.proto.riva_asr_pb2.WordInfo()
+diagnostics = _classify_word_timing_shapes((word,)).to_dict()
+print(json.dumps({
+    "start_has_presence": (
+        word.DESCRIPTOR.fields_by_name["start_time"].has_presence
+    ),
+    "end_has_presence": (
+        word.DESCRIPTOR.fields_by_name["end_time"].has_presence
+    ),
+    "diagnostics": diagnostics,
+}))
+"""
+    environment = dict(os.environ)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode == 77:
+        pytest.skip("installed Riva client is unavailable")
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+
+    assert observed["start_has_presence"] is False
+    assert observed["end_has_presence"] is False
+    envelope = observed["diagnostics"]["envelope"]
+    assert envelope["start"]["presence"] == "unobservable"
+    assert envelope["start"]["numeric_class"] == "zero"
+    assert envelope["end"]["presence"] == "unobservable"
+    assert envelope["end"]["numeric_class"] == "zero"
+
+
+@pytest.mark.parametrize(
+    ("word", "expected_shape", "start_class", "end_class"),
+    [
+        (
+            SimpleNamespace(end_time=100),
+            "absent_boundary",
+            "not_available",
+            "positive",
+        ),
+        (
+            SimpleNamespace(start_time=0, end_time=100),
+            "valid",
+            "zero",
+            "positive",
+        ),
+        (
+            SimpleNamespace(start_time="not-a-number", end_time=100),
+            "unparseable_boundary",
+            "unparseable",
+            "positive",
+        ),
+        (
+            SimpleNamespace(start_time=float("nan"), end_time=100),
+            "nonfinite_boundary",
+            "nonfinite",
+            "positive",
+        ),
+        (
+            SimpleNamespace(start_time=0, end_time=float("inf")),
+            "nonfinite_boundary",
+            "zero",
+            "nonfinite",
+        ),
+        (
+            SimpleNamespace(start_time=-1, end_time=100),
+            "negative_boundary",
+            "negative",
+            "positive",
+        ),
+        (
+            SimpleNamespace(start_time=200, end_time=-1),
+            "negative_boundary",
+            "positive",
+            "negative",
+        ),
+        (
+            SimpleNamespace(start_time=200, end_time=200),
+            "zero_length",
+            "positive",
+            "positive",
+        ),
+        (
+            SimpleNamespace(start_time=200, end_time=100),
+            "reversed",
+            "positive",
+            "positive",
+        ),
+    ],
+)
+def test_response_parser_classifies_raw_word_timing_shapes(
+    word,
+    expected_shape,
+    start_class,
+    end_class,
+):
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Timing shape.",
+                        is_final=True,
+                        words=[word],
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    diagnostics = event.word_timing_shape_diagnostics.to_dict()
+    assert diagnostics["envelope"]["shape"] == expected_shape
+    assert (
+        diagnostics["envelope"]["start"]["numeric_class"]
+        == start_class
+    )
+    assert diagnostics["envelope"]["end"]["numeric_class"] == end_class
+    assert diagnostics["counts"]["entry_shape"][expected_shape] == 1
+    assert sum(diagnostics["counts"]["entry_shape"].values()) == 1
+    assert (
+        sum(diagnostics["counts"]["start_numeric_class"].values())
+        == 1
+    )
+    assert sum(diagnostics["counts"]["end_numeric_class"].values()) == 1
+    assert len(diagnostics["anomalies"]) == (
+        0 if expected_shape == "valid" else 1
+    )
+
+
+def test_response_parser_counts_invalid_interior_word_independently():
+    words = [
+        SimpleNamespace(start_time=0, end_time=100),
+        SimpleNamespace(start_time=200, end_time=0),
+        SimpleNamespace(start_time=300, end_time=400),
+    ]
+
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Interior anomaly.",
+                        is_final=True,
+                        words=words,
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    diagnostics = event.word_timing_shape_diagnostics.to_dict()
+    assert diagnostics["envelope"]["shape"] == "valid"
+    assert diagnostics["counts"]["entry_shape"]["valid"] == 2
+    assert diagnostics["counts"]["entry_shape"]["reversed"] == 1
+    assert [item["word_index"] for item in diagnostics["anomalies"]] == [1]
+    assert event.timing_basis == "word_offsets"
+
+
+def test_response_parser_records_no_word_entries_without_token_content():
+    event = next(
+        iter_transcript_results(
+            [response(result("No words.", is_final=True, words=[]))],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    diagnostics = event.word_timing_shape_diagnostics.to_dict()
+    assert diagnostics["word_entry_count"] == 0
+    assert diagnostics["no_word_entries"] is True
+    assert diagnostics["envelope"] is None
+    assert diagnostics["anomalies"] == []
+    assert all(
+        sum(group.values()) == 0
+        for group in diagnostics["counts"].values()
+    )
+
+
+def test_asr_final_preserves_and_validates_shape_diagnostics():
+    event = next(
+        iter_transcript_results(
+            [
+                response(
+                    result(
+                        "Timed final.",
+                        is_final=True,
+                        words=[
+                            SimpleNamespace(start_time=100, end_time=900),
+                        ],
+                    )
+                )
+            ],
+            clock_ms=lambda: 1_000,
+        )
+    )
+
+    final = AsrFinal.from_transcript(0, event)
+
+    assert (
+        final.word_timing_shape_diagnostics
+        is event.word_timing_shape_diagnostics
+    )
+    with pytest.raises(ValueError, match="must match word_count"):
+        AsrFinal(
+            final_id=1,
+            text="private transcript",
+            received_monotonic_ms=1_000,
+            word_count=2,
+            first_word_start_ms=100,
+            last_word_end_ms=900,
+            timing_basis="word_offsets",
+            word_timing_shape_diagnostics=(
+                event.word_timing_shape_diagnostics
+            ),
+        )
+
+
+def test_word_timing_counters_reject_boolean_values():
+    with pytest.raises(ValueError, match="non-negative integers"):
+        ASRWordTimingShapeCounts(valid=True)
+
+
+def test_word_timing_typed_diagnostics_reject_bool_and_impossible_residuals():
+    with pytest.raises(ValueError, match="must be numeric"):
+        ASRBoundaryObservation(
+            presence="present",
+            numeric_class="positive",
+            finite_value_ms=True,
+        )
+    start = ASRBoundaryObservation(
+        presence="present",
+        numeric_class="zero",
+        finite_value_ms=0,
+    )
+    end = ASRBoundaryObservation(
+        presence="present",
+        numeric_class="positive",
+        finite_value_ms=100,
+    )
+    with pytest.raises(ValueError, match="usable must be boolean"):
+        ASRWordTimingEnvelope(
+            start_word_index=0,
+            end_word_index=0,
+            start=start,
+            end=end,
+            numeric_relation="end_after_start",
+            shape="valid",
+            usable=1,
+        )
+    with pytest.raises(ValueError, match="no_word_entries must be boolean"):
+        replace(
+            _classify_word_timing_shapes(()),
+            no_word_entries=0,
+        )
+
+    two_valid_words = _classify_word_timing_shapes(
+        (
+            SimpleNamespace(start_time=0, end_time=100),
+            SimpleNamespace(start_time=200, end_time=300),
+        )
+    )
+    with pytest.raises(ValueError, match="impossible boundary categories"):
+        replace(
+            two_valid_words,
+            start_numeric_class_counts=ASRBoundaryNumericClassCounts(
+                negative=1,
+                positive=1,
+            ),
+        )
+
+
+def test_incomplete_normalized_offsets_must_match_raw_envelope():
+    diagnostics = _classify_word_timing_shapes(
+        (SimpleNamespace(start_time=100, end_time=0),)
+    )
+
+    with pytest.raises(ValueError, match="match the raw envelope"):
+        AsrFinal(
+            final_id=0,
+            text="private transcript",
+            received_monotonic_ms=1_000,
+            source_end_ms=1_000,
+            audio_processed_s=1.0,
+            word_count=1,
+            first_word_start_ms=999,
+            last_word_end_ms=None,
+            timing_basis="incomplete_word_offsets",
+            word_timing_shape_diagnostics=diagnostics,
+        )
 
 
 def test_response_parser_preserves_hypothesis_local_source_timing():
