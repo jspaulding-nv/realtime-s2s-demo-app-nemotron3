@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FileAudioChunkObservation } from '../types/timing';
+import { extractExactMonoPcm16Wav } from '../utils/pcmWav';
 import { sha256Hex } from '../utils/sha256';
 
 export interface UseFileAudioSourceOptions {
@@ -67,41 +68,57 @@ export function useFileAudioSource({
     setPosition(0);
 
     const arrayBuffer = await file.arrayBuffer();
+    const exactPcm = extractExactMonoPcm16Wav(arrayBuffer, sampleRate);
+    let sourceSampleCount: number;
+    let sourceDuration: number;
+    let pcmBuffer: Int16Array<ArrayBuffer>;
 
-    // Use OfflineAudioContext to decode and resample to target sample rate
-    // We need to know the decoded length, so create a temporary decode first
-    const tempCtx = new OfflineAudioContext(1, 1, sampleRate);
-    const decoded = await tempCtx.decodeAudioData(arrayBuffer);
+    if (exactPcm !== null) {
+      // Preserve the original little-endian PCM payload byte for byte. Copying
+      // through a Uint8Array avoids a float conversion and does not depend on
+      // the host's typed-array endianness.
+      sourceSampleCount = exactPcm.sampleCount;
+      sourceDuration = sourceSampleCount / sampleRate;
+      const totalChunks = Math.ceil(sourceSampleCount / chunkSize);
+      const totalPaddedSamples = totalChunks * chunkSize;
+      pcmBuffer = new Int16Array(totalPaddedSamples);
+      new Uint8Array(pcmBuffer.buffer).set(exactPcm.pcmBytes);
+    } else {
+      // Decode and resample formats that are not already the exact ASR wire
+      // format. The second read is required because decodeAudioData may detach
+      // the first ArrayBuffer.
+      const tempCtx = new OfflineAudioContext(1, 1, sampleRate);
+      const decoded = await tempCtx.decodeAudioData(arrayBuffer);
+      const totalSamples = Math.round(decoded.duration * sampleRate);
+      const offlineCtx = new OfflineAudioContext(1, totalSamples, sampleRate);
+      const arrayBuffer2 = await file.arrayBuffer();
+      const decoded2 = await offlineCtx.decodeAudioData(arrayBuffer2);
+      const source = offlineCtx.createBufferSource();
+      source.buffer = decoded2;
+      source.connect(offlineCtx.destination);
+      source.start();
+      const resampled = await offlineCtx.startRendering();
 
-    // Now resample to target sample rate if needed
-    const totalSamples = Math.round(decoded.duration * sampleRate);
-    const offlineCtx = new OfflineAudioContext(1, totalSamples, sampleRate);
-    // Need to re-decode since the buffer is detached after first decode
-    const arrayBuffer2 = await file.arrayBuffer();
-    const decoded2 = await offlineCtx.decodeAudioData(arrayBuffer2);
-    const source = offlineCtx.createBufferSource();
-    source.buffer = decoded2;
-    source.connect(offlineCtx.destination);
-    source.start();
-    const resampled = await offlineCtx.startRendering();
-
-    // Construct the complete wire image once, including the zero padding in
-    // the final frame. The digest and every transmitted chunk are derived
-    // from this same immutable Int16 PCM buffer.
-    const sourceSamples = resampled.getChannelData(0);
-    const totalChunks = Math.ceil(sourceSamples.length / chunkSize);
-    const totalPaddedSamples = totalChunks * chunkSize;
-    const pcmBuffer = new Int16Array(totalPaddedSamples);
-    for (let i = 0; i < sourceSamples.length; i++) {
-      const sample = Math.max(-1, Math.min(1, sourceSamples[i]));
-      pcmBuffer[i] = sample < 0 ? sample * 32768 : sample * 32767;
+      sourceSampleCount = resampled.length;
+      sourceDuration = resampled.duration;
+      const totalChunks = Math.ceil(sourceSampleCount / chunkSize);
+      const totalPaddedSamples = totalChunks * chunkSize;
+      pcmBuffer = new Int16Array(totalPaddedSamples);
+      const sourceSamples = resampled.getChannelData(0);
+      for (let i = 0; i < sourceSamples.length; i++) {
+        const sample = Math.max(-1, Math.min(1, sourceSamples[i]));
+        pcmBuffer[i] = sample < 0 ? sample * 32768 : sample * 32767;
+      }
     }
+
+    // The digest and every transmitted chunk come from the same immutable wire
+    // image, including final-frame zero padding.
     const inputPcmSha256 = await sha256Hex(pcmBuffer.buffer);
 
     if (loadRunRef.current !== loadId) return;
     pcmBufferRef.current = pcmBuffer;
     inputPcmSha256Ref.current = inputPcmSha256;
-    setDuration(resampled.duration);
+    setDuration(sourceDuration);
     setPosition(0);
     chunkIndexRef.current = 0;
     setIsLoaded(true);

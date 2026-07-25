@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import sys
 import threading
 import time
 from concurrent.futures import (
@@ -19,6 +21,10 @@ from asr_config import create_streaming_asr_config
 from config import riva_config
 from riva_client import AudioChunkIterator
 from staged_models import (
+    ASR_TIMING_BASIS_AUDIO_PROCESSED_END_ONLY,
+    ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS,
+    ASR_TIMING_BASIS_UNAVAILABLE,
+    ASR_TIMING_BASIS_WORD_OFFSETS,
     ASRStreamEvent,
     ASRStreamEventKind,
     ASRTranscript,
@@ -185,7 +191,11 @@ class DirectASRClient:
         new_auth = None
         with self._lifecycle_lock:
             if self._closing:
-                print("[Direct ASR] Cannot connect while client close is in progress")
+                print(
+                    "[Direct ASR] Cannot connect while client close is in "
+                    "progress",
+                    file=sys.stderr,
+                )
                 return False
             if self._connected:
                 return True
@@ -196,7 +206,10 @@ class DirectASRClient:
                     and not self._active_stream.worker_done
                 )
             ):
-                print("[Direct ASR] Cannot connect while an ASR stream is active")
+                print(
+                    "[Direct ASR] Cannot connect while an ASR stream is active",
+                    file=sys.stderr,
+                )
                 return False
             if self._owns_executor and self._executor is None:
                 self._executor = _new_executor()
@@ -212,7 +225,11 @@ class DirectASRClient:
                 self._channel_closed = False
             return True
         except Exception as exc:
-            print(f"[Direct ASR] Failed to connect to {self.uri}: {exc}")
+            print(
+                "[Direct ASR] Connection failed "
+                f"({type(exc).__name__})",
+                file=sys.stderr,
+            )
             channel = getattr(new_auth, "channel", None)
             if channel is not None:
                 channel.close()
@@ -443,11 +460,40 @@ def iter_transcript_results(
             audio_processed_s = float(getattr(result, "audio_processed", 0.0) or 0.0)
             source_start_ms = None
             source_end_ms = None
+            first_word_start_ms = None
+            last_word_end_ms = None
+            timing_basis = ASR_TIMING_BASIS_UNAVAILABLE
             if words:
-                source_start_ms = float(getattr(words[0], "start_time", 0.0))
-                source_end_ms = float(getattr(words[-1], "end_time", 0.0))
+                first_word_start_ms = _optional_nonnegative_finite(
+                    getattr(words[0], "start_time", None)
+                )
+                last_word_end_ms = _optional_nonnegative_finite(
+                    getattr(words[-1], "end_time", None)
+                )
+                if (
+                    first_word_start_ms is not None
+                    and last_word_end_ms is not None
+                    and last_word_end_ms > first_word_start_ms
+                ):
+                    source_start_ms = first_word_start_ms
+                    source_end_ms = last_word_end_ms
+                    timing_basis = ASR_TIMING_BASIS_WORD_OFFSETS
+                else:
+                    # Do not synthesize a start from audio_processed or a
+                    # neighboring hypothesis. A partial envelope remains
+                    # explicitly unusable for semantic source attribution.
+                    if (
+                        first_word_start_ms is not None
+                        and last_word_end_ms is not None
+                    ):
+                        last_word_end_ms = None
+                    source_end_ms = last_word_end_ms
+                    if source_end_ms is None and audio_processed_s > 0:
+                        source_end_ms = audio_processed_s * 1_000
+                    timing_basis = ASR_TIMING_BASIS_INCOMPLETE_WORD_OFFSETS
             elif audio_processed_s > 0:
                 source_end_ms = audio_processed_s * 1_000
+                timing_basis = ASR_TIMING_BASIS_AUDIO_PROCESSED_END_ONLY
 
             languages = tuple(
                 str(value)
@@ -464,7 +510,23 @@ def iter_transcript_results(
                 source_start_ms=source_start_ms,
                 source_end_ms=source_end_ms,
                 detected_languages=languages,
+                word_count=len(words),
+                first_word_start_ms=first_word_start_ms,
+                last_word_end_ms=last_word_end_ms,
+                timing_basis=timing_basis,
             )
+
+
+def _optional_nonnegative_finite(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(converted) or converted < 0:
+        return None
+    return converted
 
 
 def _new_executor() -> ThreadPoolExecutor:

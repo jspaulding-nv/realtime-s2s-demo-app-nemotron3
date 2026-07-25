@@ -9,7 +9,10 @@ import {
 } from '../utils/playbackPolicy';
 import type { AudioFrameObservation } from '../types/audioMetadata';
 
+const MAX_OUTPUT_TIMESTAMP_STALENESS_MS = 500;
+
 export interface PlaybackScheduleEvent {
+  playbackClockSessionId: number;
   timestampMs: number;
   schedulePerformanceMs: number;
   audioContextTimeAtScheduleSeconds: number;
@@ -27,6 +30,31 @@ export interface PlaybackScheduleEvent {
   aboveTarget: boolean;
   aboveLimit: boolean;
   audioFrame?: AudioFrameObservation;
+}
+
+export type PlaybackClockSampleBasis =
+  | 'get_output_timestamp'
+  | 'current_time_bracket';
+
+export type PlaybackClockSampleReason =
+  | 'session_started'
+  | 'queue_started'
+  | 'interval'
+  | 'queue_drained'
+  | 'session_stopped';
+
+export interface PlaybackClockSampleEvent {
+  playbackClockSessionId: number;
+  clockSampleSequence: number;
+  clockSampleReason: PlaybackClockSampleReason;
+  clockSamplePerformanceClientMs: number;
+  clockSamplePerformanceBeforeClientMs: number;
+  clockSamplePerformanceAfterClientMs: number;
+  clockSampleContextSeconds: number;
+  clockSampleOutputContextSeconds?: number;
+  clockSampleOutputPerformanceClientMs?: number;
+  clockSampleBasis: PlaybackClockSampleBasis;
+  clockSampleQueueEndContextSeconds: number;
 }
 
 export interface PlaybackMetrics {
@@ -47,6 +75,7 @@ interface UseAudioPlaybackOptions {
   adaptivePlayback?: boolean;
   playbackPolicy?: PlaybackPolicy;
   onSchedule?: (event: PlaybackScheduleEvent) => void;
+  onClockSample?: (event: PlaybackClockSampleEvent) => void;
 }
 
 interface UseAudioPlaybackReturn {
@@ -69,6 +98,7 @@ export function useAudioPlayback({
   adaptivePlayback = false,
   playbackPolicy = DEFAULT_PLAYBACK_POLICY,
   onSchedule,
+  onClockSample,
 }: UseAudioPlaybackOptions = {}): UseAudioPlaybackReturn {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMutedState] = useState(initialMuted);
@@ -87,15 +117,113 @@ export function useAudioPlayback({
   const limitExceededCountRef = useRef(0);
   const sessionGenerationRef = useRef(0);
   const projectedEndClientMsRef = useRef<number | null>(null);
+  const clockSampleTimerRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
+  const clockSampleSequenceRef = useRef(0);
+  const clockWasQueuedRef = useRef(false);
   const adaptivePlaybackRef = useRef(adaptivePlayback);
   const playbackPolicyRef = useRef(playbackPolicy);
   const onScheduleRef = useRef(onSchedule);
+  const onClockSampleRef = useRef(onClockSample);
 
   useEffect(() => {
     adaptivePlaybackRef.current = adaptivePlayback;
     playbackPolicyRef.current = playbackPolicy;
     onScheduleRef.current = onSchedule;
-  }, [adaptivePlayback, playbackPolicy, onSchedule]);
+    onClockSampleRef.current = onClockSample;
+  }, [adaptivePlayback, playbackPolicy, onSchedule, onClockSample]);
+
+  const emitClockSample = useCallback((
+    ctx: AudioContext,
+    reason: PlaybackClockSampleReason,
+  ) => {
+    if (!onClockSampleRef.current) return;
+
+    const performanceBeforeClientMs = performance.now();
+    const contextSeconds = ctx.currentTime;
+    let candidateOutputContextSeconds: number | undefined;
+    let candidateOutputPerformanceClientMs: number | undefined;
+
+    try {
+      if (typeof ctx.getOutputTimestamp === 'function') {
+        const outputTimestamp = ctx.getOutputTimestamp();
+        const outputContextTime = outputTimestamp.contextTime;
+        const outputPerformanceTime = outputTimestamp.performanceTime;
+        // Browsers may expose the method before the rendering clock is
+        // initialized and return an all-zero placeholder. Do not label that
+        // placeholder as stronger output-timestamp evidence.
+        if (
+          typeof outputContextTime === 'number'
+          && Number.isFinite(outputContextTime)
+          && outputContextTime > 0
+          && typeof outputPerformanceTime === 'number'
+          && Number.isFinite(outputPerformanceTime)
+          && outputPerformanceTime > 0
+        ) {
+          candidateOutputContextSeconds = outputContextTime;
+          candidateOutputPerformanceClientMs = outputPerformanceTime;
+        }
+      }
+    } catch {
+      // Preserve the currentTime/performance.now bracket as the portable
+      // fallback when getOutputTimestamp is unavailable or fails.
+    }
+
+    const performanceAfterClientMs = performance.now();
+    const outputTimestampIsCurrent = (
+      candidateOutputContextSeconds !== undefined
+      && candidateOutputPerformanceClientMs !== undefined
+      && candidateOutputContextSeconds <= contextSeconds
+      && (
+        contextSeconds - candidateOutputContextSeconds
+      ) * 1000 <= MAX_OUTPUT_TIMESTAMP_STALENESS_MS
+      && (
+        candidateOutputPerformanceClientMs
+        <= performanceAfterClientMs
+      )
+      && (
+        performanceAfterClientMs
+        - candidateOutputPerformanceClientMs
+      ) <= MAX_OUTPUT_TIMESTAMP_STALENESS_MS
+    );
+    const basis: PlaybackClockSampleBasis = outputTimestampIsCurrent
+      ? 'get_output_timestamp'
+      : 'current_time_bracket';
+
+    onClockSampleRef.current({
+      playbackClockSessionId: sessionGenerationRef.current,
+      clockSampleSequence: clockSampleSequenceRef.current,
+      clockSampleReason: reason,
+      clockSamplePerformanceClientMs: (
+        performanceBeforeClientMs
+        + (performanceAfterClientMs - performanceBeforeClientMs) / 2
+      ),
+      clockSamplePerformanceBeforeClientMs: performanceBeforeClientMs,
+      clockSamplePerformanceAfterClientMs: performanceAfterClientMs,
+      clockSampleContextSeconds: contextSeconds,
+      ...(basis === 'get_output_timestamp'
+        ? {
+            clockSampleOutputContextSeconds: (
+              candidateOutputContextSeconds
+            ),
+            clockSampleOutputPerformanceClientMs: (
+              candidateOutputPerformanceClientMs
+            ),
+          }
+        : {}),
+      clockSampleBasis: basis,
+      clockSampleQueueEndContextSeconds: nextStartTimeRef.current,
+    });
+    clockSampleSequenceRef.current += 1;
+  }, []);
+
+  const clearClockSampleTimer = useCallback(() => {
+    if (clockSampleTimerRef.current !== null) {
+      clearInterval(clockSampleTimerRef.current);
+      clockSampleTimerRef.current = null;
+    }
+  }, []);
 
   const start = useCallback(() => {
     console.log('AudioPlayback: starting');
@@ -126,12 +254,45 @@ export function useAudioPlayback({
     totalScheduledDurationRef.current = 0;
     limitExceededCountRef.current = 0;
     projectedEndClientMsRef.current = null;
+    clockSampleSequenceRef.current = 0;
+    clockWasQueuedRef.current = false;
     isActiveRef.current = true;
+    emitClockSample(audioContextRef.current, 'session_started');
+    clearClockSampleTimer();
+    if (onClockSampleRef.current) {
+      clockSampleTimerRef.current = setInterval(() => {
+        const ctx = audioContextRef.current;
+        if (!isActiveRef.current || !ctx) return;
+
+        const queueIsActive = nextStartTimeRef.current > ctx.currentTime;
+        if (queueIsActive) {
+          clockWasQueuedRef.current = true;
+          emitClockSample(ctx, 'interval');
+        } else if (clockWasQueuedRef.current) {
+          emitClockSample(ctx, 'queue_drained');
+          clockWasQueuedRef.current = false;
+        }
+      }, 200);
+    }
     setIsPlaying(true);
-  }, [sampleRate]);
+  }, [clearClockSampleTimer, emitClockSample, sampleRate]);
 
   const stop = useCallback(() => {
     console.log('AudioPlayback: stopping');
+    if (audioContextRef.current && isActiveRef.current) {
+      if (
+        clockWasQueuedRef.current
+        && nextStartTimeRef.current <= audioContextRef.current.currentTime
+      ) {
+        // Teardown can race the 200 ms sampler immediately after a true
+        // drain. Close that interval only when the AudioContext clock proves
+        // the scheduled endpoint has passed.
+        emitClockSample(audioContextRef.current, 'queue_drained');
+        clockWasQueuedRef.current = false;
+      }
+      emitClockSample(audioContextRef.current, 'session_stopped');
+    }
+    clearClockSampleTimer();
     isActiveRef.current = false;
     sessionGenerationRef.current += 1;
     projectedEndClientMsRef.current = null;
@@ -143,7 +304,7 @@ export function useAudioPlayback({
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
-  }, []);
+  }, [clearClockSampleTimer, emitClockSample]);
 
   const queueAudio = useCallback(
     (
@@ -204,6 +365,14 @@ export function useAudioPlayback({
         : selectPlaybackRate(0, policy);
       const scheduledDuration = bufferDuration / playbackRate;
       const scheduledEndTime = startTime + scheduledDuration;
+      const queueWasActive = nextStartTimeRef.current > currentTime;
+      if (!queueWasActive && clockWasQueuedRef.current) {
+        // The previous queue may have drained between interval ticks. Preserve
+        // its old endpoint before replacing nextStartTime with this buffer's
+        // schedule so every disjoint queued interval has an explicit close.
+        emitClockSample(ctx, 'queue_drained');
+        clockWasQueuedRef.current = false;
+      }
       const projectedScheduledStartClientMs = Math.max(
         schedulePerformanceMs,
         projectedEndClientMsRef.current ?? schedulePerformanceMs,
@@ -231,6 +400,10 @@ export function useAudioPlayback({
       source.start(startTime);
       nextStartTimeRef.current = scheduledEndTime;
       projectedEndClientMsRef.current = projectedScheduledEndClientMs;
+      if (!queueWasActive) {
+        clockWasQueuedRef.current = true;
+        emitClockSample(ctx, 'queue_started');
+      }
 
       peakQueueDepthRef.current = Math.max(
         peakQueueDepthRef.current,
@@ -246,6 +419,7 @@ export function useAudioPlayback({
       playbackModeRef.current = playbackMode;
 
       onScheduleRef.current?.({
+        playbackClockSessionId: sessionGenerationRef.current,
         timestampMs: schedulePerformanceMs,
         schedulePerformanceMs,
         audioContextTimeAtScheduleSeconds,
@@ -265,7 +439,7 @@ export function useAudioPlayback({
         ...(observation ? { audioFrame: observation } : {}),
       });
     },
-    [sampleRate]
+    [emitClockSample, sampleRate]
   );
 
   const setMuted = useCallback((muted: boolean) => {
@@ -299,6 +473,7 @@ export function useAudioPlayback({
   }, []);
 
   useEffect(() => () => {
+    clearClockSampleTimer();
     isActiveRef.current = false;
     sessionGenerationRef.current += 1;
     projectedEndClientMsRef.current = null;
@@ -306,7 +481,7 @@ export function useAudioPlayback({
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
-  }, []);
+  }, [clearClockSampleTimer]);
 
   return {
     isPlaying,

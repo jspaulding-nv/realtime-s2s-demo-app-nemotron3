@@ -37,8 +37,10 @@ GATE_EXIT_CODES = {
 }
 CSV_RECONCILIATION_TOLERANCE_MS = 0.01
 CSV_RECONCILIATION_TOLERANCE_SEC = 0.00001
-PLAYBACK_CLOCK_LINK_TOLERANCE_MS = 25.0
-PLAYBACK_CLOCK_OFFSET_SPAN_LIMIT_MS = 50.0
+PLAYBACK_CLOCK_INTERVAL_GUARD_MS = 32.0
+PLAYBACK_CLOCK_MAX_SAMPLE_GAP_MS = 500.0
+PLAYBACK_CLOCK_COVERAGE_TOLERANCE_MS = 25.0
+PLAYBACK_OUTPUT_TIMESTAMP_MAX_STALENESS_MS = 500.0
 EVENT_ID_PATTERN = re.compile(r"event-[0-9]{3}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -90,6 +92,17 @@ REQUIRED_CSV_COLUMNS = {
     "scheduled_end_context_sec",
     "projected_scheduled_start_client_ms",
     "source_end_to_projected_scheduled_start_ms",
+    "playback_clock_session_id",
+    "clock_sample_sequence",
+    "clock_sample_reason",
+    "clock_sample_performance_client_ms",
+    "clock_sample_performance_before_client_ms",
+    "clock_sample_performance_after_client_ms",
+    "clock_sample_context_sec",
+    "clock_sample_output_context_sec",
+    "clock_sample_output_performance_client_ms",
+    "clock_sample_basis",
+    "clock_sample_queue_end_context_sec",
 }
 RELEVANT_STAGES = {
     "chunk_sent",
@@ -123,6 +136,7 @@ class InputLedger:
 @dataclass(frozen=True)
 class Frame:
     generation: int
+    playback_clock_session_id: int
     parent_sequence_id: int
     audio_frame_id: int
     audio_bytes: int
@@ -204,8 +218,64 @@ class ParentComplete:
 
 @dataclass(frozen=True)
 class PlaybackClockEvidence:
+    session_id: int
+    sample_count: int
+    output_timestamp_sample_count: int
+    fallback_sample_count: int
+    maximum_sample_gap_ms: float
+    offset_lower_ms: float
+    offset_upper_ms: float
+    interval_guard_ms: float
     maximum_absolute_link_residual_ms: float
     offset_span_ms: float
+
+
+@dataclass(frozen=True)
+class PlaybackClockSample:
+    session_id: int
+    sequence: int
+    reason: str
+    performance_client_ms: float
+    performance_before_client_ms: float
+    performance_after_client_ms: float
+    context_sec: float
+    output_context_sec: float | None
+    output_performance_client_ms: float | None
+    basis: str
+    queue_end_context_sec: float
+    csv_line: int
+
+    @property
+    def fallback_offset_lower_ms(self) -> float:
+        return (
+            self.performance_before_client_ms
+            - self.context_sec * 1000.0
+        )
+
+    @property
+    def fallback_offset_upper_ms(self) -> float:
+        return (
+            self.performance_after_client_ms
+            - self.context_sec * 1000.0
+        )
+
+    @property
+    def output_offset_ms(self) -> float | None:
+        if self.basis != "get_output_timestamp":
+            return None
+        assert self.output_context_sec is not None
+        assert self.output_performance_client_ms is not None
+        return (
+            self.output_performance_client_ms
+            - self.output_context_sec * 1000.0
+        )
+
+
+@dataclass(frozen=True)
+class PlaybackClockCoverage:
+    maximum_sample_gap_ms: float
+    observed_offset_lower_ms: float
+    observed_offset_upper_ms: float
 
 
 def _sha256(data: bytes) -> str:
@@ -275,6 +345,18 @@ def _csv_float(
             f"{context} has invalid {key}"
         )
     return value
+
+
+def _csv_optional_float(
+    row: dict[str, str],
+    key: str,
+    context: str,
+    *,
+    minimum: float | None = None,
+) -> float | None:
+    if row.get(key, "") == "":
+        return None
+    return _csv_float(row, key, context, minimum=minimum)
 
 
 def _validate_exact_keys(
@@ -765,6 +847,370 @@ def _source_boundary_fields(
     return boundary
 
 
+def _parse_playback_clock_samples(
+    rows: list[dict[str, str]],
+) -> list[PlaybackClockSample]:
+    sample_rows = [
+        row
+        for row in rows
+        if (
+            row["source"] == "client"
+            and row["stage"] == "playback_clock_sample"
+        )
+    ]
+    if not sample_rows:
+        raise SemanticEventLatencyError(
+            "playback clock trace has no continuous clock samples"
+        )
+
+    allowed_reasons = {
+        "session_started",
+        "queue_started",
+        "interval",
+        "queue_drained",
+        "session_stopped",
+    }
+    allowed_bases = {
+        "get_output_timestamp",
+        "current_time_bracket",
+    }
+    samples: list[PlaybackClockSample] = []
+    for row in sample_rows:
+        context = _context(row)
+        reason = row["clock_sample_reason"]
+        if reason not in allowed_reasons:
+            raise SemanticEventLatencyError(
+                f"{context} has unsupported clock_sample_reason"
+            )
+        basis = row["clock_sample_basis"]
+        if basis not in allowed_bases:
+            raise SemanticEventLatencyError(
+                f"{context} has unsupported clock_sample_basis"
+            )
+        performance_before = _csv_float(
+            row,
+            "clock_sample_performance_before_client_ms",
+            context,
+            minimum=0,
+        )
+        performance_after = _csv_float(
+            row,
+            "clock_sample_performance_after_client_ms",
+            context,
+            minimum=0,
+        )
+        performance_client = _csv_float(
+            row,
+            "clock_sample_performance_client_ms",
+            context,
+            minimum=0,
+        )
+        if (
+            performance_after < performance_before
+            or performance_client < performance_before
+            or performance_client > performance_after
+        ):
+            raise SemanticEventLatencyError(
+                f"{context} has an invalid performance clock bracket"
+            )
+        output_context = _csv_optional_float(
+            row,
+            "clock_sample_output_context_sec",
+            context,
+            minimum=0,
+        )
+        output_performance = _csv_optional_float(
+            row,
+            "clock_sample_output_performance_client_ms",
+            context,
+            minimum=0,
+        )
+        context_seconds = _csv_float(
+            row,
+            "clock_sample_context_sec",
+            context,
+            minimum=0,
+        )
+        if basis == "get_output_timestamp":
+            if (
+                output_context is None
+                or output_context <= 0
+                or output_performance is None
+                or output_performance <= 0
+            ):
+                raise SemanticEventLatencyError(
+                    f"{context} lacks initialized output-timestamp evidence"
+                )
+            context_staleness_ms = (
+                context_seconds - output_context
+            ) * 1000.0
+            performance_staleness_ms = (
+                performance_after - output_performance
+            )
+            if (
+                context_staleness_ms
+                < -PLAYBACK_CLOCK_COVERAGE_TOLERANCE_MS
+                or performance_staleness_ms
+                < -PLAYBACK_CLOCK_COVERAGE_TOLERANCE_MS
+            ):
+                raise SemanticEventLatencyError(
+                    f"{context} contains a future output timestamp"
+                )
+            if (
+                context_staleness_ms
+                > PLAYBACK_OUTPUT_TIMESTAMP_MAX_STALENESS_MS
+                + CSV_RECONCILIATION_TOLERANCE_MS
+                or performance_staleness_ms
+                > PLAYBACK_OUTPUT_TIMESTAMP_MAX_STALENESS_MS
+                + CSV_RECONCILIATION_TOLERANCE_MS
+            ):
+                raise SemanticEventLatencyError(
+                    f"{context} contains a stale output timestamp"
+                )
+        elif output_context is not None or output_performance is not None:
+            raise SemanticEventLatencyError(
+                f"{context} mixes fallback and output-timestamp evidence"
+            )
+
+        sample = PlaybackClockSample(
+            session_id=_csv_int(
+                row,
+                "playback_clock_session_id",
+                context,
+                minimum=1,
+            ),
+            sequence=_csv_int(
+                row,
+                "clock_sample_sequence",
+                context,
+                minimum=0,
+            ),
+            reason=reason,
+            performance_client_ms=performance_client,
+            performance_before_client_ms=performance_before,
+            performance_after_client_ms=performance_after,
+            context_sec=context_seconds,
+            output_context_sec=output_context,
+            output_performance_client_ms=output_performance,
+            basis=basis,
+            queue_end_context_sec=_csv_float(
+                row,
+                "clock_sample_queue_end_context_sec",
+                context,
+                minimum=0,
+            ),
+            csv_line=int(row["_line_number"]),
+        )
+        samples.append(sample)
+
+    samples.sort(key=lambda sample: sample.sequence)
+    session_ids = {sample.session_id for sample in samples}
+    if len(session_ids) != 1:
+        raise SemanticEventLatencyError(
+            "playback clock trace contains multiple sessions"
+        )
+    if [sample.sequence for sample in samples] != list(range(len(samples))):
+        raise SemanticEventLatencyError(
+            "playback clock sample sequence is duplicated or fragmented"
+        )
+    if samples[0].reason != "session_started":
+        raise SemanticEventLatencyError(
+            "playback clock trace does not begin with session_started"
+        )
+
+    previous: PlaybackClockSample | None = None
+    previous_output_context = -math.inf
+    previous_output_performance = -math.inf
+    for sample in samples:
+        if previous is not None:
+            if (
+                sample.performance_before_client_ms
+                + CSV_RECONCILIATION_TOLERANCE_MS
+                < previous.performance_after_client_ms
+            ):
+                raise SemanticEventLatencyError(
+                    "playback clock performance brackets are not monotonic"
+                )
+            if (
+                sample.context_sec
+                + CSV_RECONCILIATION_TOLERANCE_SEC
+                < previous.context_sec
+            ):
+                raise SemanticEventLatencyError(
+                    "playback clock context samples are not monotonic"
+                )
+        if sample.basis == "get_output_timestamp":
+            assert sample.output_context_sec is not None
+            assert sample.output_performance_client_ms is not None
+            if (
+                sample.output_context_sec
+                + CSV_RECONCILIATION_TOLERANCE_SEC
+                < previous_output_context
+                or sample.output_performance_client_ms
+                + CSV_RECONCILIATION_TOLERANCE_MS
+                < previous_output_performance
+            ):
+                raise SemanticEventLatencyError(
+                    "playback output-timestamp samples are not monotonic"
+                )
+            previous_output_context = sample.output_context_sec
+            previous_output_performance = (
+                sample.output_performance_client_ms
+            )
+        previous = sample
+    return samples
+
+
+def _queued_context_intervals(
+    frames: Sequence[Frame],
+) -> list[tuple[float, float]]:
+    intervals: list[list[float]] = []
+    for frame in frames:
+        start = frame.scheduled_start_context_sec
+        end = frame.scheduled_end_context_sec
+        if (
+            not intervals
+            or frame.audio_context_time_at_schedule_sec
+            + CSV_RECONCILIATION_TOLERANCE_SEC
+            >= intervals[-1][1]
+        ):
+            intervals.append([start, end])
+        else:
+            intervals[-1][1] = max(intervals[-1][1], end)
+    return [(start, end) for start, end in intervals]
+
+
+def _validate_clock_sample_coverage(
+    samples: Sequence[PlaybackClockSample],
+    frames: Sequence[Frame],
+) -> PlaybackClockCoverage:
+    maximum_gap_ms = 0.0
+    tolerance_sec = PLAYBACK_CLOCK_COVERAGE_TOLERANCE_MS / 1000.0
+    maximum_gap_sec = PLAYBACK_CLOCK_MAX_SAMPLE_GAP_MS / 1000.0
+    intervals = _queued_context_intervals(frames)
+    starts = [
+        sample for sample in samples if sample.reason == "queue_started"
+    ]
+    drains = [
+        sample for sample in samples if sample.reason == "queue_drained"
+    ]
+    if len(starts) != len(intervals) or len(drains) != len(intervals):
+        raise SemanticEventLatencyError(
+            "playback clock queue-boundary count does not match scheduled "
+            "queued intervals"
+        )
+
+    offset_lowers: list[float] = []
+    offset_uppers: list[float] = []
+    previous_drain_sequence = -1
+    for interval_index, ((start, end), start_sample, drain_sample) in enumerate(
+        zip(intervals, starts, drains)
+    ):
+        if not (
+            start - tolerance_sec
+            <= start_sample.context_sec
+            <= start + tolerance_sec
+        ):
+            raise SemanticEventLatencyError(
+                "playback clock trace lacks one queue-start sample for "
+                f"queued interval {interval_index}"
+            )
+        if not (
+            start_sample.sequence > previous_drain_sequence
+            and drain_sample.sequence > start_sample.sequence
+        ):
+            raise SemanticEventLatencyError(
+                "playback clock queue boundaries are reused or out of order"
+            )
+        if not (
+            drain_sample.context_sec + tolerance_sec >= end
+            and drain_sample.context_sec <= end + maximum_gap_sec
+        ):
+            raise SemanticEventLatencyError(
+                "playback clock trace does not cover the final drain for "
+                f"queued interval {interval_index}"
+            )
+        interval_samples = [
+            sample
+            for sample in samples
+            if start_sample.sequence <= sample.sequence <= drain_sample.sequence
+        ]
+        if any(
+            sample.reason in {"queue_started", "queue_drained"}
+            for sample in interval_samples[1:-1]
+        ):
+            raise SemanticEventLatencyError(
+                "playback clock trace contains nested queue boundaries"
+            )
+        if (
+            drain_sample.queue_end_context_sec
+            > drain_sample.context_sec
+            + tolerance_sec
+        ):
+            raise SemanticEventLatencyError(
+                "queue-drain sample still reports queued playback"
+            )
+
+        for sample in interval_samples:
+            offset_lowers.append(sample.fallback_offset_lower_ms)
+            offset_uppers.append(sample.fallback_offset_upper_ms)
+            output_offset = sample.output_offset_ms
+            if output_offset is not None:
+                offset_lowers.append(output_offset)
+                offset_uppers.append(output_offset)
+
+        previous = interval_samples[0]
+        for sample in interval_samples[1:]:
+            performance_gap_ms = (
+                sample.performance_before_client_ms
+                - previous.performance_after_client_ms
+            )
+            context_gap_ms = (
+                sample.context_sec - previous.context_sec
+            ) * 1000.0
+            maximum_gap_ms = max(
+                maximum_gap_ms,
+                performance_gap_ms,
+                context_gap_ms,
+            )
+            if (
+                performance_gap_ms
+                > PLAYBACK_CLOCK_MAX_SAMPLE_GAP_MS
+                + CSV_RECONCILIATION_TOLERANCE_MS
+                or context_gap_ms
+                > PLAYBACK_CLOCK_MAX_SAMPLE_GAP_MS
+                + CSV_RECONCILIATION_TOLERANCE_MS
+            ):
+                raise SemanticEventLatencyError(
+                    "playback clock sampling gap exceeds the queued-coverage "
+                    "limit"
+                )
+            # Both browser clocks are monotonic. Between two samples, any
+            # unsampled offset must lie inside this cross-corner rectangle,
+            # even if the offset briefly changes and returns before the next
+            # timer callback.
+            offset_lowers.append(
+                previous.performance_before_client_ms
+                - sample.context_sec * 1000.0
+            )
+            offset_uppers.append(
+                sample.performance_after_client_ms
+                - previous.context_sec * 1000.0
+            )
+            previous = sample
+        previous_drain_sequence = drain_sample.sequence
+
+    if not offset_lowers or not offset_uppers:
+        raise SemanticEventLatencyError(
+            "playback clock trace has no queued mapping evidence"
+        )
+    return PlaybackClockCoverage(
+        maximum_sample_gap_ms=maximum_gap_ms,
+        observed_offset_lower_ms=min(offset_lowers),
+        observed_offset_upper_ms=max(offset_uppers),
+    )
+
+
 def _validate_protocol_trace(
     rows: list[dict[str, str]],
     ledger: InputLedger,
@@ -774,6 +1220,7 @@ def _validate_protocol_trace(
     dict[tuple[int, int], ParentComplete],
     PlaybackClockEvidence,
 ]:
+    clock_samples = _parse_playback_clock_samples(rows)
     client_rows = [
         row
         for row in rows
@@ -995,6 +1442,12 @@ def _validate_protocol_trace(
         )
         schedules[key] = Frame(
             generation=generation,
+            playback_clock_session_id=_csv_int(
+                row,
+                "playback_clock_session_id",
+                context,
+                minimum=1,
+            ),
             parent_sequence_id=parent_id,
             audio_frame_id=frame_id,
             audio_bytes=audio_bytes,
@@ -1259,13 +1712,6 @@ def _validate_protocol_trace(
                 "global projected start recurrence",
                 tolerance=CSV_RECONCILIATION_TOLERANCE_MS,
             )
-            _require_close(
-                frame.audio_context_wait_ms,
-                frame.projected_wait_ms,
-                f"frame {frame.key}",
-                "client/AudioContext playback-wait linkage",
-                tolerance=PLAYBACK_CLOCK_LINK_TOLERANCE_MS,
-            )
             clock_offsets_ms.append(frame.clock_offset_ms)
             absolute_clock_link_residuals_ms.append(
                 abs(frame.clock_link_residual_ms)
@@ -1290,21 +1736,54 @@ def _validate_protocol_trace(
 
     _reject_non_monotonic_parent_source_ranges(completions)
     _reject_unsupported_distinct_range_overlaps(completions)
-    clock_offset_span_ms = max(clock_offsets_ms) - min(clock_offsets_ms)
-    if (
-        clock_offset_span_ms
-        > PLAYBACK_CLOCK_OFFSET_SPAN_LIMIT_MS
-        + CSV_RECONCILIATION_TOLERANCE_MS
-    ):
+    clock_session_ids = {
+        frame.playback_clock_session_id for frame in ordered_frames
+    }
+    sample_session_id = clock_samples[0].session_id
+    if clock_session_ids != {sample_session_id}:
         raise SemanticEventLatencyError(
-            "protocol trace client/AudioContext clock offset span exceeds "
-            "the capture limit"
+            "playback schedules and clock samples use different sessions"
         )
+    clock_coverage = _validate_clock_sample_coverage(
+        clock_samples,
+        ordered_frames,
+    )
+    observed_offset_lower_ms = min(
+        clock_coverage.observed_offset_lower_ms,
+        *clock_offsets_ms,
+    )
+    observed_offset_upper_ms = max(
+        clock_coverage.observed_offset_upper_ms,
+        *clock_offsets_ms,
+    )
+    clock_offset_span_ms = (
+        observed_offset_upper_ms - observed_offset_lower_ms
+    )
     return (
         generation,
         schedules,
         completions,
         PlaybackClockEvidence(
+            session_id=sample_session_id,
+            sample_count=len(clock_samples),
+            output_timestamp_sample_count=sum(
+                sample.basis == "get_output_timestamp"
+                for sample in clock_samples
+            ),
+            fallback_sample_count=sum(
+                sample.basis == "current_time_bracket"
+                for sample in clock_samples
+            ),
+            maximum_sample_gap_ms=clock_coverage.maximum_sample_gap_ms,
+            offset_lower_ms=(
+                observed_offset_lower_ms
+                - PLAYBACK_CLOCK_INTERVAL_GUARD_MS
+            ),
+            offset_upper_ms=(
+                observed_offset_upper_ms
+                + PLAYBACK_CLOCK_INTERVAL_GUARD_MS
+            ),
+            interval_guard_ms=PLAYBACK_CLOCK_INTERVAL_GUARD_MS,
             maximum_absolute_link_residual_ms=max(
                 absolute_clock_link_residuals_ms
             ),
@@ -1509,11 +1988,19 @@ def analyze_semantic_event_latency(
         projected_end = max(
             frame.projected_end_client_ms for frame in candidate_frames
         )
+        scheduled_context_start = min(
+            frame.scheduled_start_context_sec for frame in candidate_frames
+        )
+        scheduled_context_end = max(
+            frame.scheduled_end_context_sec for frame in candidate_frames
+        )
         conservative_projected_start = (
-            projected_start - PLAYBACK_CLOCK_LINK_TOLERANCE_MS
+            scheduled_context_start * 1000.0
+            + playback_clock_evidence.offset_lower_ms
         )
         conservative_projected_end = (
-            projected_end + PLAYBACK_CLOCK_LINK_TOLERANCE_MS
+            scheduled_context_end * 1000.0
+            + playback_clock_evidence.offset_upper_ms
         )
         start_delay_ms = (
             conservative_projected_start - source_event_client_ms
@@ -1558,6 +2045,12 @@ def analyze_semantic_event_latency(
                 ),
                 "projected_first_frame_start_client_ms": projected_start,
                 "projected_final_frame_end_client_ms": projected_end,
+                "scheduled_first_frame_start_context_sec": (
+                    scheduled_context_start
+                ),
+                "scheduled_final_frame_end_context_sec": (
+                    scheduled_context_end
+                ),
                 "conservative_projected_first_frame_start_client_ms": (
                     conservative_projected_start
                 ),
@@ -1644,11 +2137,38 @@ def analyze_semantic_event_latency(
                 "output_sample_rate_hz": OUTPUT_SAMPLE_RATE_HZ,
                 "output_channels": 1,
                 "output_bytes_per_sample": OUTPUT_BYTES_PER_SAMPLE,
-                "playback_clock_link_tolerance_ms": (
-                    PLAYBACK_CLOCK_LINK_TOLERANCE_MS
+                "playback_clock_session_id": (
+                    playback_clock_evidence.session_id
                 ),
-                "playback_clock_offset_span_limit_ms": (
-                    PLAYBACK_CLOCK_OFFSET_SPAN_LIMIT_MS
+                "playback_clock_sample_count": (
+                    playback_clock_evidence.sample_count
+                ),
+                "playback_clock_output_timestamp_sample_count": (
+                    playback_clock_evidence.output_timestamp_sample_count
+                ),
+                "playback_clock_fallback_sample_count": (
+                    playback_clock_evidence.fallback_sample_count
+                ),
+                "playback_clock_maximum_sample_gap_ms": (
+                    playback_clock_evidence.maximum_sample_gap_ms
+                ),
+                "playback_clock_maximum_sample_gap_limit_ms": (
+                    PLAYBACK_CLOCK_MAX_SAMPLE_GAP_MS
+                ),
+                "playback_output_timestamp_max_staleness_ms": (
+                    PLAYBACK_OUTPUT_TIMESTAMP_MAX_STALENESS_MS
+                ),
+                "playback_clock_inter_sample_bound": (
+                    "monotonic_cross_corner_v1"
+                ),
+                "playback_clock_interval_guard_ms": (
+                    playback_clock_evidence.interval_guard_ms
+                ),
+                "playback_clock_guarded_offset_lower_ms": (
+                    playback_clock_evidence.offset_lower_ms
+                ),
+                "playback_clock_guarded_offset_upper_ms": (
+                    playback_clock_evidence.offset_upper_ms
                 ),
                 "playback_clock_maximum_absolute_link_residual_ms": (
                     playback_clock_evidence.maximum_absolute_link_residual_ms
@@ -1706,15 +2226,31 @@ def render_semantic_event_latency_markdown(
             f"{evidence['stream_generation']}"
         ),
         (
-            "- Playback clock-link residual / allowed: "
+            "- Playback clock-link residual (diagnostic): "
             f"{evidence['playback_clock_maximum_absolute_link_residual_ms']:.3f}"
-            " ms / "
-            f"{evidence['playback_clock_link_tolerance_ms']:.3f} ms"
+            " ms"
         ),
         (
-            "- Playback clock-offset span / allowed: "
-            f"{evidence['playback_clock_offset_span_ms']:.3f} ms / "
-            f"{evidence['playback_clock_offset_span_limit_ms']:.3f} ms"
+            "- Continuous playback-clock samples "
+            "(output timestamp / fallback): "
+            f"{evidence['playback_clock_sample_count']} "
+            f"({evidence['playback_clock_output_timestamp_sample_count']} / "
+            f"{evidence['playback_clock_fallback_sample_count']})"
+        ),
+        (
+            "- Maximum queued clock-sample gap / allowed: "
+            f"{evidence['playback_clock_maximum_sample_gap_ms']:.3f} ms / "
+            f"{evidence['playback_clock_maximum_sample_gap_limit_ms']:.3f} ms"
+        ),
+        (
+            "- Observed clock-offset span / guarded interval: "
+            f"{evidence['playback_clock_offset_span_ms']:.3f} ms / ["
+            f"{evidence['playback_clock_guarded_offset_lower_ms']:.3f}, "
+            f"{evidence['playback_clock_guarded_offset_upper_ms']:.3f}] ms"
+        ),
+        (
+            "- Capture-wide clock interval guard: "
+            f"{evidence['playback_clock_interval_guard_ms']:.3f} ms"
         ),
         (
             "- Semantic source marker reviewed: "

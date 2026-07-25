@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { createHash } from 'node:crypto';
 import { useFileAudioSource } from '../hooks/useFileAudioSource';
+import { pcm16LeBytes, pcm16MonoWave } from './wavTestFixtures';
 
 // Mock AudioBuffer that works in jsdom
 class MockAudioBuffer {
@@ -35,6 +36,17 @@ function createMockFile(name: string): File {
     (file as unknown as Record<string, unknown>).arrayBuffer = () =>
       Promise.resolve(new ArrayBuffer(100));
   }
+  return file;
+}
+
+function createByteFile(
+  name: string,
+  bytes: Uint8Array<ArrayBuffer>,
+): File {
+  const file = new File([bytes], name, { type: 'audio/wav' });
+  Object.defineProperty(file, 'arrayBuffer', {
+    value: vi.fn(async () => Uint8Array.from(bytes).buffer),
+  });
   return file;
 }
 
@@ -249,6 +261,129 @@ describe('useFileAudioSource', () => {
     expect(
       new Set(observations.map((item) => item.inputPcmSampleCount)),
     ).toEqual(new Set([19200]));
+  });
+
+  it('passes matching PCM WAV bytes through exactly and pads only the wire tail', async () => {
+    const samples = [0x1234, -2, -32768, 32767, 1];
+    const sourceBytes = pcm16LeBytes(samples);
+    const file = createByteFile(
+      'exact-16khz-mono-pcm16.wav',
+      pcm16MonoWave(samples),
+    );
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+
+    await act(async () => {
+      await result.current.loadFile(file);
+    });
+
+    expect(result.current.isLoaded).toBe(true);
+    expect(result.current.duration).toBe(samples.length / 16000);
+    expect(OfflineAudioContext).not.toHaveBeenCalled();
+    expect(file.arrayBuffer).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(300));
+
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    const transmitted = new Uint8Array(
+      onChunk.mock.calls[0][0] as ArrayBuffer,
+    );
+    const expected = new Uint8Array(4800 * Int16Array.BYTES_PER_ELEMENT);
+    expected.set(sourceBytes);
+    const expectedDigest = createHash('sha256')
+      .update(expected)
+      .digest('hex');
+
+    expect(expectedDigest).toBe(
+      '181ebc7fcdf1139c9430d4145f841689acadd310a196570510ec493eec2a8ac5',
+    );
+    expect(Array.from(transmitted.slice(0, sourceBytes.byteLength))).toEqual(
+      Array.from(sourceBytes),
+    );
+    expect(
+      transmitted.slice(sourceBytes.byteLength).every((value) => value === 0),
+    ).toBe(true);
+    expect(onChunk.mock.calls[0][1]).toMatchObject({
+      inputPcmSampleCount: 4800,
+      inputPcmSha256: expectedDigest,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+    });
+  });
+
+  it('reconstructs a multi-frame exact WAV without changing any source byte', async () => {
+    const samples = Array.from(
+      { length: 4803 },
+      (_, index) => ((index * 97) % 65536) - 32768,
+    );
+    const sourceBytes = pcm16LeBytes(samples);
+    const file = createByteFile(
+      'multi-frame-exact.wav',
+      pcm16MonoWave(samples),
+    );
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+
+    await act(async () => {
+      await result.current.loadFile(file);
+    });
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(600));
+
+    expect(onChunk).toHaveBeenCalledTimes(2);
+    const transmitted = new Uint8Array(9600 * 2);
+    transmitted.set(
+      new Uint8Array(onChunk.mock.calls[0][0] as ArrayBuffer),
+      0,
+    );
+    transmitted.set(
+      new Uint8Array(onChunk.mock.calls[1][0] as ArrayBuffer),
+      4800 * 2,
+    );
+    const expectedDigest = createHash('sha256')
+      .update(transmitted)
+      .digest('hex');
+
+    expect(Array.from(transmitted.slice(0, sourceBytes.length))).toEqual(
+      Array.from(sourceBytes),
+    );
+    expect(
+      transmitted.slice(sourceBytes.length).every((value) => value === 0),
+    ).toBe(true);
+    expect(
+      new Set(onChunk.mock.calls.map((call) => call[1].inputPcmSha256)),
+    ).toEqual(new Set([expectedDigest]));
+    expect(
+      onChunk.mock.calls.map((call) => call[1].sourceSampleStart),
+    ).toEqual([0, 4800]);
+    expect(
+      onChunk.mock.calls.map((call) => call[1].sourceSampleEndExclusive),
+    ).toEqual([4800, 9600]);
+  });
+
+  it('falls back to WebAudio for a malformed WAV instead of passing bytes through', async () => {
+    const malformed = createByteFile(
+      'malformed.wav',
+      Uint8Array.of(
+        0x52, 0x49, 0x46, 0x46,
+        0xff, 0xff, 0xff, 0x7f,
+        0x57, 0x41, 0x56, 0x45,
+      ),
+    );
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+
+    await act(async () => {
+      await result.current.loadFile(malformed);
+    });
+
+    expect(result.current.isLoaded).toBe(true);
+    expect(OfflineAudioContext).toHaveBeenCalledTimes(2);
+    expect(malformed.arrayBuffer).toHaveBeenCalledTimes(2);
   });
 
   it('hashes the exact transmitted PCM without Web Crypto on plain HTTP', async () => {

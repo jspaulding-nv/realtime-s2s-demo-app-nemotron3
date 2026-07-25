@@ -12,6 +12,7 @@ let mockGainNode: {
 
 let mockCtxCurrentTime: number;
 let mockCtxState: string;
+let mockGetOutputTimestamp: ReturnType<typeof vi.fn>;
 
 // Track created sources so tests can fire onended
 let createdSources: Array<{
@@ -26,6 +27,10 @@ function setupMockAudioContext() {
   mockCtxCurrentTime = 0;
   mockCtxState = 'running';
   createdSources = [];
+  mockGetOutputTimestamp = vi.fn(() => ({
+    contextTime: 0,
+    performanceTime: 0,
+  }));
 
   mockGainNode = {
     gain: { value: 1 },
@@ -41,6 +46,7 @@ function setupMockAudioContext() {
     },
     resume: vi.fn(),
     close: vi.fn(),
+    getOutputTimestamp: mockGetOutputTimestamp,
     destination: { type: 'destination' },
     sampleRate: 16000,
     createGain: vi.fn(() => mockGainNode),
@@ -74,6 +80,7 @@ describe('useAudioPlayback', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -134,6 +141,314 @@ describe('useAudioPlayback', () => {
 
     act(() => result.current.stop());
     expect(result.current.isPlaying).toBe(false);
+  });
+
+  it('samples the paired browser clocks through queue drain', () => {
+    vi.useFakeTimers();
+    const onClockSample = vi.fn();
+    const { result } = renderHook(() => useAudioPlayback({
+      onClockSample,
+    }));
+
+    act(() => result.current.start());
+    act(() => (
+      result.current.queueAudio(new Int16Array(16000).buffer)
+    ));
+    act(() => vi.advanceTimersByTime(400));
+    mockCtxCurrentTime = 0.75;
+    act(() => vi.advanceTimersByTime(200));
+    mockCtxCurrentTime = 1;
+    act(() => vi.advanceTimersByTime(200));
+
+    const beforeIdleWait = onClockSample.mock.calls.length;
+    act(() => vi.advanceTimersByTime(400));
+    expect(onClockSample).toHaveBeenCalledTimes(beforeIdleWait);
+
+    act(() => result.current.stop());
+    const afterStop = onClockSample.mock.calls.length;
+    act(() => vi.advanceTimersByTime(400));
+    expect(onClockSample).toHaveBeenCalledTimes(afterStop);
+    const samples = onClockSample.mock.calls.map(([sample]) => sample);
+    expect(samples.map((sample) => sample.clockSampleReason)).toEqual([
+      'session_started',
+      'queue_started',
+      'interval',
+      'interval',
+      'interval',
+      'queue_drained',
+      'session_stopped',
+    ]);
+    expect(samples.map((sample) => sample.clockSampleSequence)).toEqual(
+      [0, 1, 2, 3, 4, 5, 6],
+    );
+    expect(samples.every((sample) => (
+      sample.playbackClockSessionId === 1
+    ))).toBe(true);
+    expect(samples[1].clockSampleQueueEndContextSeconds).toBe(1);
+    expect(samples[5].clockSampleContextSeconds).toBe(1);
+    expect(samples[5].clockSampleQueueEndContextSeconds).toBe(1);
+    for (let index = 1; index < samples.length; index += 1) {
+      expect(
+        samples[index].clockSamplePerformanceClientMs,
+      ).toBeGreaterThanOrEqual(
+        samples[index - 1].clockSamplePerformanceClientMs,
+      );
+    }
+  });
+
+  it('uses initialized output timestamps and brackets zero placeholders', () => {
+    vi.useFakeTimers();
+    const onClockSample = vi.fn();
+    const onSchedule = vi.fn();
+    const { result } = renderHook(() => useAudioPlayback({
+      onClockSample,
+      onSchedule,
+    }));
+
+    act(() => vi.advanceTimersByTime(1250));
+    act(() => result.current.start());
+    expect(onClockSample.mock.calls[0][0]).toMatchObject({
+      clockSampleBasis: 'current_time_bracket',
+      clockSampleContextSeconds: 0,
+    });
+    expect(
+      onClockSample.mock.calls[0][0].clockSampleOutputContextSeconds,
+    ).toBeUndefined();
+
+    mockCtxCurrentTime = 0.5;
+    mockGetOutputTimestamp.mockReturnValue({
+      contextTime: 0.48,
+      performanceTime: 1234.1,
+    });
+    act(() => (
+      result.current.queueAudio(new Int16Array(1600).buffer)
+    ));
+
+    const queueStarted = onClockSample.mock.calls
+      .map(([sample]) => sample)
+      .find((sample) => sample.clockSampleReason === 'queue_started');
+    expect(queueStarted).toMatchObject({
+      playbackClockSessionId: 1,
+      clockSampleBasis: 'get_output_timestamp',
+      clockSampleContextSeconds: 0.5,
+      clockSampleOutputContextSeconds: 0.48,
+      clockSampleOutputPerformanceClientMs: 1234.1,
+      clockSampleQueueEndContextSeconds: 0.6,
+    });
+    expect(
+      queueStarted.clockSamplePerformanceBeforeClientMs,
+    ).toBeLessThanOrEqual(
+      queueStarted.clockSamplePerformanceClientMs,
+    );
+    expect(
+      queueStarted.clockSamplePerformanceClientMs,
+    ).toBeLessThanOrEqual(
+      queueStarted.clockSamplePerformanceAfterClientMs,
+    );
+    expect(onSchedule.mock.calls[0][0].playbackClockSessionId).toBe(
+      queueStarted.playbackClockSessionId,
+    );
+  });
+
+  it.each([
+    {
+      label: 'AudioContext clock is stale',
+      outputContextSeconds: 0.49,
+      outputPerformanceClientMs: 990,
+    },
+    {
+      label: 'performance clock is stale',
+      outputContextSeconds: 0.99,
+      outputPerformanceClientMs: 489,
+    },
+  ])(
+    'falls back when a frozen output timestamp $label',
+    ({
+      outputContextSeconds,
+      outputPerformanceClientMs,
+    }) => {
+      vi.useFakeTimers();
+      act(() => vi.advanceTimersByTime(1000));
+      const onClockSample = vi.fn();
+      const { result } = renderHook(() => useAudioPlayback({
+        onClockSample,
+      }));
+
+      act(() => result.current.start());
+      mockCtxCurrentTime = 1;
+      mockGetOutputTimestamp.mockReturnValue({
+        contextTime: outputContextSeconds,
+        performanceTime: outputPerformanceClientMs,
+      });
+      act(() => (
+        result.current.queueAudio(new Int16Array(1600).buffer)
+      ));
+
+      const queueStarted = onClockSample.mock.calls
+        .map(([sample]) => sample)
+        .find((sample) => sample.clockSampleReason === 'queue_started');
+      expect(queueStarted).toMatchObject({
+        clockSampleBasis: 'current_time_bracket',
+        clockSampleContextSeconds: 1,
+      });
+      expect(
+        queueStarted.clockSampleOutputContextSeconds,
+      ).toBeUndefined();
+      expect(
+        queueStarted.clockSampleOutputPerformanceClientMs,
+      ).toBeUndefined();
+    },
+  );
+
+  it.each([
+    {
+      label: 'AudioContext clock is in the future',
+      outputContextSeconds: 1.001,
+      outputPerformanceClientMs: 990,
+    },
+    {
+      label: 'performance clock is in the future',
+      outputContextSeconds: 0.99,
+      outputPerformanceClientMs: 1000.1,
+    },
+  ])(
+    'falls back when an output timestamp $label',
+    ({
+      outputContextSeconds,
+      outputPerformanceClientMs,
+    }) => {
+      vi.useFakeTimers();
+      act(() => vi.advanceTimersByTime(1000));
+      const onClockSample = vi.fn();
+      const { result } = renderHook(() => useAudioPlayback({
+        onClockSample,
+      }));
+
+      act(() => result.current.start());
+      mockCtxCurrentTime = 1;
+      mockGetOutputTimestamp.mockReturnValue({
+        contextTime: outputContextSeconds,
+        performanceTime: outputPerformanceClientMs,
+      });
+      act(() => (
+        result.current.queueAudio(new Int16Array(1600).buffer)
+      ));
+
+      const queueStarted = onClockSample.mock.calls
+        .map(([sample]) => sample)
+        .find((sample) => sample.clockSampleReason === 'queue_started');
+      expect(queueStarted.clockSampleBasis).toBe('current_time_bracket');
+      expect(
+        queueStarted.clockSampleOutputContextSeconds,
+      ).toBeUndefined();
+      expect(
+        queueStarted.clockSampleOutputPerformanceClientMs,
+      ).toBeUndefined();
+    },
+  );
+
+  it('closes a drained queue before a new buffer replaces its endpoint', () => {
+    vi.useFakeTimers();
+    const onClockSample = vi.fn();
+    const { result } = renderHook(() => useAudioPlayback({
+      onClockSample,
+    }));
+
+    act(() => result.current.start());
+    act(() => (
+      result.current.queueAudio(new Int16Array(1600).buffer)
+    ));
+    mockCtxCurrentTime = 0.11;
+    // Do not advance the 200 ms timer: the arriving buffer must detect and
+    // close the old queue interval itself.
+    act(() => (
+      result.current.queueAudio(new Int16Array(1600).buffer)
+    ));
+
+    const transitions = onClockSample.mock.calls
+      .map(([sample]) => sample)
+      .filter((sample) => (
+        sample.clockSampleReason === 'queue_started'
+        || sample.clockSampleReason === 'queue_drained'
+      ));
+    expect(transitions.map((sample) => sample.clockSampleReason)).toEqual([
+      'queue_started',
+      'queue_drained',
+      'queue_started',
+    ]);
+    expect(
+      transitions[0].clockSampleQueueEndContextSeconds,
+    ).toBeCloseTo(0.1);
+    expect(
+      transitions[1].clockSampleQueueEndContextSeconds,
+    ).toBeCloseTo(0.1);
+    expect(
+      transitions[2].clockSampleQueueEndContextSeconds,
+    ).toBeCloseTo(0.21);
+    expect(transitions[1].clockSampleContextSeconds).toBe(0.11);
+    expect(transitions[2].clockSampleContextSeconds).toBe(0.11);
+  });
+
+  it('records a proven drain when stop wins the interval-timer race', () => {
+    vi.useFakeTimers();
+    const onClockSample = vi.fn();
+    const { result } = renderHook(() => useAudioPlayback({
+      onClockSample,
+    }));
+
+    act(() => result.current.start());
+    act(() => (
+      result.current.queueAudio(new Int16Array(1600).buffer)
+    ));
+    mockCtxCurrentTime = 0.1;
+    act(() => result.current.stop());
+
+    expect(onClockSample.mock.calls.map(([sample]) => (
+      sample.clockSampleReason
+    ))).toEqual([
+      'session_started',
+      'queue_started',
+      'queue_drained',
+      'session_stopped',
+    ]);
+  });
+
+  it('separates clock evidence across playback restarts', () => {
+    vi.useFakeTimers();
+    const onClockSample = vi.fn();
+    const onSchedule = vi.fn();
+    const { result } = renderHook(() => useAudioPlayback({
+      onClockSample,
+      onSchedule,
+    }));
+
+    act(() => result.current.start());
+    act(() => (
+      result.current.queueAudio(new Int16Array(1600).buffer)
+    ));
+    act(() => result.current.stop());
+    mockCtxCurrentTime = 0.25;
+    act(() => result.current.start());
+    act(() => (
+      result.current.queueAudio(new Int16Array(1600).buffer)
+    ));
+
+    expect(onSchedule.mock.calls.map(([event]) => (
+      event.playbackClockSessionId
+    ))).toEqual([1, 3]);
+    const sessionStarts = onClockSample.mock.calls
+      .map(([sample]) => sample)
+      .filter((sample) => sample.clockSampleReason === 'session_started');
+    expect(sessionStarts).toMatchObject([
+      {
+        playbackClockSessionId: 1,
+        clockSampleSequence: 0,
+      },
+      {
+        playbackClockSessionId: 3,
+        clockSampleSequence: 0,
+      },
+    ]);
   });
 
   it('start() resets playbackPosition to 0', () => {
