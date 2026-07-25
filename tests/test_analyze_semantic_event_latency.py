@@ -77,20 +77,22 @@ def _protocol_row(
     schedule_time="",
     projected_start="",
     duration="",
+    audio_context_time=1.0,
+    scheduled_start_context="",
 ):
     source_boundary = 10000 + float(source_end)
     has_receipt = receipt != ""
     has_completion = complete_receipt != ""
     has_schedule = schedule_time != ""
-    audio_context_time = 1.0
     playback_rate = 1.0
     media_duration = float(duration) if has_schedule else ""
-    scheduled_start_context = (
-        audio_context_time
-        + (float(projected_start) - float(schedule_time)) / 1000.0
-        if has_schedule
-        else ""
-    )
+    if has_schedule and scheduled_start_context == "":
+        scheduled_start_context = (
+            float(audio_context_time)
+            + (float(projected_start) - float(schedule_time)) / 1000.0
+        )
+    elif not has_schedule:
+        scheduled_start_context = ""
     scheduled_end_context = (
         scheduled_start_context + float(duration)
         if has_schedule
@@ -171,9 +173,16 @@ def _base_rows():
             input_ledger_valid="true",
         ),
     ]
-    for frame, receipt, schedule_time, projected_start in (
-        (0, 12000, 12010, 13000),
-        (1, 12100, 12110, 13100),
+    for (
+        frame,
+        receipt,
+        schedule_time,
+        projected_start,
+        audio_context_time,
+        scheduled_start_context,
+    ) in (
+        (0, 12000, 13000, 13000, 1.0, 1.0),
+        (1, 13010, 13020, 13100, 1.02, 1.1),
     ):
         rows.append(
             _protocol_row(
@@ -198,6 +207,8 @@ def _base_rows():
                 schedule_time=schedule_time,
                 projected_start=projected_start,
                 duration="0.100000",
+                audio_context_time=audio_context_time,
+                scheduled_start_context=scheduled_start_context,
             )
         )
     rows.append(
@@ -208,7 +219,7 @@ def _base_rows():
             audio_bytes=6400,
             source_start=0,
             source_end=900,
-            complete_receipt=12200,
+            complete_receipt=13120,
         )
     )
     rows.extend(
@@ -230,9 +241,11 @@ def _base_rows():
                 source_start=1000,
                 source_end=1900,
                 receipt=14000,
-                schedule_time=14010,
+                schedule_time=15000,
                 projected_start=15000,
                 duration="0.200000",
+                audio_context_time=3.0,
+                scheduled_start_context=3.0,
             ),
             _protocol_row(
                 "audio_parent_complete",
@@ -241,7 +254,7 @@ def _base_rows():
                 audio_bytes=6400,
                 source_start=1000,
                 source_end=1900,
-                complete_receipt=14100,
+                complete_receipt=15100,
             ),
         ]
     )
@@ -288,6 +301,30 @@ def _write_case(tmp_path, *, rows=None, markers=None):
     return csv_path, marker_path
 
 
+def _set_parent_source_range(rows, parent, source_start, source_end):
+    source_boundary = 10000 + float(source_end)
+    for row in rows:
+        if row["parent_sequence_id"] != str(parent):
+            continue
+        row["source_start_ms"] = str(source_start)
+        row["source_end_ms"] = str(source_end)
+        row["source_end_boundary_client_ms"] = str(source_boundary)
+        if row["binary_receipt_client_ms"]:
+            row["source_end_to_binary_receipt_ms"] = str(
+                float(row["binary_receipt_client_ms"]) - source_boundary
+            )
+        if row["parent_complete_received_client_ms"]:
+            row["source_end_to_parent_complete_ms"] = str(
+                float(row["parent_complete_received_client_ms"])
+                - source_boundary
+            )
+        if row["projected_scheduled_start_client_ms"]:
+            row["source_end_to_projected_scheduled_start_ms"] = str(
+                float(row["projected_scheduled_start_client_ms"])
+                - source_boundary
+            )
+
+
 def _rewrite_markers(marker_path, mutate):
     document = json.loads(marker_path.read_text(encoding="utf-8"))
     mutate(document)
@@ -320,6 +357,17 @@ def test_valid_capture_calculates_conservative_bounds_and_claim_scope(
     assert analysis["evidence"]["source_pcm_sha256"] == SOURCE_PCM_SHA256
     assert analysis["evidence"]["source_pcm_sample_count"] == 2000
     assert analysis["evidence"]["source_pcm_binding_verified"] is True
+    assert analysis["evidence"]["playback_clock_link_tolerance_ms"] == 25
+    assert (
+        analysis["evidence"]["playback_clock_offset_span_limit_ms"] == 50
+    )
+    assert (
+        analysis["evidence"][
+            "playback_clock_maximum_absolute_link_residual_ms"
+        ]
+        == 0
+    )
+    assert analysis["evidence"]["playback_clock_offset_span_ms"] == 0
     assert analysis["claim_scope"] == {
         "semantic_source_marker_reviewed": True,
         "source_pcm_binding_verified": True,
@@ -352,16 +400,24 @@ def test_valid_capture_calculates_conservative_bounds_and_claim_scope(
     assert event["candidate_parent_sequence_ids"] == [0]
     assert event["candidate_frame_count"] == 2
     assert event["first_candidate_frame_receipt_client_ms"] == 12000
-    assert event["last_candidate_frame_receipt_client_ms"] == 12100
-    assert event["parent_complete_receipt_bound_client_ms"] == 12200
+    assert event["last_candidate_frame_receipt_client_ms"] == 13010
+    assert event["parent_complete_receipt_bound_client_ms"] == 13120
     assert event["projected_first_frame_start_client_ms"] == 13000
     assert event["projected_final_frame_end_client_ms"] == 13200
+    assert (
+        event["conservative_projected_first_frame_start_client_ms"]
+        == 12975
+    )
+    assert (
+        event["conservative_projected_final_frame_end_client_ms"]
+        == 13225
+    )
     assert event["latency_bounds_ms"] == {
         "first_candidate_frame_receipt": 1200,
-        "last_candidate_frame_receipt": 1300,
-        "parent_complete_receipt": 1400,
-        "projected_first_frame_start": 2200,
-        "projected_final_frame_end": 2400,
+        "last_candidate_frame_receipt": 2210,
+        "parent_complete_receipt": 2320,
+        "conservative_projected_first_frame_start": 2175,
+        "conservative_projected_final_frame_end": 2425,
     }
 
 
@@ -460,9 +516,129 @@ def test_identical_source_range_siblings_use_union_conservatively(tmp_path):
     assert event["candidate_frame_count"] == 3
     assert event["first_candidate_frame_receipt_client_ms"] == 12000
     assert event["last_candidate_frame_receipt_client_ms"] == 14000
-    assert event["parent_complete_receipt_bound_client_ms"] == 14100
+    assert event["parent_complete_receipt_bound_client_ms"] == 15100
     assert event["projected_first_frame_start_client_ms"] == 13000
     assert event["projected_final_frame_end_client_ms"] == 15200
+
+
+@pytest.mark.parametrize("include_second_suffix", [False, True])
+def test_same_end_suffix_pair_or_chain_allows_outer_only_marker(
+    tmp_path,
+    include_second_suffix,
+):
+    rows = _base_rows()
+    _set_parent_source_range(rows, 1, 700, 900)
+    if include_second_suffix:
+        rows.extend(
+            [
+                _protocol_row(
+                    "audio_received",
+                    parent=2,
+                    frame=0,
+                    audio_bytes=3200,
+                    source_start=800,
+                    source_end=900,
+                    receipt=15500,
+                ),
+                _protocol_row(
+                    "playback_chunk_scheduled",
+                    parent=2,
+                    frame=0,
+                    audio_bytes=3200,
+                    source_start=800,
+                    source_end=900,
+                    receipt=15500,
+                    schedule_time=16000,
+                    projected_start=16000,
+                    duration="0.100000",
+                    audio_context_time=4.0,
+                    scheduled_start_context=4.0,
+                ),
+                _protocol_row(
+                    "audio_parent_complete",
+                    parent=2,
+                    frame_count=1,
+                    audio_bytes=3200,
+                    source_start=800,
+                    source_end=900,
+                    complete_receipt=16100,
+                ),
+            ]
+        )
+    csv_path, marker_path = _write_case(
+        tmp_path,
+        rows=rows,
+        markers=_markers(("event-001", 100, 2)),
+    )
+
+    analysis = analyze_semantic_event_latency(csv_path, marker_path, 5)
+
+    assert analysis["events"][0]["candidate_parent_sequence_ids"] == [0]
+
+
+def test_marker_in_same_end_suffix_overlap_fails_closed(tmp_path):
+    rows = _base_rows()
+    _set_parent_source_range(rows, 1, 700, 900)
+    csv_path, marker_path = _write_case(
+        tmp_path,
+        rows=rows,
+        markers=_markers(("event-001", 800, 2)),
+    )
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="resolves to distinct source ranges",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 5)
+
+
+@pytest.mark.parametrize(
+    ("source_start", "source_end", "message"),
+    [
+        (700, 1200, "overlapping distinct source ranges"),
+        (700, 900.001, "overlapping distinct source ranges"),
+        (700, 800, "source ranges move backward"),
+        (0, 1200, "overlapping distinct source ranges"),
+    ],
+    ids=[
+        "crossing",
+        "nonidentical-end",
+        "different-end-nesting",
+        "later-range-contains-earlier",
+    ],
+)
+def test_unsupported_distinct_source_range_overlaps_fail_closed(
+    tmp_path,
+    source_start,
+    source_end,
+    message,
+):
+    rows = _base_rows()
+    _set_parent_source_range(rows, 1, source_start, source_end)
+    csv_path, marker_path = _write_case(
+        tmp_path,
+        rows=rows,
+        markers=_markers(("event-001", 100, 2)),
+    )
+
+    with pytest.raises(SemanticEventLatencyError, match=message):
+        analyze_semantic_event_latency(csv_path, marker_path, 5)
+
+
+def test_marker_on_inclusive_touching_range_boundary_is_ambiguous(tmp_path):
+    rows = _base_rows()
+    _set_parent_source_range(rows, 1, 900, 1900)
+    csv_path, marker_path = _write_case(
+        tmp_path,
+        rows=rows,
+        markers=_markers(("event-001", 900, 2)),
+    )
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="resolves to distinct source ranges",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 5)
 
 
 def test_hash_mismatch_fails_closed(tmp_path):
@@ -526,7 +702,7 @@ def test_output_cannot_precede_its_attributed_source_boundary(tmp_path):
         analyze_semantic_event_latency(csv_path, marker_path, 3)
 
 
-def test_projected_start_must_reconcile_with_audio_context_clock(tmp_path):
+def test_first_projected_start_must_equal_its_schedule_clock(tmp_path):
     rows = _base_rows()
     for row in rows:
         if (
@@ -534,14 +710,183 @@ def test_projected_start_must_reconcile_with_audio_context_clock(tmp_path):
             and row["parent_sequence_id"] == "0"
             and row["audio_frame_id"] == "0"
         ):
-            row["projected_scheduled_start_client_ms"] = "12020"
-            row["source_end_to_projected_scheduled_start_ms"] = "1120"
+            row["projected_scheduled_start_client_ms"] = "13020"
+            row["source_end_to_projected_scheduled_start_ms"] = "2120"
             break
     csv_path, marker_path = _write_case(tmp_path, rows=rows)
 
     with pytest.raises(
         SemanticEventLatencyError,
-        match="inconsistent projected scheduled start",
+        match="global projected start recurrence",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_global_projection_accepts_quantized_clocks_and_true_gap(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_chunk_scheduled"
+            and row["parent_sequence_id"] == "0"
+            and row["audio_frame_id"] == "1"
+        ):
+            row["scheduled_start_context_sec"] = "1.100009"
+            row["scheduled_end_context_sec"] = "1.200009"
+            row["projected_scheduled_start_client_ms"] = "13100.009"
+            row["source_end_to_projected_scheduled_start_ms"] = "2200.009"
+            break
+    csv_path, marker_path = _write_case(
+        tmp_path,
+        rows=rows,
+        markers=_markers(
+            ("event-001", 800, 2),
+            ("event-002", 1500, 2),
+        ),
+    )
+
+    analysis = analyze_semantic_event_latency(csv_path, marker_path, 5)
+
+    assert analysis["summary"]["overall_status"] == "pass"
+    assert analysis["events"][0][
+        "projected_final_frame_end_client_ms"
+    ] == 13200.009
+    assert analysis["events"][1][
+        "projected_first_frame_start_client_ms"
+    ] == 15000
+
+
+def test_client_audio_context_wait_divergence_fails_closed(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_chunk_scheduled"
+            and row["parent_sequence_id"] == "0"
+            and row["audio_frame_id"] == "1"
+        ):
+            # Both ordered recurrences still pass independently, but the
+            # context wait is now 30 ms longer than the projected wait.
+            row["audio_context_time_at_schedule_sec"] = "0.99"
+            break
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="client/AudioContext playback-wait linkage",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_capture_wide_clock_offset_divergence_fails_closed(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_chunk_scheduled"
+            and row["parent_sequence_id"] == "1"
+        ):
+            # Both domains independently show an underrun, so their wait
+            # residual is zero. The 100 ms change in their session offset must
+            # still invalidate the capture.
+            row["audio_context_time_at_schedule_sec"] = "3.1"
+            row["scheduled_start_context_sec"] = "3.1"
+            row["scheduled_end_context_sec"] = "3.3"
+            break
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="clock offset span exceeds",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+@pytest.mark.parametrize(
+    ("maximum_latency", "expected"),
+    [
+        (2.41, "inconclusive"),
+        (2.18, "inconclusive"),
+        (2.17, "fail"),
+    ],
+)
+def test_clock_link_allowance_is_applied_to_decision_bounds(
+    tmp_path,
+    maximum_latency,
+    expected,
+):
+    csv_path, marker_path = _write_case(tmp_path)
+
+    analysis = analyze_semantic_event_latency(
+        csv_path,
+        marker_path,
+        maximum_latency,
+    )
+
+    assert analysis["summary"]["overall_status"] == expected
+
+
+def test_old_event_local_projection_reanchoring_fails_closed(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_chunk_scheduled"
+            and row["parent_sequence_id"] == "0"
+            and row["audio_frame_id"] == "1"
+        ):
+            # This satisfies the old event-local affine formula:
+            # 13020 + (1.1 - 1.01) * 1000 = 13110. It is nevertheless
+            # impossible in the global queue, whose prior projected end is
+            # 13100.
+            row["audio_context_time_at_schedule_sec"] = "1.01"
+            row["projected_scheduled_start_client_ms"] = "13110"
+            row["source_end_to_projected_scheduled_start_ms"] = "2210"
+            break
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="global projected start recurrence",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_broken_context_recurrence_fails_closed(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_chunk_scheduled"
+            and row["parent_sequence_id"] == "0"
+            and row["audio_frame_id"] == "1"
+        ):
+            # Both the old affine projection and the new projected recurrence
+            # reconcile, but this inserts an unaccounted 10 ms context gap.
+            row["schedule_performance_client_ms"] = "13010"
+            row["scheduled_start_context_sec"] = "1.11"
+            row["scheduled_end_context_sec"] = "1.21"
+            break
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="global scheduled context start recurrence",
+    ):
+        analyze_semantic_event_latency(csv_path, marker_path, 3)
+
+
+def test_context_recurrence_continues_across_parent_boundary(tmp_path):
+    rows = _base_rows()
+    for row in rows:
+        if (
+            row["stage"] == "playback_chunk_scheduled"
+            and row["parent_sequence_id"] == "1"
+        ):
+            row["audio_context_time_at_schedule_sec"] = "1.9"
+            row["scheduled_start_context_sec"] = "2.0"
+            row["scheduled_end_context_sec"] = "2.2"
+            break
+    csv_path, marker_path = _write_case(tmp_path, rows=rows)
+
+    with pytest.raises(
+        SemanticEventLatencyError,
+        match="global scheduled context start recurrence",
     ):
         analyze_semantic_event_latency(csv_path, marker_path, 3)
 
@@ -556,7 +901,7 @@ def test_projected_start_must_reconcile_with_audio_context_clock(tmp_path):
         ("nonmonotonic_receipt", "non-monotonic frame receipts"),
         ("wire_row_order", "wire order"),
         ("cross_parent_clock", "wire order"),
-        ("projected_overlap", "overlapping projected playback"),
+        ("projected_overlap", "global projected start recurrence"),
         ("media_byte_duration", "media duration/output PCM byte count"),
     ],
 )
@@ -628,8 +973,9 @@ def test_additional_protocol_chronology_corruption_fails_closed(
                 row["schedule_performance_client_ms"] = "13100"
                 row["projected_scheduled_start_client_ms"] = "13150"
                 row["source_end_to_projected_scheduled_start_ms"] = "1250"
-                row["scheduled_start_context_sec"] = "1.05"
-                row["scheduled_end_context_sec"] = "1.25"
+                row["audio_context_time_at_schedule_sec"] = "2"
+                row["scheduled_start_context_sec"] = "2"
+                row["scheduled_end_context_sec"] = "2.2"
     elif corruption == "media_byte_duration":
         for row in rows:
             if row["stage"] == "playback_chunk_scheduled":

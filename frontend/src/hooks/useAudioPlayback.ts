@@ -86,6 +86,7 @@ export function useAudioPlayback({
   const totalScheduledDurationRef = useRef(0);
   const limitExceededCountRef = useRef(0);
   const sessionGenerationRef = useRef(0);
+  const projectedEndClientMsRef = useRef<number | null>(null);
   const adaptivePlaybackRef = useRef(adaptivePlayback);
   const playbackPolicyRef = useRef(playbackPolicy);
   const onScheduleRef = useRef(onSchedule);
@@ -124,6 +125,7 @@ export function useAudioPlayback({
     totalSourceDurationRef.current = 0;
     totalScheduledDurationRef.current = 0;
     limitExceededCountRef.current = 0;
+    projectedEndClientMsRef.current = null;
     isActiveRef.current = true;
     setIsPlaying(true);
   }, [sampleRate]);
@@ -132,6 +134,7 @@ export function useAudioPlayback({
     console.log('AudioPlayback: stopping');
     isActiveRef.current = false;
     sessionGenerationRef.current += 1;
+    projectedEndClientMsRef.current = null;
     setIsPlaying(false);
 
     gainNodeRef.current = null;
@@ -201,9 +204,12 @@ export function useAudioPlayback({
         : selectPlaybackRate(0, policy);
       const scheduledDuration = bufferDuration / playbackRate;
       const scheduledEndTime = startTime + scheduledDuration;
-      const projectedScheduledStartClientMs = (
-        schedulePerformanceMs
-        + (startTime - audioContextTimeAtScheduleSeconds) * 1000
+      const projectedScheduledStartClientMs = Math.max(
+        schedulePerformanceMs,
+        projectedEndClientMsRef.current ?? schedulePerformanceMs,
+      );
+      const projectedScheduledEndClientMs = (
+        projectedScheduledStartClientMs + scheduledDuration * 1000
       );
       const queueDepthSeconds = Math.max(0, scheduledEndTime - currentTime);
       const aboveTarget = queueDepthSeconds > policy.targetQueueSeconds;
@@ -224,6 +230,7 @@ export function useAudioPlayback({
       // experiment that this hook is intended to measure.
       source.start(startTime);
       nextStartTimeRef.current = scheduledEndTime;
+      projectedEndClientMsRef.current = projectedScheduledEndClientMs;
 
       peakQueueDepthRef.current = Math.max(
         peakQueueDepthRef.current,
@@ -294,6 +301,7 @@ export function useAudioPlayback({
   useEffect(() => () => {
     isActiveRef.current = false;
     sessionGenerationRef.current += 1;
+    projectedEndClientMsRef.current = null;
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;

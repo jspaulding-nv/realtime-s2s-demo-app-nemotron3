@@ -1109,30 +1109,60 @@ ASR final while assigning their shared conservative parent envelope a
 deterministic anonymous group ID. Marker counts and unique candidate-group
 counts are reported separately so repeated markers are not presented as
 independent trials. Duplicate source samples, incomplete evidence, end-only
-offsets, overlapping or backward-moving distinct ranges, or impossible
-timelines fail the complete analysis.
+offsets, backward-moving ranges, unsupported overlaps, ambiguous marker
+attribution, or impossible timelines fail the complete analysis. Ordered
+same-end suffix overlaps are accepted as a Nemotron/punctuation provenance
+shape, but a marker inside more than one distinct range still rejects the
+complete gate.
 
 For an explicitly supplied SLA, the result is PASS only when the complete
-candidate parent envelope projects to finish by the limit, FAIL when even its
-first projected frame starts after the limit, and INCONCLUSIVE when the
-unknown target landmark could fall on either side. This does not identify the
-Spanish landmark or prove physical audibility. A target-sample annotation,
-common-clock digital loopback, and ultimately a two-channel physical recording
-remain higher evidence tiers. CLI exit codes distinguish PASS (`0`), FAIL
-(`1`), invalid arguments/evidence or report-output I/O failure (`2`), and
-INCONCLUSIVE (`3`) for automation. Multi-report output is staged before
-installation and rolled back as a set on expected installation failures.
+clock-linkage-adjusted candidate parent envelope finishes by the limit, FAIL
+when even its conservative projected first-frame start lower bound is too
+late, and INCONCLUSIVE when the adjusted envelope straddles the limit. This
+does not identify the target-language landmark or prove physical audibility. A
+target-sample annotation, common-clock digital loopback, and ultimately a
+two-channel physical recording remain higher evidence tiers. CLI exit codes
+distinguish PASS (`0`), FAIL (`1`), invalid arguments/evidence or report-output
+I/O failure (`2`), and INCONCLUSIVE (`3`) for automation. Multi-report output
+is staged before installation and rolled back as a set on expected
+installation failures.
 
 Review found and closed an initial false-PASS path that trusted projected
 schedule fields without independently reconciling their source-boundary and
 AudioContext clocks. Later review also closed missing source-PCM binding,
 self-declared-only CLI pacing provenance, automation exit-status, partial-tail
 fallback, and repeated-parent-counting ambiguities. The final validation passed
-408 root Python tests with one optional test skipped, 418 backend tests, and
-146 frontend tests. Frontend lint/build, Python compilation, shell syntax,
+425 root Python tests with one optional test skipped, 418 backend tests, and
+150 frontend tests. Frontend lint/build, Python compilation, shell syntax,
 Compose configuration, and whitespace checks also passed. No live semantic
 marker result is claimed yet. See
 [Semantic source-event latency gate](SEMANTIC_EVENT_LATENCY_GATE.md).
+
+The first live Test Dashboard preflight then exposed 170 false projected
+overlaps, up to 16.0 ms, even though all 496 AudioContext frame intervals were
+non-overlapping. The cause was a fresh `performance.now()` to quantized
+`AudioContext.currentTime` projection for every frame. Browser projection now
+advances by `max(schedulePerformance, previousProjectedEnd)`, while the
+analyzer independently verifies that recurrence and the corresponding
+AudioContext recurrence across parent boundaries. A matched rerun passed every
+mechanical invariant: 200 input chunks, 23 translated parents, 520 output
+frames, 0.0-55.1 ms input pacing lateness, 1.642-8.254 second projected-start
+source-end lag, 1.742-8.312 second projected-end source-end lag, and a
+6.563-second projected tail after input ended. It has no human marker sidecar,
+so it is not a semantic PASS/FAIL result. See
+[Semantic gate browser preflight](SEMANTIC_EVENT_GATE_PREFLIGHT_2026-07-25.md).
+
+Final review found that validating the AudioContext and client-clock
+recurrences independently still allowed the domains to diverge. The analyzer
+now rejects a per-frame playback-wait linkage residual above 25 ms or a
+capture-wide clock-offset span above 50 ms. Semantic decisions widen the raw
+projected parent envelope by 25 ms in both directions. The matched browser
+capture remained valid at a 17.8 ms maximum residual and 28.3 ms offset span.
+The 50 ms span ceiling remains provisional because it was calibrated on only
+60 seconds. The first long-duration capture must test that pre-registered
+limit unchanged; a clean clock-only rejection would require a duration-aware
+or common-clock evidence revision and a repeat, not a post-hoc threshold
+change.
 
 ## Handoff checklist
 
@@ -1143,7 +1173,7 @@ marker result is claimed yet. See
 - [x] Verify terminal completion, PCM-send drain, staged promotion, and hashes
 - [x] Verify resume provenance and backend lock behavior after a live failure
 - [ ] Run three repeats per sample after the staged design improves the queue
-- [ ] Cross-check replay scheduling with an actual browser/Web Audio run
+- [x] Cross-check replay scheduling with an actual browser/Web Audio run
 - [ ] Capture synchronized phrase/punchline delay, not only queue depth
 - [ ] Review 1.05x and 1.10x quality with native Spanish listeners
 - [x] Implement and unit-test punctuation splitting before staged live tests

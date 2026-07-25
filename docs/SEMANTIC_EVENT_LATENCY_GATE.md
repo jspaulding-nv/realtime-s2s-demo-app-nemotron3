@@ -70,6 +70,62 @@ This removes a look-ahead bias in earlier file tests, which released a complete
 chunk at its start boundary. The analyzer independently checks every CSV input
 ledger row and rejects older or corrupted start-boundary captures.
 
+## Projected playback chronology prerequisite
+
+Web Audio schedules PCM on `AudioContext.currentTime`, while the CSV reports
+latency on the client `performance.now()` clock. Sampling an independent
+clock offset for every small frame is invalid because `currentTime` advances in
+render quanta while `performance.now()` advances continuously. Formal captures
+therefore project one ordered playback cursor:
+
+```text
+contextStart[i] =
+  max(audioContextAtSchedule[i], contextEnd[i-1])
+
+projectedStart[i] =
+  max(schedulePerformance[i], projectedEnd[i-1])
+
+projectedEnd[i] =
+  projectedStart[i] + scheduledDuration[i] * 1000
+```
+
+The first frame has no prior end. A real queue underrun reanchors the projected
+cursor at the later scheduling timestamp; frames that remain queued advance
+exactly by their rate-adjusted scheduled duration. Start, stop, and restart
+reset both cursors. The analyzer independently replays both recurrences across
+parent boundaries and rejects event-local re-projection, hidden context gaps,
+overlaps, or stale-session state.
+
+Independent recurrences are not sufficient on their own: they could describe
+two unrelated clocks. The analyzer also reconciles the queued wait in both
+domains:
+
+```text
+contextWaitMs[i] =
+  (contextStart[i] - audioContextAtSchedule[i]) * 1000
+
+projectedWaitMs[i] =
+  projectedStart[i] - schedulePerformance[i]
+```
+
+Their absolute difference may not exceed 25 ms, and the capture-wide span of
+`schedulePerformance - audioContextAtSchedule * 1000` may not exceed 50 ms.
+The matched browser preflight observed 17.8 ms and 28.3 ms, respectively.
+These explicit limits reject a discontinuity or gradual cross-clock divergence
+beyond those limits. The event decision also widens each raw projected
+candidate envelope by 25 ms: subtract 25 ms from its earliest start and add
+25 ms to its latest end.
+
+The 50 ms capture-wide limit is provisional and was calibrated on the
+60-second controlled-Chromium preflight. A 30-40 minute formal capture must
+pass the limit as written; do not loosen it after seeing an outcome. If a clean
+long-duration clock canary exceeds it, revise the evidence model first—using a
+pre-registered duration-aware drift allowance or a common-clock capture—and
+repeat the run before applying the semantic gate.
+
+This remains a browser scheduling projection. It does not observe rendered
+device output and does not set `actual_audibility_proven=true`.
+
 ## Runtime prerequisites
 
 Use the staged schema-3 incremental path:
@@ -198,6 +254,14 @@ independent parent-level observations. Reports assign deterministic anonymous
 `group-NNN` identifiers and separately show marker count and unique candidate
 group count. Event/status counts are marker counts, not independent trials.
 
+Nemotron word envelopes plus punctuation splitting can also produce a narrower
+later range with the same source end as the preceding range. The trace accepts
+only this ordered same-end suffix shape: the later start must strictly advance
+and the end must be exactly equal. Crossing, backward, different-end, and all
+other containing overlaps remain invalid. A reviewed marker that falls inside
+more than one distinct range rejects the complete gate as ambiguous; only
+parents with one exact shared range are unioned into a candidate envelope.
+
 ## Run the analyzer
 
 Use an explicit SLA; the command has no implicit audience threshold:
@@ -246,13 +310,17 @@ finds any of the following:
   source-range evidence;
 - end-only or otherwise non-attributed source timing;
 - noncontiguous parent/frame identity;
-- overlapping or backward-moving distinct source ranges;
+- broken AudioContext or projected-playback recurrence;
+- playback-wait linkage beyond 25 ms or a capture-wide client/AudioContext
+  offset span beyond 50 ms;
+- backward-moving ranges or an unsupported distinct source-range overlap;
+- a marker that resolves to more than one distinct attributed range;
 - a marker outside transmitted input or with no attributed range;
 - duplicate source samples or insufficient reviewers.
 
-Multiple parents are accepted only when they carry the exact same attributed
-source range, as can occur when one ASR final is split into ordered punctuation
-segments. Their union becomes the conservative candidate envelope.
+Multiple candidate parents are accepted only when they carry the exact same
+attributed source range, as can occur when one ASR final is split into ordered
+punctuation segments. Their union becomes the conservative candidate envelope.
 
 ## Decision rule
 
@@ -260,10 +328,10 @@ For each event:
 
 ```text
 PASS
-  projected final candidate-frame end <= SLA
+  conservative projected final candidate-frame end upper bound <= SLA
 
 FAIL
-  projected first candidate-frame start > SLA
+  conservative projected first candidate-frame start lower bound > SLA
 
 INCONCLUSIVE
   candidate envelope straddles the SLA
@@ -272,10 +340,11 @@ INCONCLUSIVE
 The aggregate is `FAIL` if any event fails, otherwise `INCONCLUSIVE` if any
 event is inconclusive, otherwise `PASS`.
 
-This deliberately avoids claiming knowledge of the precise Spanish landmark.
-If the entire candidate envelope ends before the SLA, the unknown target
-landmark must also be before it. If the entire envelope begins after the SLA,
-the landmark cannot meet it. A straddling envelope cannot decide the question.
+This deliberately avoids claiming knowledge of the precise target-language
+landmark. If the entire clock-linkage-adjusted candidate envelope ends before
+the SLA, the unknown target landmark must also be before it. If the entire
+adjusted envelope begins after the SLA, the landmark cannot meet it. A
+straddling envelope cannot decide the question.
 
 The claim boundary is explicit: `semantic_source_marker_reviewed=true` means
 the anonymous coordinate met the reviewer-count requirement, and

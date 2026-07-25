@@ -37,6 +37,8 @@ GATE_EXIT_CODES = {
 }
 CSV_RECONCILIATION_TOLERANCE_MS = 0.01
 CSV_RECONCILIATION_TOLERANCE_SEC = 0.00001
+PLAYBACK_CLOCK_LINK_TOLERANCE_MS = 25.0
+PLAYBACK_CLOCK_OFFSET_SPAN_LIMIT_MS = 50.0
 EVENT_ID_PATTERN = re.compile(r"event-[0-9]{3}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -128,6 +130,9 @@ class Frame:
     source_end_ms: float
     binary_receipt_client_ms: float
     schedule_performance_client_ms: float
+    audio_context_time_at_schedule_sec: float
+    scheduled_start_context_sec: float
+    scheduled_end_context_sec: float
     projected_start_client_ms: float
     scheduled_duration_sec: float
     schedule_csv_line: int
@@ -151,6 +156,31 @@ class Frame:
             + self.scheduled_duration_sec * 1000.0
         )
 
+    @property
+    def audio_context_wait_ms(self) -> float:
+        return (
+            self.scheduled_start_context_sec
+            - self.audio_context_time_at_schedule_sec
+        ) * 1000.0
+
+    @property
+    def projected_wait_ms(self) -> float:
+        return (
+            self.projected_start_client_ms
+            - self.schedule_performance_client_ms
+        )
+
+    @property
+    def clock_link_residual_ms(self) -> float:
+        return self.audio_context_wait_ms - self.projected_wait_ms
+
+    @property
+    def clock_offset_ms(self) -> float:
+        return (
+            self.schedule_performance_client_ms
+            - self.audio_context_time_at_schedule_sec * 1000.0
+        )
+
 
 @dataclass(frozen=True)
 class ParentComplete:
@@ -170,6 +200,12 @@ class ParentComplete:
     @property
     def source_range(self) -> tuple[float, float]:
         return (self.source_start_ms, self.source_end_ms)
+
+
+@dataclass(frozen=True)
+class PlaybackClockEvidence:
+    maximum_absolute_link_residual_ms: float
+    offset_span_ms: float
 
 
 def _sha256(data: bytes) -> str:
@@ -736,6 +772,7 @@ def _validate_protocol_trace(
     int,
     dict[tuple[int, int, int], Frame],
     dict[tuple[int, int], ParentComplete],
+    PlaybackClockEvidence,
 ]:
     client_rows = [
         row
@@ -944,17 +981,6 @@ def _validate_protocol_trace(
             context,
             minimum=0,
         )
-        expected_projected_start = (
-            schedule_performance
-            + (scheduled_start_context - audio_context_time) * 1000.0
-        )
-        _require_close(
-            projected_start,
-            expected_projected_start,
-            context,
-            "projected scheduled start",
-            tolerance=CSV_RECONCILIATION_TOLERANCE_MS,
-        )
         source_end_to_projected_start = _csv_float(
             row,
             "source_end_to_projected_scheduled_start_ms",
@@ -976,6 +1002,9 @@ def _validate_protocol_trace(
             source_end_ms=source_range[1],
             binary_receipt_client_ms=binary_receipt,
             schedule_performance_client_ms=schedule_performance,
+            audio_context_time_at_schedule_sec=audio_context_time,
+            scheduled_start_context_sec=scheduled_start_context,
+            scheduled_end_context_sec=scheduled_end_context,
             projected_start_client_ms=projected_start,
             scheduled_duration_sec=scheduled_duration,
             schedule_csv_line=int(row["_line_number"]),
@@ -1176,7 +1205,10 @@ def _validate_protocol_trace(
     )
     expected_csv_lines: list[int] = []
     protocol_clock: list[float] = []
-    previous_projected_end = -math.inf
+    clock_offsets_ms: list[float] = []
+    absolute_clock_link_residuals_ms: list[float] = []
+    previous_context_end: float | None = None
+    previous_projected_end: float | None = None
     frame_index = 0
     for parent_id in parent_ids:
         parent_frames: list[Frame] = []
@@ -1197,14 +1229,48 @@ def _validate_protocol_trace(
                     frame.schedule_performance_client_ms,
                 ]
             )
-            if (
-                frame.projected_start_client_ms
-                + CSV_RECONCILIATION_TOLERANCE_MS
-                < previous_projected_end
-            ):
-                raise SemanticEventLatencyError(
-                    "protocol trace contains overlapping projected playback"
+            expected_context_start = (
+                frame.audio_context_time_at_schedule_sec
+                if previous_context_end is None
+                else max(
+                    frame.audio_context_time_at_schedule_sec,
+                    previous_context_end,
                 )
+            )
+            _require_close(
+                frame.scheduled_start_context_sec,
+                expected_context_start,
+                f"frame {frame.key}",
+                "global scheduled context start recurrence",
+                tolerance=CSV_RECONCILIATION_TOLERANCE_SEC,
+            )
+            expected_projected_start = (
+                frame.schedule_performance_client_ms
+                if previous_projected_end is None
+                else max(
+                    frame.schedule_performance_client_ms,
+                    previous_projected_end,
+                )
+            )
+            _require_close(
+                frame.projected_start_client_ms,
+                expected_projected_start,
+                f"frame {frame.key}",
+                "global projected start recurrence",
+                tolerance=CSV_RECONCILIATION_TOLERANCE_MS,
+            )
+            _require_close(
+                frame.audio_context_wait_ms,
+                frame.projected_wait_ms,
+                f"frame {frame.key}",
+                "client/AudioContext playback-wait linkage",
+                tolerance=PLAYBACK_CLOCK_LINK_TOLERANCE_MS,
+            )
+            clock_offsets_ms.append(frame.clock_offset_ms)
+            absolute_clock_link_residuals_ms.append(
+                abs(frame.clock_link_residual_ms)
+            )
+            previous_context_end = frame.scheduled_end_context_sec
             previous_projected_end = frame.projected_end_client_ms
         complete = completions[(generation, parent_id)]
         expected_csv_lines.append(complete.csv_line)
@@ -1223,8 +1289,28 @@ def _validate_protocol_trace(
         )
 
     _reject_non_monotonic_parent_source_ranges(completions)
-    _reject_overlapping_distinct_ranges(completions)
-    return generation, schedules, completions
+    _reject_unsupported_distinct_range_overlaps(completions)
+    clock_offset_span_ms = max(clock_offsets_ms) - min(clock_offsets_ms)
+    if (
+        clock_offset_span_ms
+        > PLAYBACK_CLOCK_OFFSET_SPAN_LIMIT_MS
+        + CSV_RECONCILIATION_TOLERANCE_MS
+    ):
+        raise SemanticEventLatencyError(
+            "protocol trace client/AudioContext clock offset span exceeds "
+            "the capture limit"
+        )
+    return (
+        generation,
+        schedules,
+        completions,
+        PlaybackClockEvidence(
+            maximum_absolute_link_residual_ms=max(
+                absolute_clock_link_residuals_ms
+            ),
+            offset_span_ms=clock_offset_span_ms,
+        ),
+    )
 
 
 def _reject_non_monotonic_parent_source_ranges(
@@ -1253,19 +1339,40 @@ def _reject_non_monotonic_parent_source_ranges(
         previous_range = source_range
 
 
-def _reject_overlapping_distinct_ranges(
+def _reject_unsupported_distinct_range_overlaps(
     completions: dict[tuple[int, int], ParentComplete],
 ) -> None:
-    unique_ranges = sorted(
-        {complete.source_range for complete in completions.values()}
-    )
-    for index, first in enumerate(unique_ranges):
-        for second in unique_ranges[index + 1 :]:
-            if max(first[0], second[0]) < min(first[1], second[1]):
-                raise SemanticEventLatencyError(
-                    "protocol trace contains overlapping distinct source "
-                    "ranges"
-                )
+    """Allow only ordered same-end suffix nesting between distinct ranges.
+
+    Nemotron word envelopes can legitimately produce this shape when a
+    punctuation cut consumes part of a later ASR final: the emitted aggregate
+    uses the earlier start while the residual keeps the later final's narrower
+    range. Exact-range siblings are also valid. All other distinct overlaps
+    remain invalid evidence.
+
+    The preceding monotonicity check guarantees nondecreasing starts and ends,
+    so comparing adjacent parents is sufficient to detect every unsupported
+    overlap.
+    """
+
+    previous_range: tuple[float, float] | None = None
+    for parent_key in sorted(completions):
+        source_range = completions[parent_key].source_range
+        if previous_range is None or source_range == previous_range:
+            previous_range = source_range
+            continue
+
+        overlaps = source_range[0] < previous_range[1]
+        is_same_end_suffix = (
+            source_range[0] > previous_range[0]
+            and source_range[1] == previous_range[1]
+        )
+        if overlaps and not is_same_end_suffix:
+            raise SemanticEventLatencyError(
+                "protocol trace contains unsupported overlapping distinct "
+                "source ranges"
+            )
+        previous_range = source_range
 
 
 def _round_numbers(value: Any) -> Any:
@@ -1328,7 +1435,12 @@ def analyze_semantic_event_latency(
         declared_source_pcm_sha256=declared_source_pcm_sha256,
         declared_source_pcm_sample_count=declared_source_pcm_sample_count,
     )
-    generation, frames, completions = _validate_protocol_trace(rows, ledger)
+    (
+        generation,
+        frames,
+        completions,
+        playback_clock_evidence,
+    ) = _validate_protocol_trace(rows, ledger)
 
     events: list[dict[str, Any]] = []
     sla_ms = normalized_sla * 1000.0
@@ -1397,8 +1509,18 @@ def analyze_semantic_event_latency(
         projected_end = max(
             frame.projected_end_client_ms for frame in candidate_frames
         )
-        start_delay_ms = projected_start - source_event_client_ms
-        end_delay_ms = projected_end - source_event_client_ms
+        conservative_projected_start = (
+            projected_start - PLAYBACK_CLOCK_LINK_TOLERANCE_MS
+        )
+        conservative_projected_end = (
+            projected_end + PLAYBACK_CLOCK_LINK_TOLERANCE_MS
+        )
+        start_delay_ms = (
+            conservative_projected_start - source_event_client_ms
+        )
+        end_delay_ms = (
+            conservative_projected_end - source_event_client_ms
+        )
         if end_delay_ms <= sla_ms:
             status = "pass"
         elif start_delay_ms > sla_ms:
@@ -1436,6 +1558,12 @@ def analyze_semantic_event_latency(
                 ),
                 "projected_first_frame_start_client_ms": projected_start,
                 "projected_final_frame_end_client_ms": projected_end,
+                "conservative_projected_first_frame_start_client_ms": (
+                    conservative_projected_start
+                ),
+                "conservative_projected_final_frame_end_client_ms": (
+                    conservative_projected_end
+                ),
                 "latency_bounds_ms": {
                     "first_candidate_frame_receipt": (
                         first_receipt - source_event_client_ms
@@ -1446,8 +1574,10 @@ def analyze_semantic_event_latency(
                     "parent_complete_receipt": (
                         parent_complete_bound - source_event_client_ms
                     ),
-                    "projected_first_frame_start": start_delay_ms,
-                    "projected_final_frame_end": end_delay_ms,
+                    "conservative_projected_first_frame_start": (
+                        start_delay_ms
+                    ),
+                    "conservative_projected_final_frame_end": end_delay_ms,
                 },
                 "status": status,
                 "semantic_source_marker_reviewed": True,
@@ -1514,6 +1644,18 @@ def analyze_semantic_event_latency(
                 "output_sample_rate_hz": OUTPUT_SAMPLE_RATE_HZ,
                 "output_channels": 1,
                 "output_bytes_per_sample": OUTPUT_BYTES_PER_SAMPLE,
+                "playback_clock_link_tolerance_ms": (
+                    PLAYBACK_CLOCK_LINK_TOLERANCE_MS
+                ),
+                "playback_clock_offset_span_limit_ms": (
+                    PLAYBACK_CLOCK_OFFSET_SPAN_LIMIT_MS
+                ),
+                "playback_clock_maximum_absolute_link_residual_ms": (
+                    playback_clock_evidence.maximum_absolute_link_residual_ms
+                ),
+                "playback_clock_offset_span_ms": (
+                    playback_clock_evidence.offset_span_ms
+                ),
             },
             "claim_scope": {
                 "semantic_source_marker_reviewed": True,
@@ -1564,6 +1706,17 @@ def render_semantic_event_latency_markdown(
             f"{evidence['stream_generation']}"
         ),
         (
+            "- Playback clock-link residual / allowed: "
+            f"{evidence['playback_clock_maximum_absolute_link_residual_ms']:.3f}"
+            " ms / "
+            f"{evidence['playback_clock_link_tolerance_ms']:.3f} ms"
+        ),
+        (
+            "- Playback clock-offset span / allowed: "
+            f"{evidence['playback_clock_offset_span_ms']:.3f} ms / "
+            f"{evidence['playback_clock_offset_span_limit_ms']:.3f} ms"
+        ),
+        (
             "- Semantic source marker reviewed: "
             f"{str(analysis['claim_scope']['semantic_source_marker_reviewed']).lower()}"
         ),
@@ -1597,8 +1750,8 @@ def render_semantic_event_latency_markdown(
         "",
         (
             "| Event | Group | Source sample / offset | First receipt | "
-            "Last receipt | Parent complete | Projected start | "
-            "Projected end | Status |"
+            "Last receipt | Parent complete | Projected start lower | "
+            "Projected end upper | Status |"
         ),
         "|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
@@ -1616,8 +1769,12 @@ def render_semantic_event_latency_markdown(
                 first=latency["first_candidate_frame_receipt"],
                 last=latency["last_candidate_frame_receipt"],
                 complete=latency["parent_complete_receipt"],
-                start=latency["projected_first_frame_start"],
-                end=latency["projected_final_frame_end"],
+                start=latency[
+                    "conservative_projected_first_frame_start"
+                ],
+                end=latency[
+                    "conservative_projected_final_frame_end"
+                ],
                 status=event["status"],
             )
         )
@@ -1642,9 +1799,9 @@ def render_semantic_event_latency_markdown(
             "",
             (
                 "PASS means the conservative projected final-frame end is at "
-                "or below the SLA. FAIL means even the projected first-frame "
-                "start exceeds the SLA. Values between those bounds are "
-                "INCONCLUSIVE."
+                "or below the SLA. FAIL means even the conservative projected "
+                "first-frame start lower bound exceeds the SLA. Values "
+                "between those bounds are INCONCLUSIVE."
             ),
             "",
             (
