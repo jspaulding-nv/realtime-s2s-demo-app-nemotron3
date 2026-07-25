@@ -7,9 +7,9 @@ from queue import Queue, Empty
 from typing import Optional, Callable
 
 import riva.client
-import riva.client.proto.riva_asr_pb2 as riva_asr_pb2
 import riva.client.proto.riva_nmt_pb2 as riva_nmt_pb2
 
+from asr_config import create_streaming_asr_config
 from config import audio_config, riva_config, SUPPORTED_LANGUAGES
 
 
@@ -22,6 +22,7 @@ class AudioChunkIterator:
     def __init__(self):
         self._queue: Queue = Queue()
         self._stopped = False
+        self._input_exhausted = False
         self._chunk_count = 0
 
     def add_chunk(self, chunk: bytes) -> None:
@@ -34,6 +35,8 @@ class AudioChunkIterator:
 
     def stop(self) -> None:
         """Signal the iterator to stop."""
+        if self._stopped:
+            return
         print("[Riva] Iterator stopped")
         self._stopped = True
         self._queue.put(None)  # Sentinel to unblock iteration
@@ -48,13 +51,13 @@ class AudioChunkIterator:
                 chunk = self._queue.get(timeout=0.5)
                 if chunk is None:
                     print("[Riva] Got stop sentinel")
+                    self._input_exhausted = True
                     raise StopIteration
                 return chunk
             except Empty:
-                if self._stopped:
-                    print("[Riva] Iterator stopped during wait")
-                    raise StopIteration
-                # Keep waiting for more chunks
+                # stop() always queues a sentinel. Waiting for that sentinel,
+                # rather than merely observing _stopped, proves that every
+                # previously queued audio chunk was consumed.
                 continue
 
 
@@ -99,30 +102,9 @@ class RivaS2SClient:
 
         print(f"[Riva] Creating config: {riva_config.source_language} -> {target_language}, voice: {voice_name}")
 
-        # Nemotron streaming final EOU configuration. The Riva team's measured
-        # starting point is an 800 ms finalization window. Do not set the
-        # two-pass stop_history_eou fields here: NVIDIA documents those as
-        # supported only by Parakeet/Conformer CTC models, not Nemotron RNNT.
-        endpointing_config = riva_asr_pb2.EndpointingConfig(
-            start_history=300,
-            start_threshold=0.2,
-            stop_history=riva_config.endpointing_history_ms,
-            stop_threshold=0.98,
-        )
-
-        # ASR config for speech recognition
-        asr_config = riva_asr_pb2.StreamingRecognitionConfig(
-            config=riva_asr_pb2.RecognitionConfig(
-                encoding=riva.client.AudioEncoding.LINEAR_PCM,
-                sample_rate_hertz=audio_config.sample_rate,
-                language_code=riva_config.source_language,
-                max_alternatives=1,
-                enable_automatic_punctuation=True,
-                audio_channel_count=audio_config.channels,
-                endpointing_config=endpointing_config,
-            ),
-            interim_results=True
-        )
+        # Shared with the staged direct-ASR adapter so both paths use the same
+        # Nemotron RNNT endpointing and punctuation request.
+        asr_config = create_streaming_asr_config()
 
         # NMT config for translation
         translation_config = riva_nmt_pb2.TranslationConfig(
@@ -150,6 +132,7 @@ class RivaS2SClient:
         target_language: str,
         on_audio: Callable[[bytes], None],
         on_error: Callable[[str], None],
+        on_complete: Callable[[], None],
     ) -> AudioChunkIterator:
         """
         Start a translation stream.
@@ -168,45 +151,52 @@ class RivaS2SClient:
             print("[Riva] Starting translation thread")
             total_responses = 0
             restart_count = 0
+            completed_successfully = False
 
-            while not chunk_iterator._stopped:
-                try:
-                    # Create fresh config for each stream session
-                    config = self.create_s2s_config(target_language)
-                    responses = self._nmt_client.streaming_s2s_response_generator(
-                        audio_chunks=chunk_iterator,
-                        streaming_config=config,
-                    )
+            try:
+                while True:
+                    try:
+                        # Create fresh config for each stream session
+                        config = self.create_s2s_config(target_language)
+                        responses = self._nmt_client.streaming_s2s_response_generator(
+                            audio_chunks=chunk_iterator,
+                            streaming_config=config,
+                        )
 
-                    for response in responses:
-                        total_responses += 1
-                        if response.speech and response.speech.audio:
-                            audio_len = len(response.speech.audio)
-                            if VERBOSE_CHUNKS:
-                                print(f"[Riva] Response {total_responses}: got {audio_len} bytes of audio")
-                            on_audio(response.speech.audio)
-                        elif VERBOSE_CHUNKS:
-                            print(f"[Riva] Response {total_responses}: no audio")
+                        for response in responses:
+                            total_responses += 1
+                            if response.speech and response.speech.audio:
+                                audio_len = len(response.speech.audio)
+                                if VERBOSE_CHUNKS:
+                                    print(f"[Riva] Response {total_responses}: got {audio_len} bytes of audio")
+                                on_audio(response.speech.audio)
+                            elif VERBOSE_CHUNKS:
+                                print(f"[Riva] Response {total_responses}: no audio")
 
-                    # for-loop ended normally = ASR endpointing closed the stream
-                    if not chunk_iterator._stopped:
-                        restart_count += 1
-                        print(f"[Riva] ASR endpointing — restarting stream (#{restart_count})")
-                        continue
-                    else:
+                        # for-loop ended normally = ASR endpointing closed the stream
+                        if not chunk_iterator._input_exhausted:
+                            restart_count += 1
+                            print(
+                                "[Riva] ASR endpointing before input exhaustion "
+                                f"— restarting stream (#{restart_count})"
+                            )
+                            continue
                         print(f"[Riva] Stream stopped normally, {total_responses} total responses")
+                        completed_successfully = True
                         break
 
-                except Exception as e:
-                    if chunk_iterator._stopped:
-                        print(f"[Riva] Stream ended: {e}")
+                    except Exception as e:
+                        print(f"[Riva] Translation failed: {e}")
+                        on_error(f"Riva translation stream failed: {e}")
                         break
-                    restart_count += 1
-                    print(f"[Riva] Error (restarting #{restart_count}): {e}")
-                    continue
-
-            print(f"[Riva] Translation thread exiting. "
-                  f"{total_responses} responses, {restart_count} restarts")
+            finally:
+                print(f"[Riva] Translation thread exiting. "
+                      f"{total_responses} responses, {restart_count} restarts")
+                if completed_successfully:
+                    try:
+                        on_complete()
+                    except Exception as exc:
+                        print(f"[Riva] Completion callback failed: {exc}")
 
         # Run translation in background thread
         self._executor.submit(run_translation)

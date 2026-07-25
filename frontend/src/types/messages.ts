@@ -1,10 +1,12 @@
 // WebSocket message types
+import type { AudioMetadataProtocolVersion } from './audioMetadata';
 
 export type SessionStatus =
   | 'disconnected'
   | 'connected'
   | 'listening'
   | 'processing'
+  | 'completed'
   | 'stopped'
   | 'error';
 
@@ -34,17 +36,26 @@ export type ServerMessage = StatusMessage | ErrorMessage | LevelMessage | PongMe
 export interface StartStreamMessage {
   type: 'start_stream';
   targetLanguage: string;
+  audioMetadataProtocolVersion?: AudioMetadataProtocolVersion;
 }
 
 export interface StopStreamMessage {
   type: 'stop_stream';
 }
 
+export interface EndInputMessage {
+  type: 'end_input';
+}
+
 export interface PingMessage {
   type: 'ping';
 }
 
-export type ClientMessage = StartStreamMessage | StopStreamMessage | PingMessage;
+export type ClientMessage =
+  | StartStreamMessage
+  | EndInputMessage
+  | StopStreamMessage
+  | PingMessage;
 
 // Language configuration
 export interface Language {
@@ -58,6 +69,20 @@ export interface AudioConfig {
   sampleRate: number;
   chunkSize: number;
   channels: number;
+  pipelineMode?: 'monolithic' | 'staged';
+  audioMetadataProtocolVersions?: AudioMetadataProtocolVersion[];
+  stagedConfig?: {
+    segmentMaxChars: number;
+    segmentMaxAgeMs: number;
+    asrEventQueueMaxSize: number;
+    nmtQueueMaxSize: number;
+    ttsQueueMaxSize: number;
+    outputQueueMaxSize: number;
+    nmtRpcTimeoutSeconds: number;
+    ttsRpcTimeoutSeconds: number;
+    ttsMaxSegmentAudioSeconds: number;
+    closeTimeoutSeconds: number;
+  };
 }
 
 // Application state

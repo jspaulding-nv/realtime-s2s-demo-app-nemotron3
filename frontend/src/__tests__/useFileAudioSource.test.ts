@@ -20,7 +20,7 @@ class MockAudioBuffer {
     }
   }
 
-  getChannelData(_channel: number): Float32Array {
+  getChannelData(): Float32Array {
     return this.data;
   }
 }
@@ -113,6 +113,39 @@ describe('useFileAudioSource', () => {
     // Each chunk: 4800 samples * 2 bytes/sample = 9600 bytes
     const firstChunk = onChunk.mock.calls[0][0] as ArrayBuffer;
     expect(firstChunk.byteLength).toBe(9600);
+    expect(onChunk.mock.calls[0][1]).toMatchObject({
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+    });
+    expect(onChunk.mock.calls[0][1].inputSampleZeroClientMs).toBe(
+      onChunk.mock.calls[0][1].emittedAtMs,
+    );
+  });
+
+  it('emits a contiguous transmitted-sample ledger with a stable anchor', async () => {
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete }),
+    );
+    const mockFile = createMockFile('test.wav');
+    await act(async () => {
+      await result.current.loadFile(mockFile);
+    });
+
+    act(() => result.current.startStreaming());
+    act(() => vi.advanceTimersByTime(600));
+
+    const first = onChunk.mock.calls[0][1];
+    const second = onChunk.mock.calls[1][1];
+    expect(second).toMatchObject({
+      chunkIndex: 1,
+      sampleRateHz: 16000,
+      sourceSampleStart: 4800,
+      sourceSampleEndExclusive: 9600,
+      inputSampleZeroClientMs: first.inputSampleZeroClientMs,
+    });
+    expect(second.emittedAtMs).toBeGreaterThanOrEqual(first.emittedAtMs);
   });
 
   it('converts Float32 to Int16 correctly', async () => {

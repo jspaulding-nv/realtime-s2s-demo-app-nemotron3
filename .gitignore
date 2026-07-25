@@ -61,6 +61,7 @@ test_results/
 test_results_2/
 test_results_3/
 test_results_nemotron/
+test_results_staged/
 experiment_results/
 docs/results/raw/
 
@@ -74,3 +75,4 @@ docs/results/raw/
 
 # Development notes
 *.txt
+!requirements-dev.txt

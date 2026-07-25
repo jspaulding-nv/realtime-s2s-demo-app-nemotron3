@@ -2,9 +2,9 @@
 
 **Date:** 2026-02-12
 **Source file:** `timing-export-2026-02-13T01-34-48-442Z.csv`
-**Input audio:** `test-30min.wav` (English sample, 16kHz mono Int16 PCM)
+**Input audio:** local `long-form-03-30min.wav` fixture (16kHz mono Int16 PCM)
 **Translation target:** es-US (Spanish)
-**Riva endpoint:** riva-host:50051
+**Riva endpoint:** configured with `RIVA_URI` (default: `localhost:50051`)
 
 ---
 

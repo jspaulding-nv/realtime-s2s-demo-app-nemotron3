@@ -1,3 +1,18 @@
+export interface FileAudioChunkObservation {
+  chunkIndex: number;
+  sampleRateHz: number;
+  sourceSampleStart: number;
+  sourceSampleEndExclusive: number;
+  emittedAtMs: number;
+  inputSampleZeroClientMs: number;
+}
+
+export type SourceTimingBasis =
+  | 'attributed_range'
+  | 'audio_processed/nonsemantic'
+  | 'partial_range'
+  | 'unavailable';
+
 /** Client-side timing event recorded by the frontend. */
 export interface ClientTimingEvent {
   stage: string;
@@ -5,6 +20,38 @@ export interface ClientTimingEvent {
   chunkIndex: number;
   sourcePositionSec: number;
   audioBytes: number;
+  mediaDurationSec?: number;
+  scheduledDurationSec?: number;
+  playbackWaitSec?: number;
+  queueDepthSec?: number;
+  playbackRate?: number;
+  playbackMode?: string;
+  adaptivePlaybackEnabled?: boolean;
+  audioMetadataProtocolVersion?: number;
+  streamGeneration?: number;
+  parentSequenceId?: number;
+  audioFrameId?: number;
+  audioFrameCount?: number;
+  sourceStartMs?: number | null;
+  sourceEndMs?: number | null;
+  sourceTimingBasis?: SourceTimingBasis;
+  binaryReceiptClientMs?: number;
+  parentCompleteReceivedClientMs?: number;
+  inputSampleZeroClientMs?: number;
+  inputChunkEmittedClientMs?: number;
+  inputSourceSampleStart?: number;
+  inputSourceSampleEndExclusive?: number;
+  inputSampleRateHz?: number;
+  inputLedgerValid?: boolean;
+  sourceEndBoundaryClientMs?: number;
+  sourceEndToBinaryReceiptMs?: number;
+  sourceEndToParentCompleteMs?: number;
+  schedulePerformanceClientMs?: number;
+  audioContextTimeAtScheduleSec?: number;
+  scheduledStartContextSec?: number;
+  scheduledEndContextSec?: number;
+  projectedScheduledStartClientMs?: number;
+  sourceEndToProjectedScheduledStartMs?: number;
 }
 
 /** Backend timing event received via /ws/metrics. */

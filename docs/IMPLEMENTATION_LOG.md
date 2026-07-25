@@ -1,0 +1,1104 @@
+# Implementation log
+
+This log distinguishes completed repository work from proposed work and from
+historical test evidence. Dates are UTC.
+
+## 2026-07-08: pinned Nemotron baseline
+
+Completed:
+
+- Replaced Parakeet CTC with Nemotron ASR Streaming `1.2.0`, using the English
+  `batch_size=32` profile.
+- Pinned Riva Translate 1.6B to `1.5.2` and Magpie multilingual TTS to `1.7.0`.
+- Configured one-GPU Compose networking with ASR on gRPC 50052, NMT/S2S on
+  50051, and TTS on 50053.
+- Enabled ASR automatic punctuation and used an 800 ms final EOU window.
+- Added environment-based Riva connection and endpointing settings.
+- Added explicit `end_input` handling so final translated output could drain
+  before `stop_stream`.
+- Corrected the batch harness to measure first audio, post-input output,
+  service flush tail, duration expansion, and fixed-rate listener playback
+  tail.
+- Completed one long-form run for each of @jgough-essextec's three sample files
+  without a WebSocket drop or gRPC failure.
+
+Pinned pipeline:
+
+```text
+Nemotron ASR Streaming 1.2.0
+  -> Riva Translate 1.6B 1.5.2
+  -> Magpie multilingual TTS 1.7.0
+```
+
+Historical results:
+
+| Sample | First audio | Service flush tail | Output/input | Fixed 1.00x playback tail |
+|---|---:|---:|---:|---:|
+| Sample 01 | 16.1 s | 0.0 s | 1.056x | 172.638 s |
+| Sample 02 | 2.3 s | 0.4 s | 1.081x | 228.772 s |
+| Sample 03 | 4.7 s | 0.8 s | 1.017x | 70.394 s |
+
+The fixed tails shown here were later corrected to the exact end of the final
+PCM source chunk. The compact July 8 summaries retain their original
+last-chunk-start values as historical capture records; the generated playback
+report labels those values as compatibility evidence.
+
+The short service flush tail did not eliminate the listener tail. Spanish
+media was longer than the source, and response timing left substantial audio
+queued for fixed-rate playback. Sanitized aggregate findings are retained in
+`NEMOTRON_TEST_RESULTS.md`; raw captures are intentionally excluded.
+
+Benefit observed from Nemotron 3:
+
+- It uses the Riva team's recommended high-quality English streaming ASR for
+  this English-input use case.
+- Sample 03 showed a substantial listener-tail improvement and Sample 01 a
+  moderate improvement relative to reconstructed prior runs.
+- Sample 02 remained effectively unchanged, so the ASR change alone did not
+  solve audience delay across all files.
+
+The percentages are based on one new run per file against three older runs and
+must be repeated before being treated as stable.
+
+## 2026-07-22: adaptive browser playback implementation
+
+Completed in the working branch:
+
+- Added a policy module with 5-second catch-up, 8-second urgent, and 10-second
+  over-limit thresholds.
+- Added 4-second and 7-second release thresholds for hysteresis.
+- Added 1.00x, 1.05x, and 1.10x per-buffer playback rates.
+- Kept speech lossless: no buffer is dropped when the queue exceeds 10
+  seconds. The threshold is an SLA alarm and breach counter.
+- Added current, peak, p50, and p95 browser queue telemetry plus time above 5
+  and 10 seconds.
+- Added scheduling and queue-sample fields to client CSV exports.
+- Enabled adaptive translated output in the live translation panel and file
+  test dashboard; kept English input monitoring at fixed 1.00x.
+- Updated the test dashboard to require both network quiet and an empty
+  browser playback queue before completing a natural drain.
+- Added the typed `end_input` client message.
+- Added policy, scheduling, telemetry, CSV, and dashboard test coverage.
+- Added a pre-run adaptive/fixed control in the dashboard; its session event
+  records that condition in every exported client CSV.
+- Pinned the backend SDK to the tested `nvidia-riva-client==2.24.0` for
+  reproducible service integration and the planned direct-stage work.
+
+Validation snapshot:
+
+```text
+Python backend + analysis tests: 53 passed
+Frontend tests:                  81 passed (Node.js 22)
+Frontend build:                  passed (Vite chunk-size warning only)
+Frontend lint:                   passed
+```
+
+No new live Riva sample run using the adaptive browser controller had been
+completed at this point. Do not label the July 8 fixed-rate tails as adaptive
+results.
+
+Completed offline validation:
+
+- Added a pure Python playback simulator matching the browser thresholds,
+  hysteresis, and rate decisions.
+- Added a trace analyzer that reads the ignored July 8 client event CSVs,
+  validates fixed-rate tails against the compact committed summaries, and
+  writes JSON and Markdown results.
+- Replayed every translated PCM chunk; no speech was dropped.
+
+| Saved trace | Simulated adaptive tail | Arrival-sampled queue p95 | Peak queue | Playback time over 10 s |
+|---|---:|---:|---:|---:|
+| Sample 01 | 27.051 s | 38.08 s | 46.54 s | 80.0% |
+| Sample 02 | 40.195 s | 44.71 s | 53.11 s | 77.3% |
+| Sample 03 | 16.408 s | 19.10 s | 23.81 s | 45.6% |
+
+The simulated aggregate tail reduction was 82.3%. This is promising but does
+not meet the queue goal: 1.10x still left all three traces above the 10-second
+soft ceiling for substantial periods. The output also predicts that most
+translated media would be accelerated, so a live browser run and native
+listener review remain mandatory.
+
+Generated replay artifacts remain under ignored local result directories. They
+are deterministic simulations from saved arrival traces, not modified live
+Riva results.
+
+Completed experiment automation:
+
+- Added `run_long_form_experiment.py` to health-check an already running
+  deployment, execute the one-minute preflight, and stream Sample 01, Sample 02, and
+  Sample 03 sequentially.
+- Added repeat and interrupted-run recovery controls with `--repeats` and
+  `--resume-dir`, plus `--dry-run` for reviewing the resolved plan without
+  contacting the backend.
+- Pinned the runner dependencies to `websockets==15.0.1`,
+  `matplotlib==3.10.9`, and `imageio-ffmpeg==0.6.0` in the root requirements.
+- Added timestamped, ignored `experiment_results/` runs that keep raw traces,
+  per-sample summaries and plots, matched playback-policy analysis, and run
+  metadata together.
+- Made the experiment fail when requested artifacts or valid translated audio
+  are missing instead of silently treating partial batch output as success.
+
+Post-review hardening:
+
+- The backend now emits terminal `completed` only after the Riva response
+  generator exhausts successfully, the request iterator has consumed its stop
+  sentinel, and all pending PCM WebSocket sends finish. Sentinel consumption
+  proves every queued source chunk was read; early ASR endpointing restarts the
+  generator until input is exhausted. Generator/final-flush errors or
+  audio-send failures emit `error` and invalidate the capture. Five seconds of
+  output silence is no longer success, and the 300-second maximum is a failure.
+- Captures are generated under `.staging`, validated as a complete
+  CSV/summary/plot set, promoted, hashed with SHA-256, and validated again.
+  Validation reconciles CSV sent/receive counts and received-byte totals with
+  the summary. Resume rechecks the stored artifact hashes.
+- Resume now requires the original and current worktrees to be clean at the
+  same Git commit, with each sample unchanged by size and SHA-256.
+- A backend-keyed local `flock` rejects concurrent harnesses on the same
+  machine. It does not coordinate clients on separate machines.
+- Candidate p95 is now the exact time-weighted queue p95 over the playback
+  window. Reports also include exact time above 10 seconds and the longest
+  continuous interval scheduled at 1.10x.
+
+The output contract is:
+
+```text
+experiment_results/YYYYMMDDTHHMMSSZ_<git-short-sha>/
+├── manifest.json
+├── playback_policy_analysis.json
+├── playback_policy_analysis.md
+├── preflight/
+│   ├── preflight_results.csv
+│   ├── preflight_summary.json
+│   └── preflight_latency.png
+└── repeat-01/
+    ├── <sample-stem>_results.csv
+    ├── <sample-stem>_summary.json
+    └── <sample-stem>_latency.png
+```
+
+Each `repeat-NN` directory contains that artifact set for all three samples.
+The manifest stores resumable per-capture status, so there is no separate
+checkpoint file. `--dry-run` does not contact the backend or create the run
+directory. `--resume-dir` requires a compatible existing manifest, validates
+provenance and artifact integrity before skipping completed entries, and
+retries incomplete or failed entries. It recovers backend and repeat settings
+from the manifest; explicitly supplied values must match. Queue-SLA misses
+remain reported experimental outcomes; they are not treated like transport,
+preflight, zero-output, completion, or artifact-integrity failures.
+
+One live Riva trace is sufficient for both fixed and adaptive playback analysis
+because the playback policy is downstream of ASR, NMT, and TTS. Reusing the
+same PCM arrival events makes the two policy results a matched comparison and
+avoids a second inference pass whose service and network variation would
+confound the result. The Python scheduler mirrors the browser policy, but this
+automation is not a browser/Web Audio execution. It also does not evaluate
+Spanish naturalness or intelligibility and cannot measure semantic delay from
+an English joke or marked phrase to the corresponding Spanish audio.
+
+Runs are sequential because the application exposes one active S2S session and
+one global timing session. A repeat contains approximately 103.7 minutes
+(roughly 1 hour 45 minutes) of source audio for the three samples. A new run
+adds a single one-minute preflight, and every capture adds translated-tail drain
+time. The harness deliberately does not start or stop the Riva containers or
+FastAPI backend.
+
+Automation validation snapshot:
+
+```text
+Python backend + analysis + harness tests: 70 passed
+Frontend tests:                           81 passed (Node.js 22)
+Frontend lint:                            passed
+Frontend build:                           passed (Vite chunk-size warning only)
+Docker Compose configuration:             passed
+Harness --help and no-write --dry-run:     passed
+```
+
+Known experimental limitation:
+
+- Web Audio `playbackRate` changes pitch as well as tempo and may reveal chunk
+  boundary artifacts. Native Spanish listener evaluation is required.
+- The 10-second threshold cannot be a hard cap while speech is preserved if
+  sustained translated media arrives faster than 1.10x consumption.
+- Browser queue depth is exact playback backlog, but it is only one component
+  of semantic English-to-Spanish delay.
+
+## 2026-07-22: one-repeat live acceptance run
+
+Completed:
+
+- Started all three pinned NIMs on one NVIDIA RTX PRO 6000 Blackwell Server
+  Edition and confirmed final usage of 32,217 MiB with 65,034 MiB free.
+- Passed the one-minute preflight and captured one new real-time Riva arrival
+  trace for Sample 01, Sample 02, and Sample 03.
+- Verified terminal completion, summary/CSV consistency, manifest artifact
+  hashes, empty staging state, and final service readiness.
+- Exercised strict resume after one Sample 02 TTS failure. The harness
+  retained verified work, discarded incomplete staging output, and reran only
+  the failed and pending work.
+
+Measured fixed 1.00x versus adaptive playback:
+
+| Sample | Fixed tail | Adaptive tail | Reduction | Adaptive p95 | Time above 10 s |
+|---|---:|---:|---:|---:|---:|
+| Sample 01 | 142.433 s | 36.656 s | 74.3% | 35.823 s | 69.377% |
+| Sample 02 | 204.144 s | 30.509 s | 85.1% | 37.460 s | 78.620% |
+| Sample 03 | 41.806 s | 17.797 s | 57.4% | 18.622 s | 41.569% |
+
+Aggregate tail fell 78.1%, from 388.383 to 84.962 seconds, with no translated
+chunks dropped. Every sample trace nevertheless missed the overall candidate
+gate set. The data does not support treating the 10-second value as a bounded
+audience experience at the current 1.10x maximum rate.
+
+The first Sample 02 attempt exposed a separate robustness issue. Magpie's logs
+showed that the text reaching TTS contained Chinese `阿门。` for a final
+"Amen." fragment despite the Spanish target; the NMT logs did not expose the
+translated text directly. The Magpie ensemble failed while mapping it. Direct
+TTS, concurrency, and 30-second end-of-file S2S isolation probes later
+succeeded, ruling out a simple permanent inability to synthesize the text but
+not isolating the cause. Target-language/non-empty validation before TTS is
+still required in the staged design.
+
+The detailed procedure, metrics, failure diagnosis, evidence boundaries,
+artifact hashes, and next recommendations are in
+[Three-sample acceptance run](ACCEPTANCE_RUN_2026-07-22.md).
+
+## 2026-07-22: staged pipeline foundation
+
+Completed on the stacked `agent/staged-s2s-pipeline` branch:
+
+- Added a direct Nemotron streaming-ASR adapter on `localhost:50052` while
+  leaving the active monolithic WebSocket path unchanged.
+- Added a bounded ordered ASR event bridge whose blocking worker backpressures
+  on a full asyncio queue, with tested terminal events, cancellation, active
+  stream exclusion, channel close, and owned-executor cleanup.
+- Factored the tested 16 kHz mono, automatic-punctuation, 800 ms RNNT EOU
+  request into one builder shared with the existing S2S client.
+- Added separate ASR-final and emitted-segment identities with provenance and
+  a future stage-event telemetry contract.
+- Added deterministic punctuation segmentation across finals, abbreviation
+  and decimal protection, Unicode boundaries, exact-once final flush, and
+  configurable 240-character/2,000 ms safety valves.
+- Added strict direct-ASR completion: early server termination before the
+  input sentinel is consumed reports an error rather than success.
+- Added a standalone real-time WAV smoke command.
+
+Validation:
+
+```text
+Focused staged foundation tests: 79 passed
+Full Python regression suite:     149 passed
+Live direct ASR smoke:             20.0 s audio, 59 interims,
+                                   5 finals, 4 segments, input complete
+Live bounded event bridge:         59 INTERIM, 5 FINAL, 1 COMPLETE,
+                                   0 ERROR
+```
+
+The smoke used the pinned Nemotron ASR Streaming `1.2.0`, Riva client `2.24.0`,
+automatic punctuation, and the 800 ms EOU configuration. Detailed contracts,
+commands, limitations, and observed results are in
+[Staged pipeline foundation](STAGED_PIPELINE_FOUNDATION.md).
+
+## 2026-07-22: bounded staged NMT and TTS pipeline
+
+Completed on the stacked `agent/staged-nmt-tts-pipeline` branch:
+
+- Added direct one-segment NMT with an explicit unary deadline, exact-one and
+  nonempty-response validation, and an exact `es-US` language check.
+- Added direct Magpie TTS with Isabela voice selection, mono Int16 validation,
+  active-call cancellation, and atomic whole-segment PCM publication.
+- Confirmed live that blank NMT requests can hallucinate fluent output and
+  enforced a pre-RPC blank-input rejection.
+- Added one NMT worker and one TTS worker on separate executors so stages
+  overlap while output remains in source order without a reorder buffer.
+- Added bounded NMT, TTS, and output queues, exact natural sentinel drain,
+  first-failure ownership, deterministic cancellation, and model deadlines.
+- Added queue-depth, blocked-put, queue-residence, processing, first-audio,
+  provenance, and PCM-duration telemetry.
+- Added an opt-in end-to-end WAV smoke that emits raw PCM and a JSON report.
+
+Validation:
+
+```text
+Direct NMT tests:                    24 passed
+Direct TTS tests:                    29 passed
+Staged orchestrator tests:           23 passed
+Full backend regression suite:      176 passed
+Full Python regression suite:       225 passed
+
+Live 60-second staged preflight:
+  terminal outcome:                 complete
+  first translated audio:           5.109 s
+  post-input tail drain:             1.307 s
+  translated audio segments:        23
+  max NMT / TTS / output depth:      2 / 2 / 2
+  blocked queue puts:                0
+  NMT average processing:          319.84 ms
+  TTS average first audio:         145.98 ms
+  TTS average full completion:     493.69 ms
+```
+
+That milestone left the active browser route monolithic. The subsequent
+default-off WebSocket integration is documented in
+[Feature-flagged staged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+The one-minute WebSocket gate later passed. The Sample 03 canary also passed
+after the content-safety hardening documented below; new staged Sample 01,
+Sample 02, and Sample 03 matrix runs remain pending.
+
+## 2026-07-22: feature-flagged staged WebSocket path
+
+Completed on top of `agent/staged-nmt-tts-pipeline`:
+
+- wired the bounded direct pipeline into `/ws/translate` only when
+  `S2S_PIPELINE_MODE=staged`; the default remains `monolithic`;
+- created fresh session-owned ASR, NMT, and TTS clients for every staged
+  stream so cancellation cannot poison a later stream;
+- preserved the existing control/status/error/binary PCM protocol;
+- emitted `listening` only after all staged clients and workers started;
+- serialized PCM, status, level, and pong WebSocket writes;
+- retained FIFO sequence IDs and successful WebSocket send timestamps;
+- validated cleanup, outcome, incomplete sequences, and sent/dequeued parity
+  before emitting `completed`;
+- made duplicate `end_input` idempotent and session replacement await cleanup;
+- exported full staged events and summaries from `/api/test/export`;
+- exposed active mode and all staged limits through `/api/config`;
+- taught the batch and resumable sample harnesses to save and enforce staged
+  integrity evidence while keeping audience SLA misses as measurements;
+- made the browser dashboard require server completion, network quiet, and an
+  empty Web Audio queue for natural success; and
+- exposed current/peak browser queue, playback rate/mode, and limit breaches
+  in the live translation panel.
+
+Regression validation after integration:
+
+```text
+Python:          275 passed
+Frontend:         88 passed
+Frontend lint:    passed
+Frontend build:   passed (existing bundle-size warning only)
+Python compile:   passed
+git diff check:   passed
+```
+
+Live terminal-aware `/ws/translate` preflight with the local `preflight.wav`:
+
+```text
+mode:                            staged (reported by /api/config)
+input:                           60.000 s / 200 chunks, complete
+first translated client audio:    5.087 s
+translated output:               50.295 s / 1,609,442 bytes
+output/input whole-prefix ratio:   0.838x
+last-audio tail after input:       1.316 s
+completed-terminal arrival:       1.374 s
+harness drain observation:         2.254 s (poll/settle included)
+fixed-rate playback tail:          6.996 s
+segments emitted/sent:            23 / 23 (IDs 0-22)
+max NMT/TTS/output depths:         2 / 2 / 1
+blocked queue puts:                0 / 0 / 0
+integrity result:                  passed
+```
+
+The run had no failure, cleanup error, incomplete sequence, disconnect,
+timeout, container restart, or GPU OOM. All three NIMs remained healthy with
+zero restarts. Detailed timings, limitations, reproduction commands, and the
+compact evidence record are in
+[Feature-flagged staged WebSocket integration](STAGED_WEBSOCKET_INTEGRATION.md).
+
+This one-minute pass does not establish the live-audience SLA. A complete
+Sample 03 operational canary subsequently passed after the hardening described
+below. New staged runs of all three samples remain pending. Browser queue
+p95/peak/time-over-10-seconds and a synchronized joke/marked-phrase delay also
+remain separate audience evidence.
+
+## 2026-07-22: staged content hardening and full Sample 03 canary
+
+The full-sample promotion gate exposed two defects that the one-minute
+preflight did not reach:
+
+- Attempt 1 stopped approximately 69.1 seconds into Sample 03 when a producer
+  capture timestamp arrived behind a newer asyncio age-poll observation and
+  triggered `monotonic time cannot move backwards`. The staged consumer now
+  supplies a nondecreasing observation timeline to the segmenter while retaining
+  the original capture times and Nemotron source-word offsets as evidence.
+- Attempt 2 reached 807.9 seconds before Magpie failed on an isolated English
+  hesitation final, `uh.`. A targeted ASR replay reproduced that exact fragment;
+  Riva Translate 1.5.2 translated it to Chinese `呃。` while reporting the
+  requested Spanish target. Direct probes found the same wrong-script class for
+  standalone `Okay.` (`好吧。`) and `Amen.` (`阿门。`). This tied the earlier
+  Sample 02 `阿门。` observation to a reproducible short-fragment NMT content
+  class rather than a permanent TTS or GPU failure.
+
+The mitigation is deliberately layered:
+
+- suppress only exact standalone hesitation fillers (`uh`, `um`, `er`, `erm`,
+  and `hmm`, ignoring case and surrounding punctuation) before assigning a
+  segment ID, with privacy-safe `filler_discarded` telemetry;
+- validate every Spanish-target NMT result immediately after NMT and again at
+  the TTS boundary, rejecting empty, wrong-script, mixed-script, control,
+  format, symbol, or detached-mark content before it can reach Magpie; and
+- use narrow deterministic Spanish overrides for standalone `OK`/`Okay` and
+  `Amen` fragments. Meaningful short utterances remain eligible for normal
+  translation, and unsafe content is not blindly retried through TTS.
+
+An exact 790-815 second Sample 03-region smoke then completed successfully. It
+emitted and synthesized 10 ordered segments, discarded the isolated filler,
+passed staged integrity, and reported no pipeline error or incomplete ID.
+
+Attempt 3 completed the entire 1,888.1045-second Sample 03 source through the
+feature-flagged staged WebSocket path:
+
+| Measurement | Result |
+|---|---:|
+| Ordered segment IDs | 646 |
+| Exact fillers discarded | 6 |
+| Translated output/input duration | 1.01627x |
+| First translated audio | 5.113 s |
+| Last-audio arrival tail | 0.850 s |
+| Completed-terminal arrival after input | 1.744 s |
+| Harness drain observation (poll/settle included) | 2.255 s |
+| Fixed 1.00x playback tail | 64.038 s |
+| Maximum NMT / TTS / output queue depth | 4 / 4 / 1 |
+| Blocked NMT / TTS / output puts | 15 / 0 / 0 |
+
+All 646 IDs were emitted, dequeued, and sent in order. The run passed the
+terminal and staged-integrity checks with no server error, cleanup error,
+incomplete sequence, disconnect, timeout, container restart, or GPU OOM. The
+15 blocked NMT puts demonstrate that bounded backpressure was exercised rather
+than bypassed.
+
+The post-run playback analyzer also exposed and fixed a 300 ms boundary error:
+new CSVs contain an explicit `client/input_ended` event, but the loader still
+used the start timestamp of the last input chunk. It now prefers the explicit
+boundary; older traces use the exact end of their final PCM chunk, while old
+start-boundary summaries are accepted only as annotated compatibility
+evidence. Regression tests cover both rules. The Sample 03 replay matches its
+explicit-boundary 64.038-second fixed tail within 7 microseconds. The adaptive
+replay reaches a 14.246-second tail (77.75% lower) but still peaks at 28.052
+seconds of queued media.
+
+The final release audit then hardened cases not exercised by the live canary:
+
+- reject a `completed` control before client `end_input`;
+- require exact successful-server-send/client-receive PCM frame and byte
+  parity for staged captures;
+- freeze full declared ASR/NMT/TTS model configuration for new runs and
+  reject incompatible resume checkpoints;
+- record exact completed-terminal arrival separately from harness
+  polling/settle duration;
+- make staged cleanup singleton and cancellation-safe, prevent a displaced
+  session from restarting, and avoid lifecycle locks across socket writes;
+- route unknown controls through the staged terminal latch; and
+- reject non-Magpie-safe target punctuation, including CJK full stop, without
+  logging translated text.
+
+The retained attempt-3 trace satisfies the new terminal order and byte-parity
+checks, but its old summary lacks `modelConfig` and the new top-level timing
+fields. It is therefore historical/non-resumable evidence. The final edge
+hardening is unit/integration-tested and still needs a fresh GPU preflight
+before the remaining long-form matrix.
+
+Post-hardening validation snapshot:
+
+```text
+Focused backend hardening:                125 passed
+Focused harness hardening:                 59 passed
+Full backend suite:                       264 passed
+Full Python backend + analysis + harness: 344 passed
+Frontend tests:                            88 passed (Node.js 22)
+Frontend lint:                             passed
+Frontend build:                            passed (existing bundle-size warning only)
+```
+
+This is an operational canary pass, not an audience-latency acceptance. Its
+64.038-second fixed-rate listener tail still illustrates the delayed-joke risk.
+An actual browser/Web Audio run, synchronized English-to-Spanish phrase timing,
+native Spanish quality review, and a new full staged Sample 01/Sample 02/Sample 03
+matrix remain required.
+
+## 2026-07-23: narrow NMT recovery and failure evidence
+
+A new staged Sample 02 run failed closed when Riva Translate 1.6B `1.5.2`
+declared `es-US` but returned unsupported wrong-script content for one isolated
+short source segment. The target validator prevented that text from reaching
+TTS. Privacy-safe controlled replay isolated a deterministic request-shape
+boundary:
+
+| Replay condition | Validation result |
+|---|---:|
+| Exact isolated ASCII-token plus punctuation shape | failed, 5/5 |
+| Same token without terminal punctuation | passed, 5/5 |
+| Same token with preceding context | passed, 5/5 |
+| Same token with following context | passed, 5/5 |
+| Same token with both neighboring contexts | passed, 5/5 |
+
+This evidence ruled out a transient RPC, TTS, concurrency, or GPU-capacity
+failure. Repeating the unchanged request was therefore rejected as a recovery
+strategy.
+
+The direct NMT adapter now owns one narrowly defined alternate request:
+
+- exact target `es-US`;
+- source text, after trimming, of 1-32 ASCII letters followed by exactly one
+  `.`, `?`, or `!`;
+- first RPC cardinality and response language are valid, but translated text
+  raises `TargetTextValidationError`; and
+- one second request removes only the terminal punctuation.
+
+The returned object keeps the original segment, sequence ID, ASR-final
+provenance, source timing, and emission reason. The second NMT response is
+fully revalidated before TTS. RPC, cardinality, response-language, ineligible
+source, and second-attempt failures receive no extra attempt. Neither NMT nor
+TTS ever repeats an unchanged payload.
+
+Recovery is observable without recording transcript text. A completed NMT
+event carries `retry_count` zero or one, and the staged summary's
+`nmt_retry_count` must equal the sum across those events. If the alternate
+request also fails, a typed NMT error event retains the original sequence and
+provenance with `retry_count=1`; no translated text enters telemetry or TTS.
+
+Failure evidence handling was hardened at the same boundary:
+
+- staged shutdown retains an exportable snapshot before asynchronous cleanup
+  and a finalized snapshot afterward;
+- the batch client polls for the finalized `closed` snapshot for a bounded
+  close-settling interval;
+- staged integrity requires the closed state and consistent retry totals; and
+- a failed long-form capture retains only its generated event CSV, summary, and
+  latency plot under neutral names in an ignored owner-private directory, with
+  paths and SHA-256 hashes recorded under `failure_artifacts`.
+
+Source audio, generated audio, arbitrary temporary files, logs, and credentials
+are not copied into the failed-capture record. The complete behavior,
+verification gates, and clean rerun order are documented in
+[Narrow NMT recovery for short punctuated segments](NMT_SHORT_SEGMENT_RECOVERY.md).
+At that point, the next gates were a targeted Sample 02 pass followed by a
+fresh preflight and clean three-sample matrix.
+
+Local verification passed `376` Python tests with one skipped integration test,
+all `88` frontend tests, frontend lint, and the production build. All three
+pinned service HTTP readiness probes returned ready. A privacy-safe live call
+through the updated direct adapter used the exact protected failure segment and
+reported one retry, preserved sequence 77, returned exact `es-US`, and passed
+target validation without printing source or translated text.
+
+## 2026-07-23: full Sample 02 post-recovery canary
+
+Commit `55b59bd` completed one standalone 2,427.011-second Sample 02 run through
+the hardened staged WebSocket path. The artifact reached `closed` / `complete`
+and passed staged integrity with:
+
+- 805 emitted, NMT-completed, TTS-completed, produced, WebSocket-sent, and
+  client-received audio segments;
+- contiguous unique sequence IDs 0–804 and exact PCM count-and-byte parity;
+- no incomplete IDs, pipeline failure, cleanup error, connection loss, drain
+  timeout, server error, or PCM after terminal completion;
+- three validated NMT recoveries at sequence IDs 77, 92, and 449;
+- maximum NMT/TTS/output queue depths of 4/4/1; and
+- 17/5/0 blocked puts, demonstrating bounded backpressure without drops.
+
+First audio arrived after 4.807 seconds. Last translated audio arrived 0.308
+seconds after source input ended, and the completed terminal arrived after
+1.455 seconds. Operationally, the recovery and drain paths passed.
+
+The audience gate did not pass. Translated PCM totaled 2,641.342 seconds,
+1.08831x the 2,427.011-second input, and fixed 1.00x arrival replay ended
+239.156 seconds late. This makes 1.10x a more plausible catch-up candidate than
+1.05x for this sample, but executed browser playback, marked-phrase timing, and
+native-Spanish quality review remain required.
+
+This targeted canary is not part of a resumable experiment manifest and must
+not be treated as a completed matrix checkpoint. The compact, transcript-free
+record is
+[Sample 02 post-recovery staged canary](STAGED_SAMPLE_02_RECOVERY_CANARY.md).
+
+## 2026-07-24: VM restart readiness observation
+
+The completed canary artifacts survived a later VM lease expiry and shutdown.
+After the VM returned, all three Compose-managed NIM containers restarted at
+approximately 00:03:24 UTC and reported `healthy`; their `unless-stopped`
+policy behaved as configured. The separately launched FastAPI process did not
+restart and its staged endpoint was not listening.
+
+The next formal experiment must therefore relaunch FastAPI, verify `/` and
+`/api/config`, and pass a new 60-second preflight before starting a clean
+three-sample matrix. Healthy model containers alone are not sufficient
+readiness after a host restart.
+
+## Reproducible validation commands
+
+Authenticate and start the pinned Riva services:
+
+```bash
+set -a
+source .env
+set +a
+
+printf '%s' "$NGC_API_KEY" | \
+  docker login nvcr.io --username '$oauthtoken' --password-stdin
+
+docker compose config --images
+docker compose pull
+docker compose up -d
+docker compose ps
+
+curl --fail http://localhost:9002/v1/health/ready
+curl --fail http://localhost:9001/v1/health/ready
+curl --fail http://localhost:9003/v1/health/ready
+nvidia-smi
+```
+
+Run code validation:
+
+```bash
+python -m pytest backend/tests tests -q
+
+cd frontend
+npm ci
+npm test
+npm run build
+npm run lint
+cd ..
+```
+
+Install the root experiment dependencies, inspect the plan, and run all three
+samples:
+
+```bash
+pip install -r requirements.txt
+git status --short  # must be empty for a resumable live run
+python run_long_form_experiment.py --dry-run
+python run_long_form_experiment.py
+```
+
+The defaults are:
+
+- `--backend http://localhost:8000`;
+- `--output-root experiment_results`; and
+- `--repeats 1`.
+
+`--run-id` gives a new run a deterministic directory name. `--skip-preflight`
+is available only when an operator intentionally accepts the loss of that
+service-path check; it cannot change a resumed run.
+
+Collect three live traces per sample or continue an interrupted experiment:
+
+```bash
+python run_long_form_experiment.py --repeats 3
+python run_long_form_experiment.py \
+  --resume-dir experiment_results/<run-id>
+```
+
+The automated report calculates both fixed and adaptive playback from every
+live trace. Separately use `http://localhost:5173/#/test` and export its CSV for
+an actual Web Audio cross-check. Preserve the entire browser drain; do not stop
+after network output goes quiet while the playback queue remains nonzero. A
+native-listener review and synchronized joke/marked-phrase measurements are
+also separate required activities.
+
+## Next-run record template
+
+Copy this block into the compact summary for each formal run:
+
+```text
+Run ID:
+UTC start:
+Git commit:
+Measurement source: automated Python replay | browser Web Audio
+Policy: fixed-1.00x | adaptive
+Audio file:
+Repeat number:
+GPU / driver:
+ASR image or digest:
+NMT image or digest:
+TTS image or digest:
+EOU / punctuation:
+First audio:
+Service flush tail:
+Output/input duration:
+Simulated time-weighted queue p50 / p95; peak:
+Longest continuous 1.10x:
+Actual browser queue p50 / p95 / max (browser runs only):
+Seconds and percent >5 s:
+Seconds and percent >10 s:
+Rate exposure at 1.00x / 1.05x / 1.10x:
+Listener playback tail:
+Marked-phrase or punchline delay:
+Quality observations:
+Runtime failures:
+Artifact locations:
+```
+
+## July 24, 2026: intermittent short-target TTS recovery
+
+The first post-reboot provenance-frozen matrix passed preflight and then
+failed during Sample 01 at source position 39.3 seconds. Sequence 7 had a
+three-character source and validated two-character `es-US` target. NMT
+completed normally with no retry, but Magpie returned gRPC `UNKNOWN` with an
+internal Triton zero-token tensor mismatch.
+
+Retained evidence ruled out queue pressure, transport loss, GPU exhaustion,
+container restart, OOM, and a persistent service failure. The same source
+hash and sequence shape had succeeded earlier, and a direct known-good TTS
+call passed after the failure.
+
+A new privacy-safe `diagnose_short_segment.py` replayed the first 39.3 seconds
+through the production-style asynchronous ASR bridge and age-polling segmenter.
+It retains no text, path, filename, or endpoint hostname and uses only
+structural counts plus a per-run keyed HMAC whose key is discarded. The replay
+recreated sequence 7 exactly: three source characters and a validated
+two-character target. With client retry disabled, four of five exact TTS calls
+passed and one reproduced gRPC `UNKNOWN`. The adjacent-context translation
+passed five of five calls. With retry enabled, all 20 isolated calls passed and
+two recorded `client_retry_count=1`, directly exercising successful recovery
+against the live pinned service.
+
+The direct TTS adapter now permits one retry only for gRPC `UNKNOWN`, controlled
+by `STAGED_TTS_MAX_RETRIES` (`0` or `1`, default `1` for the staged path).
+Both attempts remain inside one orchestrator deadline and use separate private
+PCM buffers. Validation, cancellation, timeout, resource, format, and local
+safety failures are never retried. Successful and exhausted recovery paths
+retain sequence attribution and privacy-safe retry telemetry. Batch integrity
+reconciles `tts_retry_count` against completed TTS events.
+
+True post-NMT coalescing was intentionally deferred. It requires grouped
+synthesis units and grouped sequence accounting. The five-call context result
+is promising but does not establish a general classifier, and broadly holding
+short utterances would add avoidable audience delay. See
+[Atomic TTS recovery for an intermittent short-segment failure](TTS_SHORT_SEGMENT_RECOVERY.md).
+
+The failed `700aeec` matrix remains an immutable baseline. Because the harness
+correctly rejects cross-commit resume, the recovery must be evaluated in a
+fresh formal matrix after commit, backend restart, and preflight.
+
+## July 24, 2026: clean staged recovery matrix
+
+Recovery commit `636f4784797372a8b6092255d0438951f9300c0b` passed the
+one-minute preflight and completed one new real-time trace for each neutral
+long-form sample. The repository was clean, the manifest froze the pinned
+ASR/NMT/TTS digests, and all promoted artifact hashes validated.
+
+The three captures produced 2,027/2,027 ordered PCM segments with exact
+server-send/client-receive count and byte parity. Three guarded NMT retries
+recovered during Sample 02. No TTS retry was needed, and there was no incomplete
+sequence, connection loss, timeout, pipeline failure, or cleanup error. A
+separate immediate post-run check, outside the hashed manifest, found all
+containers healthy with zero restarts or OOM events.
+
+The run is an operational pass and an audience-latency miss. Matched no-drop
+adaptive replay reduced the sum of fixed listener tails from 526.441 seconds to
+117.516 seconds, or 77.677%. Per-sample adaptive queue p95 remained 61.414,
+38.158, and 23.210 seconds. The controller already played 78.650-94.811% of
+translated media at 1.10x, so threshold-only tuning is unlikely to establish the
+5-10 second objective.
+
+Retain the ignored raw artifacts separately. The tracked, transcript-free
+result and next-experiment decision are in
+[Staged recovery three-sample matrix](STAGED_RECOVERY_MATRIX_2026-07-24.md).
+
+The offline analyzer now accepts repeatable `--constant-rate` and
+`--media-duration-scale` options. Its optional capacity report preserves every
+chunk and records tail, time-weighted queue p50/p95, peak, time above 10
+seconds, captured chunk-duration quantiles, and 30/60/300-second wall-clock
+media-arrival p95. The default analyzer output remains byte-compatible when
+the new flags are absent. Constant rates through 1.15x did not reach queue p95
+at or below 10 seconds on any of the three captured traces.
+
+The post-sweep full Python suite passed 413 tests with one optional local-trace
+test skipped. Independent review matched the rolling-rate implementation
+against a brute-force calculation over 10,000 randomized cases.
+
+## July 24, 2026: privacy-safe TTS duration capacity model
+
+The completed matrix retained character counts on TTS-start telemetry and PCM
+duration on matching TTS-completed events. A new deterministic
+`analyze_tts_duration.py` joins those fields by sequence ID only after
+validating clean staged outcome, contiguous and paired sequences, parent
+counts, WebSocket parent IDs, and retry totals. Its output excludes transcript,
+audio, paths, filenames, endpoints, and session IDs.
+
+The 2,027 structural records fit
+`audio_seconds = 0.488769 + 0.056789 * translated_characters`, with
+`R² = 0.853396`. Leave-one-sample-out residuals yielded a 44-character
+4-second-p95 limit and a 46-character 8-second observed-max-residual limit.
+Requiring aggregate, per-sample, and cross-sample constraints to pass within
+the observed character range on a five-character grid selected 40 characters.
+
+Call amplification prevents treating that cap as automatically beneficial.
+Ideal packing would increase calls by at least 71.8%, 58.3%, and 34.0% for
+40-, 45-, and 60-character caps. The aggregate intercept counterfactual
+corresponds to 10.7%, 8.7%, and 5.1% extra captured output. These are risk
+estimates, not live split results. A default-off composite child sequence
+contract and matched unsplit/40/45/60 five-minute canary are required before
+another full matrix. See
+[Post-NMT TTS subsegment capacity model](TTS_SUBSEGMENT_CAPACITY_MODEL.md).
+The post-model Python backend, analysis, and harness suite passed 431 tests
+with one optional local-trace test skipped; the focused analyzer suite passed
+18 tests.
+
+## July 24, 2026: default-off post-NMT TTS subsegmentation
+
+The feature-flagged staged path now keeps one complete NMT parent and can split
+only its validated target text before TTS. Zero disables splitting; positive
+caps use punctuation, whitespace, and bounded hard-fallback rules with exact
+normalized reconstruction tests.
+
+Every enabled TTS child carries a stable
+`(parent_sequence_id, subsequence_id, subsequence_count)` identity. The bounded
+queues, single TTS worker, output relay, atomic retry, error attribution,
+WebSocket sends, and telemetry preserve that identity. Raw run evidence remains
+privacy-sensitive because it can include session IDs, timings, paths, and
+endpoints, so it stays under ignored result directories. The pipeline marks a
+parent complete only after its final child is dequeued; the WebSocket layer
+separately proves that every completed child was successfully sent before the
+capture is accepted as end-to-end complete.
+
+Enabled captures use telemetry schema v2 with distinct planned, synthesized,
+dequeued, and WebSocket-sent child lists. The batch gate checks every lifecycle
+stream and compares client/server PCM sizes frame by frame. Disabled captures
+remain schema v1, and older captures with no explicit version retain legacy
+`(sequence, 0, 1)` semantics. The duration analyzer preserves the published v1
+digest and generated files byte for byte while adding composite v2 pairing.
+
+`run_tts_subsegment_canary.sh` creates one shared five-minute prefix and runs
+the disabled, 40-, 45-, and 60-character policies sequentially. It manages
+only its own FastAPI process and leaves the pinned NIMs untouched.
+Implementation details and gates are in
+[Default-off post-NMT TTS subsegmentation](TTS_SUBSEGMENT_IMPLEMENTATION.md).
+
+A non-formal 60-second-per-arm live probe passed every integrity, provenance,
+terminal, and cleanup gate. Splitting reduced child-duration p95 by 64.5–71.0%
+but increased total generated audio and worsened adaptive queue p95 and
+listener tail in every enabled arm. The 60-character policy was least harmful
+but still did not beat the disabled control. First audio remained about
+15.5–15.7 seconds. See
+[Post-NMT TTS subsegmentation: 60-second live probe](TTS_SUBSEGMENT_60S_PROBE_2026-07-24.md).
+The final local Python suite passed 514 tests with one optional local-trace
+test skipped.
+
+The formal five-minute matrix then ran from clean commit `4367931`. All four
+arms used the same 1,000 input chunks and 74 upstream NMT parents, passed
+immutable image provenance and matched-design checks, completed without a
+retry or dropped chunk, and left all three pinned NIMs healthy. The disabled
+control had a 19.339-second adaptive queue p95 and 30.510-second adaptive tail.
+Every split cap was worse: cap 60, the least harmful, increased adaptive queue
+p95 by 12.0% and tail by 8.1%. Splitting also left first audio effectively
+unchanged at about 15.5 seconds. The feature therefore stays disabled. See
+[Post-NMT TTS subsegmentation: five-minute matched canary](TTS_SUBSEGMENT_5MIN_CANARY_2026-07-24.md).
+
+## July 24, 2026: default-off incremental TTS publication
+
+The staged pipeline can now publish frame-aligned Magpie PCM while one TTS RPC
+is still active. The feature is disabled unless
+`STAGED_TTS_INCREMENTAL_PUBLISH=1`; the framing default is 100 ms. Incremental
+publication and post-NMT TTS subsegmentation are mutually exclusive for the
+first experiment, so schema-v3 identity is exactly
+`(parent_sequence_id, audio_frame_id)`.
+
+The blocking adapter privately reframes variable Riva responses, commits a
+frame only after bounded output-queue insertion is acknowledged, and returns
+an authoritative parent completion with frame and byte totals. A genuine
+gRPC `UNKNOWN` can retry once only before the first committed frame. After a
+committed prefix, any failure sends that prefix once and then one terminal
+error without replay. Abort wins an acquire/abort race until queue insertion
+has linearized the commit, preventing a reserved terminal from overtaking
+uncommitted PCM.
+
+The pipeline, WebSocket relay, batch gate, smoke tool, and latency analyzer
+now reconcile production, dequeue, server-send, and client-receive frame
+identities and bytes. The schema-v3 analyzer measures the first-frame lead
+against the same parent's TTS completion, avoiding a causal comparison across
+stochastic synthesis runs. `run_streaming_tts_canary.sh` automates a
+provenance-checked atomic/schema-v3 pair, and its comparator marks cross-arm
+queue and tail differences inconclusive whenever generated audio differs
+materially.
+
+The complete Python backend and analysis suite passed 575 tests with one
+optional local-trace test skipped. Python compilation, shell syntax, and
+whitespace checks passed. Frontend tests were not rerun on this VM because its
+Node.js 12 runtime is below the repository's declared Node.js 20.19 minimum;
+the schema-v3 wire contract remains ordinary ordered binary PCM and required
+no frontend source change.
+
+The first clean schema-v3 canary from `9505679` then reproduced the known
+two-character Magpie `UNKNOWN` after two 100 ms frames had committed. The
+adapter correctly refused to retry or replay that prefix and failed closed,
+but the run demonstrated that the diagnosed tiny-target shape needs atomic
+retry safety even when normal parents publish incrementally.
+
+Commit `57c7ffa` added a default four-character atomic fallback inside schema
+3. Tiny validated targets keep PCM private through iterator completion and the
+one allowed `UNKNOWN` retry, then reframe the successful attempt through the
+same bounded frame publisher. Longer targets retain true incremental delivery.
+Fallback identity now reconciles across adapter completion, pipeline events,
+output barriers, WebSocket completion, batch validation, latency analysis, and
+the matched canary comparator. Direct incremental-benefit metrics exclude
+fallback parents; audience-facing metrics retain them. Older schema-v3
+artifacts normalize omitted fallback fields to zero/empty.
+
+The post-fix suite passed 605 tests with one optional local-trace test skipped.
+The clean 60-second rerun completed all 16 parents in both arms. Schema 3
+selected parent 7 as its only atomic fallback and completed all 448 PCM frames
+without retry or failure. Across the 15 true-incremental parents, first PCM
+reached the WebSocket 35.5 ms p50 / 48.6 ms p95 after the first TTS response
+and led full-response completion by 347.5 ms p50 / 1.054 s p95.
+
+The atomic and schema-3 arms generated 52.199 and 43.886 seconds of speech,
+respectively, a 15.93% workload difference. Queue and tail deltas therefore
+remain confounded. First audio also remained about 15.1-15.5 seconds. This is
+an operational/direct-publication pass, not an audience-delay pass. See
+[Incremental TTS publication: 60-second formal canary](STREAMING_TTS_60S_CANARY_2026-07-24.md).
+
+The next clean five-minute matched canary ran from `29cdf4e`. Both arms
+completed the same 1,000 input chunks and 74 parent structure without a model
+retry, incomplete parent, terminal failure, or cleanup error. Schema 3
+delivered 2,782 frames and again classified the two-character parent 7 as its
+only atomic fallback.
+
+Across 73 true-incremental parents, first PCM followed the first TTS response
+by 35.5 ms p50 / 46.7 ms p95 and led full TTS completion by 348.1 ms p50 /
+1.659 s p95. The direct publication benefit therefore persisted over five
+minutes. Cross-arm playback remained confounded because generated duration
+differed by 7.43%.
+
+The schema-3 arm independently missed the live-audience bound: the no-drop
+adaptive queue had a 17.077-second time-weighted p95, 23.412-second peak, and
+27.120-second listener tail. It spent 44.286 seconds above the nominal
+10-second limit even though 55.20% of source audio was accelerated and 30.69%
+played at 1.10x. First audio remained 15.196 seconds.
+
+The unchanged no-drop policy is therefore not promoted directly to another
+three-fixture matrix. The next experiment is a deterministic hard
+freshness-cap simulation over the completed schema-3 arrival trace, reporting
+the explicit fidelity cost of whole-parent eviction at 5/8/10-second caps. See
+[Incremental TTS publication: five-minute matched canary](STREAMING_TTS_5MIN_CANARY_2026-07-24.md).
+
+## July 24, 2026: schema-3 whole-parent freshness-cap simulation
+
+The offline follow-on now joins client PCM arrivals to schema-3
+`(parent_sequence_id, audio_frame_id)` evidence only after parent-summary,
+frame-key, byte, order, timestamp, completion, and input-boundary layers
+reconcile. Public analyzer output contains only fixed role labels, hashes,
+numeric identities, counts, bytes, durations, and timing.
+
+The causal simulator applies the existing 1.00x/1.05x/1.10x decision before
+any loss. It can evict only a complete parent whose frames are all
+not-yet-audible, then compacts retained future frames while preserving their
+already-selected rates. It compares minimum oldest-first eviction with a
+jump-to-latest-complete policy and reports every residual breach rather than
+claiming an unachieved hard cap. Existing no-drop simulation output is
+unchanged.
+
+Primary results use a 100 ms cancellation guard so audio beginning effectively
+“now” is protected. The analyzer also replays 0, 50, 100, and 250 ms guards for
+the 10-second oldest-first candidate.
+
+The validated five-minute trace had 2,782 frames, 74 parents, and 274.369
+seconds of translated audio. No-drop queue p95/peak/tail were
+17.077/23.412/27.120 seconds. The most useful candidate was 10-second
+oldest-first: queue p95 fell to 8.352 seconds, peak to 14.059 seconds, and tail
+to 12.672 seconds. It retained 85.77% of generated audio, meaning it skipped 8
+parents and 39.056 seconds of speech. It still spent 4.180 seconds above the
+cap.
+
+The 10-second oldest-first headline was identical at 0/50/100 ms. At 250 ms it
+retained 86.83% instead of 85.77%, while queue p95 was 8.354 seconds and time
+above cap was 4.203 seconds. The candidate conclusion is therefore stable
+across the tested practical margins, though the selected parent IDs change.
+
+None of the six scenarios achieved its configured limit. Unaccelerated parent
+source-PCM duration was 11.331 seconds at p95 and 14.257 seconds maximum, but
+those media durations are not themselves rate-adjusted queue depth. The
+definitive failure evidence is the recorded residual breach after all eligible
+whole-parent evictions: incomplete, already-audible, or protected audio still
+exceeded each selected cap.
+
+Loss remains disabled. The next safe gate is versioned, opt-in parent/frame
+wire metadata plus observation-only browser telemetry, followed by an opt-in
+short-lookahead scheduler. See
+[Schema-3 whole-parent freshness-cap simulation](SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md).
+
+## July 25, 2026: observation-only parent/frame metadata
+
+The staged schema-3 incremental-TTS path now advertises audio metadata protocol
+version 1 and accepts an explicit per-stream opt-in. Under the existing
+serialized WebSocket send lock, every translated PCM frame is preceded by an
+exact numeric `audio_frame` header, and every parent ends with an
+`audio_parent_complete` marker that reconciles frame and byte totals. Legacy
+clients continue to receive anonymous binary PCM. The main translation screen
+remains legacy; only the test dashboard and CLI evidence clients opt in.
+
+Backend, Python, and browser receivers fail closed on missing, extra,
+misordered, mismatched, cross-generation, incomplete, or post-terminal
+evidence. Protocol fields exclude text and wall-clock identity. Raw capture
+artifacts remain private because they also contain operational paths and
+endpoints.
+
+The real-time file harness anchors input PCM sample zero and records a
+contiguous source-sample ledger. It can therefore report source-end to binary
+receipt in one client-monotonic clock. The browser additionally records
+Web Audio scheduling coordinates and a projected scheduled start without
+changing rate, order, buffering, or playback. End-only `audio_processed`
+offsets are labeled non-semantic; scheduled start is not claimed as physical
+audibility. A synchronized phrase marker and output loopback are still needed
+to measure the audience's English-joke to Spanish-audio delay directly.
+
+The long-form runner persists protocol choice in immutable manifest provenance,
+propagates it through preflight and all three samples, validates saved wire and
+summary evidence on resume, and rejects legacy-to-v1 upgrades. The freshness
+analyzer prefers explicit version-1 wire identity while retaining strict
+backward compatibility for older positional schema-3 captures. Its 10-second
+oldest-first parent policy remains a counterfactual: no live audio is dropped.
+
+Before live capture, the complete backend suite passed 416 tests, the root
+Python suite passed 317 tests with one optional local-artifact test skipped
+(733 passing Python tests combined), and the frontend passed 118 tests plus
+TypeScript build and lint. Protocol,
+privacy, clock, rollout, and reproduction details are in
+[Audio metadata observation protocol v1](AUDIO_METADATA_OBSERVATION_V1.md).
+
+The first clean live candidate completed both 60-second model arms, but the
+formal comparator rejected a legacy-control artifact that contained a
+client sample-zero marker despite not negotiating v1. Commit `062f28a` scoped
+the marker to negotiated streams and added a regression test.
+
+The corrected formal canary then passed all matched-design, provenance, wire,
+parent, byte, terminal, drain, and cleanup gates. The schema-3 arm reconciled
+521 frames and 16 parents. Source end to client receipt was 2.656 seconds p50 /
+3.915 seconds p95, while source end to deterministic scheduled start was
+8.264 seconds p50 / 12.860 seconds p95. These source ranges are not proven
+semantic boundaries, and scheduled start is not actual audibility.
+
+The 10-second oldest-first shadow policy would have retained 87.3% of
+translated audio and skipped one parent, yet it still peaked at 11.317 seconds.
+Loss remains disabled. See
+[Audio metadata protocol v1: 60-second formal canary](AUDIO_METADATA_60S_CANARY_2026-07-25.md).
+
+## Handoff checklist
+
+- [x] Frontend lint passed on the adaptive working branch
+- [x] Commit and push the adaptive branch with the initial experiment documents
+- [x] Run one automated live trace for all three samples
+- [x] Verify each completed trace produces the matched fixed/adaptive comparison
+- [x] Verify terminal completion, PCM-send drain, staged promotion, and hashes
+- [x] Verify resume provenance and backend lock behavior after a live failure
+- [ ] Run three repeats per sample after the staged design improves the queue
+- [ ] Cross-check replay scheduling with an actual browser/Web Audio run
+- [ ] Capture synchronized phrase/punchline delay, not only queue depth
+- [ ] Review 1.05x and 1.10x quality with native Spanish listeners
+- [x] Implement and unit-test punctuation splitting before staged live tests
+- [x] Add bounded NMT/TTS queues and ordered drain behavior
+- [x] Integrate the staged pipeline into `/ws/translate` behind a default-off flag
+- [x] Pass the terminal-aware one-minute staged WebSocket preflight
+- [x] Pass one complete staged Sample 03 operational canary
+- [x] Pass one complete post-recovery staged Sample 02 canary
+- [x] Run the full staged Sample 01, Sample 02, and Sample 03 matrix
+- [x] Sweep no-drop playback capacity on the completed matched traces
+- [x] Simulate 5/8/10-second whole-parent freshness/loss tradeoffs on schema 3
+- [x] Add opt-in parent/frame wire metadata and observation-only browser telemetry
+- [x] Pass a 60-second matched live canary with protocol-v1 evidence
+- [ ] Pass a five-minute matched live canary with protocol-v1 evidence
+- [ ] Run protocol v1 across all three long-form samples
+- [x] Fit and document a privacy-safe post-NMT TTS character/duration model
+- [x] Implement default-off composite-key post-NMT TTS subsegmentation
+- [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries
+- [x] Keep unapproved private/internal container references out of external
+  documentation

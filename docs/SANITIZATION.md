@@ -31,5 +31,21 @@ New public textual evidence must use neutral sample IDs, omit transcripts and
 raw paths, minimize session/runtime metadata, and be checked for secrets and
 identifying text before commit.
 
+Audio metadata protocol v1 follows an explicit numeric whitelist:
+
+- protocol and connection-local generation numbers;
+- parent and frame sequence IDs;
+- PCM byte counts and format;
+- nullable source-media offsets;
+- client-monotonic receipt/scheduling offsets; and
+- aggregate queue, freshness, and hypothetical-policy measurements.
+
+The wire and public aggregate reports exclude transcript/translation text,
+PCM, source names, local paths, URLs/endpoints, organization names, user
+identity, session UUIDs, and wall-clock epochs. Raw capture summaries still
+contain operational provenance such as the local backend URL and input path,
+so they remain under ignored, owner-private result directories. Only sanitized
+aggregate reports are candidates for commit.
+
 The upstream project is attributed by its public GitHub username and URL. The
 upstream repository is outside the scope of this repository's history rewrite.
