@@ -206,6 +206,7 @@ class FreshnessCapSummary:
     strategy: FreshnessStrategy
     adaptive: bool
     hard_cap_seconds: float
+    cancellation_guard_seconds: float
     hard_cap_achieved: bool
     frames_received: int
     frames_retained: int
@@ -795,6 +796,7 @@ def _eligible_complete_parents(
     *,
     complete_parent_ids: set[int],
     at_seconds: float,
+    cancellation_guard_seconds: float,
     parent_order: Sequence[int],
 ) -> tuple[int, ...]:
     starts_by_parent: dict[int, list[float]] = {}
@@ -808,7 +810,12 @@ def _eligible_complete_parents(
         if parent_sequence_id in complete_parent_ids
         and parent_sequence_id in starts_by_parent
         and all(
-            start_seconds > at_seconds + _FRESHNESS_TIME_EPSILON
+            start_seconds
+            > (
+                at_seconds
+                + cancellation_guard_seconds
+                + _FRESHNESS_TIME_EPSILON
+            )
             for start_seconds in starts_by_parent[parent_sequence_id]
         )
     )
@@ -952,6 +959,7 @@ def simulate_parent_freshness_cap(
     input_end_seconds: float,
     hard_cap_seconds: float,
     strategy: FreshnessStrategy,
+    cancellation_guard_seconds: float = 0.0,
     adaptive: bool = True,
     policy: PlaybackPolicy = DEFAULT_PLAYBACK_POLICY,
 ) -> FreshnessCapSimulation:
@@ -960,8 +968,9 @@ def simulate_parent_freshness_cap(
     Each frame is first scheduled with the same adaptive policy used by
     :func:`simulate_playback`. If the resulting queue exceeds
     ``hard_cap_seconds``, only complete parents for which no retained frame has
-    started are eligible for atomic eviction. Retained future frames are then
-    compacted and rescheduled at the same arrival timestamp.
+    started or entered the cancellation guard window are eligible for atomic
+    eviction. Retained future frames are then compacted and rescheduled at the
+    same arrival timestamp.
 
     ``oldest_first`` evicts the minimum oldest-parent prefix that reaches the
     cap, if possible. Retained future frames keep the causal mode/rate selected
@@ -977,6 +986,15 @@ def simulate_parent_freshness_cap(
         raise ValueError("input_end_seconds must be finite and non-negative")
     if hard_cap_seconds <= 0 or not math.isfinite(hard_cap_seconds):
         raise ValueError("hard_cap_seconds must be finite and positive")
+    if (
+        not isinstance(cancellation_guard_seconds, (int, float))
+        or isinstance(cancellation_guard_seconds, bool)
+        or not math.isfinite(cancellation_guard_seconds)
+        or cancellation_guard_seconds < 0
+    ):
+        raise ValueError(
+            "cancellation_guard_seconds must be finite and non-negative"
+        )
     if strategy not in ("oldest_first", "jump_to_latest_complete"):
         raise ValueError(
             "strategy must be 'oldest_first' or "
@@ -1016,6 +1034,7 @@ def simulate_parent_freshness_cap(
             states,
             complete_parent_ids=complete_parent_ids,
             at_seconds=frame.arrival_seconds,
+            cancellation_guard_seconds=cancellation_guard_seconds,
             parent_order=parent_order,
         )
         dropped_now: list[int] = []
@@ -1228,6 +1247,7 @@ def simulate_parent_freshness_cap(
         strategy=strategy,
         adaptive=adaptive,
         hard_cap_seconds=hard_cap_seconds,
+        cancellation_guard_seconds=cancellation_guard_seconds,
         hard_cap_achieved=residual_breach_events == 0,
         frames_received=len(frames),
         frames_retained=len(schedule),

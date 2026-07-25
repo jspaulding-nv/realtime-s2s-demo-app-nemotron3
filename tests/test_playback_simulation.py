@@ -504,6 +504,52 @@ def test_started_parent_is_protected_while_later_complete_parent_can_drop():
     assert result.summary.hard_cap_achieved
 
 
+def test_cancellation_guard_protects_parent_at_boundary_and_zero_is_default():
+    frames = [
+        _parent_frame(0, 0.0, 2.0),
+        _parent_frame(1, 1.9, 2.0),
+    ]
+    default = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=2.0,
+        hard_cap_seconds=1.5,
+        strategy="oldest_first",
+    )
+    explicit_zero = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=2.0,
+        hard_cap_seconds=1.5,
+        strategy="oldest_first",
+        cancellation_guard_seconds=0.0,
+    )
+    outside_guard = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=2.0,
+        hard_cap_seconds=1.5,
+        strategy="oldest_first",
+        cancellation_guard_seconds=0.099,
+    )
+    at_guard_boundary = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=2.0,
+        hard_cap_seconds=1.5,
+        strategy="oldest_first",
+        cancellation_guard_seconds=0.1,
+    )
+
+    assert default == explicit_zero
+    assert default.summary.cancellation_guard_seconds == 0.0
+    assert default.summary.dropped_parent_sequence_ids == (1,)
+    assert outside_guard.summary.dropped_parent_sequence_ids == (1,)
+
+    assert at_guard_boundary.summary.cancellation_guard_seconds == 0.1
+    assert not at_guard_boundary.decisions[-1].eligible_parent_sequence_ids
+    assert not at_guard_boundary.decisions[-1].dropped_parent_sequence_ids
+    assert at_guard_boundary.decisions[-1].residual_hard_cap_breach
+    assert not at_guard_boundary.summary.hard_cap_achieved
+    assert at_guard_boundary.summary.dropped_parent_sequence_ids == ()
+
+
 def test_jump_strategy_reports_residual_when_latest_parent_alone_exceeds_cap():
     frames = [
         _parent_frame(0, 0.0, 2.0),
@@ -607,6 +653,26 @@ def test_invalid_parent_frame_traces_are_rejected(frames, error):
         ({"input_end_seconds": -1.0}, "input_end_seconds"),
         ({"hard_cap_seconds": 0.0}, "hard_cap_seconds"),
         ({"hard_cap_seconds": math.inf}, "hard_cap_seconds"),
+        (
+            {"cancellation_guard_seconds": -0.1},
+            "cancellation_guard_seconds",
+        ),
+        (
+            {"cancellation_guard_seconds": math.inf},
+            "cancellation_guard_seconds",
+        ),
+        (
+            {"cancellation_guard_seconds": math.nan},
+            "cancellation_guard_seconds",
+        ),
+        (
+            {"cancellation_guard_seconds": True},
+            "cancellation_guard_seconds",
+        ),
+        (
+            {"cancellation_guard_seconds": "0.1"},
+            "cancellation_guard_seconds",
+        ),
         ({"strategy": "newest_first"}, "strategy"),
         ({"adaptive": 1}, "adaptive"),
     ],
