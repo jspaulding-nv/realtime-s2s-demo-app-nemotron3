@@ -2954,9 +2954,10 @@ async def run_test(
             offset = 0
             idx = 0
             loop_start = time.monotonic()
-            result.input_sample_zero_timestamp_ms = (
-                loop_start - client_clock_origin
-            ) * 1000
+            if audio_metadata_protocol_version is not None:
+                result.input_sample_zero_timestamp_ms = (
+                    loop_start - client_clock_origin
+                ) * 1000
 
             while offset < len(pcm_bytes):
                 if stream_abort.is_set():

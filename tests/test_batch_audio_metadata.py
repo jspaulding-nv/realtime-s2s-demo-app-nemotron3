@@ -54,14 +54,21 @@ class FakeResponse:
 
 
 class FakeWebSocket:
-    def __init__(self, *, wrong_binary_size=False):
+    def __init__(self, *, wrong_binary_size=False, legacy=False):
         self.responses = [
             json.dumps({"type": "status", "status": "connected"}),
             json.dumps({"type": "status", "status": "listening"}),
-            json.dumps(audio_frame()),
-            b"\0" * (1600 if wrong_binary_size else 3200),
-            json.dumps(parent_complete()),
         ]
+        if legacy:
+            self.responses.append(b"\0" * 3200)
+        else:
+            self.responses.extend(
+                [
+                    json.dumps(audio_frame()),
+                    b"\0" * (1600 if wrong_binary_size else 3200),
+                    json.dumps(parent_complete()),
+                ]
+            )
         self.end_input = asyncio.Event()
         self.control_sends = []
         self.terminal_sent = False
@@ -203,6 +210,31 @@ def test_run_test_negotiates_and_captures_observation_metadata(monkeypatch):
     assert pcm_event["sourceEndMs"] == 10.0
     assert validate_audio_metadata_observation(result) == []
     assert validate_capture_result(result) == []
+
+
+def test_run_test_legacy_capture_does_not_record_v1_clock_anchor(monkeypatch):
+    websocket = FakeWebSocket(legacy=True)
+    install_run_fakes(monkeypatch, websocket)
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+        )
+    )
+
+    assert websocket.control_sends[0] == {
+        "type": "start_stream",
+        "targetLanguage": "es-US",
+    }
+    assert result.input_sample_zero_timestamp_ms is None
+    assert result.audio_metadata_stream_generation is None
+    assert result.audio_metadata_paired_frames == 0
+    assert result.audio_metadata_completed_parents == 0
+    assert result.source_end_to_receipt_availability == (
+        "protocol_not_negotiated"
+    )
+    assert validate_audio_metadata_observation(result) == []
 
 
 def test_run_test_fails_closed_on_header_binary_size_mismatch(monkeypatch):
