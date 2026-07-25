@@ -46,6 +46,9 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - One atomic Magpie retry only for a server-side gRPC `UNKNOWN`, with privacy-safe retry telemetry and no partial-audio publication
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - A privacy-safe short-segment replay tool that retains structural metadata and per-run keyed equality fingerprints, never text
+- A default-off 60-second rendered-digital browser preflight that records the
+  exact source and post-queue translated output on one 16 kHz AudioContext
+  clock, then validates continuity and a 5-second-p95/10-second-peak queue gate
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
 The safe default browser path still uses the monolithic Riva S2S operation.
@@ -117,6 +120,7 @@ realtime-s2s-demo-app/
 ├── NEMOTRON_TEST_RESULTS.md
 ├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
+│   ├── RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md
 │   └── SANITIZATION.md     # Public-data and evidence policy
 ├── backend/
 │   ├── main.py              # FastAPI app + WebSocket endpoint
@@ -286,6 +290,10 @@ This will:
 - Start the backend on http://localhost:8000
 - Start the frontend on http://localhost:5173
 
+`./start.sh` is for normal interactive development. Its mutable Vite
+development server is not valid provenance for the formal rendered-digital
+preflight below.
+
 ### 4. Open the Web UI
 
 Navigate to http://localhost:5173 in your browser.
@@ -298,6 +306,47 @@ Navigate to http://localhost:5173 in your browser.
 4. Click the button again to stop
 
 **Important:** Use headphones to prevent audio feedback!
+
+### Optional: rendered-digital common-clock preflight
+
+The Test Dashboard at `http://localhost:5173/#/test` includes a default-off
+60-second capture mode. It records the exact source reference on stereo
+channel 0 and the translated post-queue, post-playback-rate signal on channel 1
+using one 16 kHz `AudioContext`. The resulting raw WAV, timing CSV, block
+ledger, and manifest are private and ignored by Git.
+
+This mode requires the exact tracked `test_audio/preflight.wav`, the pinned
+staged schema-3 incremental runtime, a clean commit, and a secure browser
+context. Use `http://localhost`, an SSH tunnel to localhost, or valid HTTPS;
+do not use an unencrypted VM-IP URL. The capture is a rendered-digital
+mechanical gate only—it does not prove DAC output, acoustic audibility,
+translation quality, or semantic phrase timing.
+
+Formal export also requires the frontend and backend processes to have started
+clean from the same commit, the fetched recorder worklet to match its tracked
+module, exactly one input-end row after all 200 source chunks, and identical
+received/scheduled aggregate translated PCM. Integer AudioContext frame
+intervals, not a later floating-point approximation, delimit translated WAV
+occupancy.
+
+After the pinned Riva containers are ready, run the formal gate from a clean
+checkout with:
+
+```bash
+python3 run_rendered_digital_preflight.py
+```
+
+The runner creates an immutable production frontend build, starts FastAPI
+without reload, verifies both served-code provenance and the registered
+runtime before and after capture, read-only attests the actual healthy
+containers and immutable image `RepoDigest`s serving all six model ports,
+retains the private evidence outside the repository, and invokes the offline
+validator.
+
+See the
+[rendered-digital common-clock preflight guide](docs/RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md)
+for the exact fixture hashes, runtime digests, private four-file export,
+validator command, and `PASS`/`FAIL`/`INVALID` meanings.
 
 ## Manual Setup
 

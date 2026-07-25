@@ -13,12 +13,18 @@ from config import (
     staged_pipeline_config,
 )
 from riva_client import riva_client
+from repository_provenance import get_repository_provenance
 from websocket_handler import (
     AUDIO_METADATA_PROTOCOL_VERSION,
     SessionStatus,
     session_manager,
 )
 from timing_logger import timing_logger
+
+# Snapshot once when this backend process imports the application. A later
+# checkout cannot make already-loaded Python/frontend code attest a different
+# commit without a process restart.
+PROCESS_REPOSITORY_PROVENANCE = get_repository_provenance()
 
 
 @asynccontextmanager
@@ -103,6 +109,7 @@ async def get_config():
             )
             else []
         ),
+        "repositoryProvenance": dict(PROCESS_REPOSITORY_PROVENANCE),
         "modelConfig": {
             "asr": {
                 "endpoint": riva_config.asr_uri,

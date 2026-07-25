@@ -64,6 +64,10 @@ test_results_nemotron/
 test_results_staged/
 experiment_results/
 docs/results/raw/
+rendered-digital-preflight-*.stereo.wav
+rendered-digital-preflight-*.manifest.json
+rendered-digital-preflight-*.timing.csv
+rendered-digital-preflight-*.blocks.csv
 
 # Temporary files
 *.tmp

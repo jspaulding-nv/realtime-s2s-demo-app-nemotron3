@@ -71,7 +71,37 @@ export interface AudioConfig {
   channels: number;
   pipelineMode?: 'monolithic' | 'staged';
   audioMetadataProtocolVersions?: AudioMetadataProtocolVersion[];
+  repositoryProvenance?: {
+    commit: string | null;
+    dirty: boolean | null;
+  };
+  modelConfig?: {
+    asr: {
+      image: string;
+      imageDigest: string | null;
+      profile: string | null;
+      eouMs: number;
+      wordTimeOffsets: boolean;
+      sourceLanguage: string;
+    };
+    nmt: {
+      image: string;
+      imageDigest: string | null;
+      profile: string | null;
+      model: string;
+      sourceLanguage: string;
+      targetLanguage: string;
+    };
+    tts: {
+      image: string;
+      imageDigest: string | null;
+      profile: string | null;
+      targetLanguage: string;
+      voice: string | null;
+    };
+  };
   stagedConfig?: {
+    telemetrySchemaVersion?: number;
     segmentMaxChars: number;
     segmentMaxAgeMs: number;
     asrEventQueueMaxSize: number;
@@ -81,7 +111,14 @@ export interface AudioConfig {
     nmtRpcTimeoutSeconds: number;
     ttsRpcTimeoutSeconds: number;
     ttsMaxSegmentAudioSeconds: number;
+    ttsMaxRetries: number;
+    ttsResponseChunkTelemetryEnabled: boolean;
+    ttsSubsegmentMaxChars: number;
+    ttsSubsegmentMinChars: number;
     closeTimeoutSeconds: number;
+    ttsIncrementalPublishEnabled?: boolean;
+    ttsIncrementalFrameMs?: number;
+    ttsIncrementalAtomicFallbackMaxChars?: number;
   };
 }
 

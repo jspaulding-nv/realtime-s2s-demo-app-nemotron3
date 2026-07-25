@@ -18,6 +18,8 @@ export interface PlaybackScheduleEvent {
   audioContextTimeAtScheduleSeconds: number;
   scheduledStartContextSeconds: number;
   scheduledEndContextSeconds: number;
+  scheduledStartContextFrameFloor: number;
+  scheduledEndContextFrameExclusive: number;
   projectedScheduledStartClientMs: number;
   audioBytes: number;
   sourceDurationSeconds: number;
@@ -69,23 +71,31 @@ export interface PlaybackMetrics {
   limitExceededCount: number;
 }
 
-interface UseAudioPlaybackOptions {
+export interface PlaybackStartRouting {
+  audioContext: AudioContext;
+  captureNode: AudioNode;
+  captureInputIndex: number;
+}
+
+export interface UseAudioPlaybackOptions {
   sampleRate?: number;
   initialMuted?: boolean;
   adaptivePlayback?: boolean;
+  minimumScheduleLeadSeconds?: number;
+  quantizeScheduleToSampleFrames?: boolean;
   playbackPolicy?: PlaybackPolicy;
   onSchedule?: (event: PlaybackScheduleEvent) => void;
   onClockSample?: (event: PlaybackClockSampleEvent) => void;
 }
 
-interface UseAudioPlaybackReturn {
+export interface UseAudioPlaybackReturn {
   isPlaying: boolean;
   isMuted: boolean;
   queueAudio: (
     audioData: ArrayBuffer,
     observation?: AudioFrameObservation,
-  ) => void;
-  start: () => void;
+  ) => PlaybackScheduleEvent | null;
+  start: (routing?: PlaybackStartRouting) => void;
   stop: () => void;
   setMuted: (muted: boolean) => void;
   getPlaybackPosition: () => number;
@@ -96,6 +106,8 @@ export function useAudioPlayback({
   sampleRate = 16000,
   initialMuted = false,
   adaptivePlayback = false,
+  minimumScheduleLeadSeconds = 0,
+  quantizeScheduleToSampleFrames = false,
   playbackPolicy = DEFAULT_PLAYBACK_POLICY,
   onSchedule,
   onClockSample,
@@ -104,6 +116,10 @@ export function useAudioPlayback({
   const [isMuted, setIsMutedState] = useState(initialMuted);
 
   const audioContextRef = useRef<AudioContext | null>(null);
+  const ownsAudioContextRef = useRef(false);
+  const captureNodeRef = useRef<AudioNode | null>(null);
+  const captureInputIndexRef = useRef<number | null>(null);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
   const isActiveRef = useRef<boolean>(false);
   const gainNodeRef = useRef<GainNode | null>(null);
@@ -123,16 +139,33 @@ export function useAudioPlayback({
   const clockSampleSequenceRef = useRef(0);
   const clockWasQueuedRef = useRef(false);
   const adaptivePlaybackRef = useRef(adaptivePlayback);
+  const minimumScheduleLeadSecondsRef = useRef(
+    minimumScheduleLeadSeconds,
+  );
+  const quantizeScheduleToSampleFramesRef = useRef(
+    quantizeScheduleToSampleFrames,
+  );
   const playbackPolicyRef = useRef(playbackPolicy);
   const onScheduleRef = useRef(onSchedule);
   const onClockSampleRef = useRef(onClockSample);
 
   useEffect(() => {
     adaptivePlaybackRef.current = adaptivePlayback;
+    minimumScheduleLeadSecondsRef.current = minimumScheduleLeadSeconds;
+    quantizeScheduleToSampleFramesRef.current = (
+      quantizeScheduleToSampleFrames
+    );
     playbackPolicyRef.current = playbackPolicy;
     onScheduleRef.current = onSchedule;
     onClockSampleRef.current = onClockSample;
-  }, [adaptivePlayback, playbackPolicy, onSchedule, onClockSample]);
+  }, [
+    adaptivePlayback,
+    minimumScheduleLeadSeconds,
+    quantizeScheduleToSampleFrames,
+    playbackPolicy,
+    onSchedule,
+    onClockSample,
+  ]);
 
   const emitClockSample = useCallback((
     ctx: AudioContext,
@@ -225,19 +258,36 @@ export function useAudioPlayback({
     }
   }, []);
 
-  const start = useCallback(() => {
+  const start = useCallback((routing?: PlaybackStartRouting) => {
     console.log('AudioPlayback: starting');
     if (isActiveRef.current) return;
 
     sessionGenerationRef.current += 1;
-    if (!audioContextRef.current) {
+    if (routing) {
+      if (
+        routing.audioContext.sampleRate !== sampleRate
+        || !Number.isSafeInteger(routing.captureInputIndex)
+        || routing.captureInputIndex < 0
+      ) {
+        throw new Error(
+          'Common-clock playback routing does not match the PCM sample rate.',
+        );
+      }
+      audioContextRef.current = routing.audioContext;
+      ownsAudioContextRef.current = false;
+      captureNodeRef.current = routing.captureNode;
+      captureInputIndexRef.current = routing.captureInputIndex;
+    } else if (!audioContextRef.current) {
       audioContextRef.current = new AudioContext({ sampleRate });
+      ownsAudioContextRef.current = true;
+      captureNodeRef.current = null;
+      captureInputIndexRef.current = null;
       console.log('AudioPlayback: created AudioContext, state:', audioContextRef.current.state);
     }
 
     if (audioContextRef.current.state === 'suspended') {
       console.log('AudioPlayback: resuming suspended AudioContext');
-      audioContextRef.current.resume();
+      void audioContextRef.current.resume();
     }
 
     const gainNode = audioContextRef.current.createGain();
@@ -298,12 +348,30 @@ export function useAudioPlayback({
     projectedEndClientMsRef.current = null;
     setIsPlaying(false);
 
+    for (const source of activeSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // An already-ended one-shot source is safe to ignore during teardown.
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // The node may already be detached by its owning AudioContext.
+      }
+    }
+    activeSourcesRef.current.clear();
     gainNodeRef.current = null;
+    captureNodeRef.current = null;
+    captureInputIndexRef.current = null;
 
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      if (ownsAudioContextRef.current) {
+        void audioContextRef.current.close();
+      }
       audioContextRef.current = null;
     }
+    ownsAudioContextRef.current = false;
   }, [clearClockSampleTimer, emitClockSample]);
 
   const queueAudio = useCallback(
@@ -312,11 +380,11 @@ export function useAudioPlayback({
       observation?: AudioFrameObservation,
     ) => {
       if (!isActiveRef.current) {
-        return;
+        return null;
       }
 
       if (!audioContextRef.current) {
-        return;
+        return null;
       }
 
       const ctx = audioContextRef.current;
@@ -337,11 +405,26 @@ export function useAudioPlayback({
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
       const sourceGeneration = sessionGenerationRef.current;
+      activeSourcesRef.current.add(source);
 
       if (gainNodeRef.current) {
         source.connect(gainNodeRef.current);
       } else {
         source.connect(ctx.destination);
+      }
+      if (
+        captureNodeRef.current
+        && captureInputIndexRef.current !== null
+      ) {
+        // The capture branch is deliberately before the user-facing monitor
+        // mute gain. AudioBufferSourceNode playbackRate has already been
+        // applied at this output, so translated channel evidence represents
+        // the actual queued/rate-adjusted program stream.
+        source.connect(
+          captureNodeRef.current,
+          0,
+          captureInputIndexRef.current,
+        );
       }
 
       const bufferDuration = audioBuffer.duration;
@@ -352,7 +435,16 @@ export function useAudioPlayback({
       const schedulePerformanceMs = performance.now();
       const audioContextTimeAtScheduleSeconds = ctx.currentTime;
       const currentTime = audioContextTimeAtScheduleSeconds;
-      const startTime = Math.max(nextStartTimeRef.current, currentTime);
+      const requestedStartTime = Math.max(
+        nextStartTimeRef.current,
+        currentTime + minimumScheduleLeadSecondsRef.current,
+      );
+      const quantizedStartFrame = quantizeScheduleToSampleFramesRef.current
+        ? Math.ceil(requestedStartTime * ctx.sampleRate)
+        : null;
+      const startTime = quantizedStartFrame === null
+        ? requestedStartTime
+        : quantizedStartFrame / ctx.sampleRate;
       const waitBeforePlaybackSeconds = Math.max(0, startTime - currentTime);
       const projectedQueueAtNormalRate = waitBeforePlaybackSeconds + bufferDuration;
       const policy = playbackPolicyRef.current;
@@ -389,6 +481,7 @@ export function useAudioPlayback({
       // Track logical media position in source-audio seconds. This remains
       // independent of the wall-clock playback rate.
       source.onended = () => {
+        activeSourcesRef.current.delete(source);
         if (sourceGeneration === sessionGenerationRef.current) {
           playbackPositionRef.current += bufferDuration;
         }
@@ -418,13 +511,25 @@ export function useAudioPlayback({
       }
       playbackModeRef.current = playbackMode;
 
-      onScheduleRef.current?.({
+      const scheduleEvent: PlaybackScheduleEvent = {
         playbackClockSessionId: sessionGenerationRef.current,
         timestampMs: schedulePerformanceMs,
         schedulePerformanceMs,
         audioContextTimeAtScheduleSeconds,
         scheduledStartContextSeconds: startTime,
         scheduledEndContextSeconds: scheduledEndTime,
+        scheduledStartContextFrameFloor: (
+          quantizedStartFrame
+          ?? Math.floor(startTime * ctx.sampleRate)
+        ),
+        scheduledEndContextFrameExclusive: (
+          quantizedStartFrame === null
+            ? Math.ceil(scheduledEndTime * ctx.sampleRate)
+            : (
+                quantizedStartFrame
+                + Math.ceil(float32Array.length / playbackRate)
+              )
+        ),
         projectedScheduledStartClientMs,
         audioBytes: audioData.byteLength,
         sourceDurationSeconds: bufferDuration,
@@ -437,7 +542,9 @@ export function useAudioPlayback({
         aboveTarget,
         aboveLimit,
         ...(observation ? { audioFrame: observation } : {}),
-      });
+      };
+      onScheduleRef.current?.(scheduleEvent);
+      return scheduleEvent;
     },
     [emitClockSample, sampleRate]
   );
@@ -477,10 +584,28 @@ export function useAudioPlayback({
     isActiveRef.current = false;
     sessionGenerationRef.current += 1;
     projectedEndClientMsRef.current = null;
+    for (const source of activeSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // Ignore already-ended sources while unmounting.
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // Ignore nodes detached by context teardown.
+      }
+    }
+    activeSourcesRef.current.clear();
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      if (ownsAudioContextRef.current) {
+        void audioContextRef.current.close();
+      }
       audioContextRef.current = null;
     }
+    ownsAudioContextRef.current = false;
+    captureNodeRef.current = null;
+    captureInputIndexRef.current = null;
   }, [clearClockSampleTimer]);
 
   return {

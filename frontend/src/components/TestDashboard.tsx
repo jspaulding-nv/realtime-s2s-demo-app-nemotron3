@@ -4,9 +4,36 @@ import { useFileAudioSource } from '../hooks/useFileAudioSource';
 import { useTimingTracker } from '../hooks/useTimingTracker';
 import { useMetricsSocket } from '../hooks/useMetricsSocket';
 import { useAudioPlayback } from '../hooks/useAudioPlayback';
+import { useRenderedDigitalCapture } from '../hooks/useRenderedDigitalCapture';
 import { DriftChart } from './DriftChart';
-import { exportTimingDataAsCSV } from '../utils/csvExport';
-import type { DriftDataPoint } from '../types/timing';
+import {
+  exportTimingDataAsCSV,
+  serializeTimingDataAsCSV,
+} from '../utils/csvExport';
+import {
+  downloadPrivateArtifact,
+  serializeRenderedDigitalBlockLedger,
+} from '../utils/renderedDigitalArtifacts';
+import {
+  buildRenderedDigitalManifest,
+  type TranslatedTransportEvidence,
+  type TranslatedTransportFrame,
+} from '../utils/renderedDigitalManifest';
+import type {
+  DriftDataPoint,
+  FileAudioChunkObservation,
+} from '../types/timing';
+import type { LoadedFilePcmSnapshot } from '../hooks/useFileAudioSource';
+import type {
+  PlaybackScheduleEvent,
+} from '../hooks/useAudioPlayback';
+import type {
+  RenderedDigitalCaptureResult,
+} from '../types/renderedDigitalCapture';
+import {
+  RENDERED_DIGITAL_SOURCE_CHUNK_FRAMES,
+  RENDERED_DIGITAL_SOURCE_FRAMES,
+} from '../types/renderedDigitalCapture';
 import {
   DEFAULT_PLAYBACK_POLICY,
   summarizePlaybackQueue,
@@ -14,7 +41,13 @@ import {
 } from '../utils/playbackPolicy';
 import type { AudioConfig, SessionStatus } from '../types/messages';
 
-type TestPhase = 'idle' | 'running' | 'draining' | 'completed' | 'failed';
+type TestPhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'draining'
+  | 'completed'
+  | 'failed';
 type FinishedPhase = Extract<TestPhase, 'completed' | 'failed'>;
 type ServerTerminalState = 'pending' | 'completed' | 'error';
 
@@ -26,6 +59,10 @@ export function TestDashboard() {
   const [phase, setPhase] = useState<TestPhase>('idle');
   const [failureMessage, setFailureMessage] = useState('');
   const [adaptivePlaybackEnabled, setAdaptivePlaybackEnabled] = useState(true);
+  const [
+    renderedDigitalCaptureEnabled,
+    setRenderedDigitalCaptureEnabled,
+  ] = useState(false);
   const [driftData, setDriftData] = useState<DriftDataPoint[]>([]);
   const [drainCountdown, setDrainCountdown] = useState(DRAIN_IDLE_SEC);
   const [stats, setStats] = useState({
@@ -52,18 +89,41 @@ export function TestDashboard() {
   const phaseRef = useRef<TestPhase>('idle');
   const serverTerminalStateRef = useRef<ServerTerminalState>('pending');
   const finishStartedRef = useRef(false);
+  const startInProgressRef = useRef(false);
   const driftDataRef = useRef<DriftDataPoint[]>([]);
   const queueSamplesRef = useRef<PlaybackQueueSample[]>([]);
+  const renderedDigitalCaptureEnabledRef = useRef(false);
+  const renderedDigitalCaptureResultRef = useRef<
+  RenderedDigitalCaptureResult | null
+  >(null);
+  const renderedDigitalSourceSnapshotRef = useRef<
+  LoadedFilePcmSnapshot | null
+  >(null);
+  const renderedDigitalSourceScheduleRef = useRef<
+  PlaybackScheduleEvent | null
+  >(null);
+  const captureConfigRef = useRef<AudioConfig | null>(null);
+  const translatedTransportEvidenceRef = useRef<
+  TranslatedTransportEvidence
+  >({
+    received: [],
+    scheduled: [],
+  });
 
   const tracker = useTimingTracker();
   const trackerRef = useRef(tracker);
   const metrics = useMetricsSocket();
+  const renderedDigitalCapture = useRenderedDigitalCapture();
 
   // Audio playback: input (English) starts muted, output (Spanish) starts muted
   const inputPlayback = useAudioPlayback({
     sampleRate: 16000,
     initialMuted: true,
     adaptivePlayback: false,
+    minimumScheduleLeadSeconds: (
+      renderedDigitalCaptureEnabled ? 0.25 : 0
+    ),
+    quantizeScheduleToSampleFrames: renderedDigitalCaptureEnabled,
   });
   const outputPlayback = useAudioPlayback({
     sampleRate: 16000,
@@ -78,18 +138,30 @@ export function TestDashboard() {
   // Stable refs for playback instances
   const inputPlaybackRef = useRef(inputPlayback);
   const outputPlaybackRef = useRef(outputPlayback);
+  const renderedDigitalCaptureRef = useRef(renderedDigitalCapture);
 
   useEffect(() => {
     trackerRef.current = tracker;
     inputPlaybackRef.current = inputPlayback;
     outputPlaybackRef.current = outputPlayback;
-  }, [tracker, inputPlayback, outputPlayback]);
+    renderedDigitalCaptureRef.current = renderedDigitalCapture;
+  }, [
+    tracker,
+    inputPlayback,
+    outputPlayback,
+    renderedDigitalCapture,
+  ]);
 
   // Keep refs in sync with state
   useEffect(() => {
     phaseRef.current = phase;
     console.log('[TestDashboard] Phase changed to:', phase);
   }, [phase]);
+  useEffect(() => {
+    renderedDigitalCaptureEnabledRef.current = (
+      renderedDigitalCaptureEnabled
+    );
+  }, [renderedDigitalCaptureEnabled]);
   useEffect(() => { driftDataRef.current = driftData; }, [driftData]);
 
   // Store stable function refs to avoid closure issues
@@ -113,11 +185,13 @@ export function TestDashboard() {
         status === 'completed'
         && serverTerminalStateRef.current === 'pending'
       ) {
+        trackerRef.current.logServerTerminal('completed');
         serverTerminalStateRef.current = 'completed';
       } else if (
         status === 'error'
         && serverTerminalStateRef.current === 'pending'
       ) {
+        trackerRef.current.logServerTerminal('error');
         serverTerminalStateRef.current = 'error';
         if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
           fileSourceRef.current?.stopStreaming();
@@ -130,6 +204,7 @@ export function TestDashboard() {
     },
     onError: (message: string) => {
       if (serverTerminalStateRef.current !== 'pending') return;
+      trackerRef.current.logServerTerminal('error');
       serverTerminalStateRef.current = 'error';
       if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
         fileSourceRef.current?.stopStreaming();
@@ -141,10 +216,58 @@ export function TestDashboard() {
       if (audioLogCountRef.current <= 5 || audioLogCountRef.current % 50 === 0) {
         console.log(`[TestDashboard] onAudio #${audioLogCountRef.current}: ${audio.byteLength} bytes`);
       }
+      let receivedEvidence: TranslatedTransportFrame | null = null;
+      if (renderedDigitalCaptureEnabledRef.current) {
+        if (!observation) {
+          const message = (
+            'Rendered-digital capture received PCM without frame metadata.'
+          );
+          serverTerminalStateRef.current = 'error';
+          fileSourceRef.current?.stopStreaming();
+          void finishTestRef.current?.('failed', message);
+          return;
+        }
+        const metadata = observation.metadata;
+        receivedEvidence = {
+          sequence: translatedTransportEvidenceRef.current.received.length,
+          streamGeneration: metadata.streamGeneration,
+          parentSequenceId: metadata.parentSequenceId,
+          audioFrameId: metadata.audioFrameId,
+          sampleRateHz: metadata.sampleRateHz,
+          channels: metadata.channels,
+          bytesPerSample: metadata.bytesPerSample,
+          // Receipt and schedule evidence use independent private copies.
+          pcm: audio.slice(0),
+        };
+        translatedTransportEvidenceRef.current.received.push(
+          receivedEvidence,
+        );
+      }
       trackerRef.current.logAudioReceived(audio.byteLength, observation);
       lastReceiveChangeRef.current = performance.now();
       // Queue translated audio for output playback
-      outputPlaybackRef.current.queueAudio(audio, observation);
+      const scheduleEvent = outputPlaybackRef.current.queueAudio(
+        audio,
+        observation,
+      );
+      if (renderedDigitalCaptureEnabledRef.current) {
+        if (scheduleEvent === null || receivedEvidence === null) {
+          const message = (
+            'Rendered-digital capture could not schedule received PCM.'
+          );
+          serverTerminalStateRef.current = 'error';
+          fileSourceRef.current?.stopStreaming();
+          void finishTestRef.current?.('failed', message);
+          return;
+        }
+        translatedTransportEvidenceRef.current.scheduled.push({
+          ...receivedEvidence,
+          sequence: (
+            translatedTransportEvidenceRef.current.scheduled.length
+          ),
+          pcm: audio.slice(0),
+        });
+      }
     },
     onAudioParentComplete: (observation) => {
       trackerRef.current.logAudioParentComplete(observation);
@@ -172,23 +295,71 @@ export function TestDashboard() {
         return;
       }
 
+      const postSendContextFrame = renderedDigitalCaptureEnabledRef.current
+        ? renderedDigitalCaptureRef.current.getCurrentContextFrame()
+        : undefined;
+      if (
+        renderedDigitalCaptureEnabledRef.current
+        && postSendContextFrame === null
+      ) {
+        const message = (
+          'The post-WebSocket AudioContext send frame was unavailable.'
+        );
+        serverTerminalStateRef.current = 'error';
+        fileSourceRef.current?.stopStreaming();
+        if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
+          void finishTestRef.current?.('failed', message);
+        }
+        return;
+      }
+      const completedObservation: FileAudioChunkObservation = {
+        ...observation,
+        // These samples are deliberately taken only after sendAudio confirms
+        // that the complete PCM frame was handed to the WebSocket API.
+        emittedAtMs: performance.now(),
+        ...(typeof postSendContextFrame === 'number'
+          ? { inputChunkEmittedContextFrame: postSendContextFrame }
+          : {}),
+      };
+
       chunkLogCountRef.current += 1;
       if (chunkLogCountRef.current <= 5 || chunkLogCountRef.current % 50 === 0) {
         console.log(`[TestDashboard] onChunk #${chunkLogCountRef.current}: ${chunk.byteLength} bytes`);
       }
-      trackerRef.current.logChunkSent(chunk.byteLength, observation);
-      // Queue input audio for input playback monitoring
-      inputPlaybackRef.current.queueAudio(chunk);
+      trackerRef.current.logChunkSent(
+        chunk.byteLength,
+        completedObservation,
+      );
+      // Formal rendered-digital mode schedules the exact padded source once
+      // and uses its AudioWorklet boundaries to pace these sends. The normal
+      // dashboard retains its historical per-chunk monitor path.
+      if (!renderedDigitalCaptureEnabledRef.current) {
+        inputPlaybackRef.current.queueAudio(chunk);
+      }
     },
     onComplete: () => {
       console.log('[TestDashboard] onComplete fired. phaseRef.current =', phaseRef.current);
       if (phaseRef.current === 'running') {
         // Close the request-audio side while leaving the WebSocket open for
         // final Riva responses and the browser playback queue to drain.
-        wsRef.current.sendMessage({ type: 'end_input' });
+        if (!wsRef.current.sendMessage({ type: 'end_input' })) {
+          const message = 'The end-of-input control message could not be sent.';
+          serverTerminalStateRef.current = 'error';
+          void finishTestRef.current?.('failed', message);
+          return;
+        }
+        trackerRef.current.logInputEnded();
         lastReceiveChangeRef.current = performance.now();
         drainStartTimeRef.current = performance.now();
         setPhase('draining');
+      }
+    },
+    onError: (message) => {
+      if (serverTerminalStateRef.current === 'pending') {
+        serverTerminalStateRef.current = 'error';
+      }
+      if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
+        void finishTestRef.current?.('failed', message);
       }
     },
   });
@@ -264,6 +435,9 @@ export function TestDashboard() {
   // -- Start test --
   const handleStart = useCallback(async () => {
     console.log('[TestDashboard] handleStart called');
+    if (startInProgressRef.current || phaseRef.current !== 'idle') return;
+    startInProgressRef.current = true;
+    setPhase('starting');
     if (fileStartTimerRef.current !== null) {
       clearTimeout(fileStartTimerRef.current);
       fileStartTimerRef.current = null;
@@ -279,23 +453,51 @@ export function TestDashboard() {
     finishStartedRef.current = false;
     setFailureMessage('');
     setDrainCountdown(DRAIN_IDLE_SEC);
+    renderedDigitalCaptureResultRef.current = null;
+    renderedDigitalSourceSnapshotRef.current = null;
+    renderedDigitalSourceScheduleRef.current = null;
+    captureConfigRef.current = null;
+    translatedTransportEvidenceRef.current = {
+      received: [],
+      scheduled: [],
+    };
+
+    if (
+      renderedDigitalCaptureEnabled
+      && Math.abs(fileSourceRef.current.duration - 60) > 0.01
+    ) {
+      setFailureMessage(
+        'Rendered-digital mode accepts only the exact 60-second preflight.',
+      );
+      startInProgressRef.current = false;
+      setPhase('idle');
+      return;
+    }
 
     console.log('[TestDashboard] Checking /api/config capabilities...');
+    let backendTestStarted = false;
     try {
+      // AudioContext creation stays inside the click activation window. The
+      // mode is default-off, so ordinary dashboard runs do not load a worklet
+      // or retain raw rendered audio.
+      if (renderedDigitalCaptureEnabled) {
+        await renderedDigitalCaptureRef.current.start();
+      }
+
       const configResponse = await fetch('/api/config');
       if (!configResponse.ok) {
         throw new Error(
           `Could not discover audio metadata capabilities (HTTP ${configResponse.status}).`,
         );
       }
-      const config = await configResponse.json() as Partial<AudioConfig>;
+      const config = await configResponse.json() as AudioConfig;
       if (!config.audioMetadataProtocolVersions?.includes(1)) {
-        setFailureMessage(
+        throw new Error(
           'Audio metadata protocol version 1 is unavailable. '
           + 'Use the staged schema-3 incremental-TTS pipeline.',
         );
-        return;
       }
+      captureConfigRef.current = config;
 
       console.log('[TestDashboard] Calling /api/test/start...');
       const response = await fetch('/api/test/start', { method: 'POST' });
@@ -307,29 +509,58 @@ export function TestDashboard() {
         } catch {
           // Preserve the HTTP fallback when the response is not JSON.
         }
-        setFailureMessage(detail);
-        return;
+        throw new Error(detail);
+      }
+      backendTestStarted = true;
+
+      metrics.connect();
+      metrics.clearEvents();
+      trackerRef.current.startTest({ adaptivePlaybackEnabled });
+
+      if (renderedDigitalCaptureEnabled) {
+        inputPlaybackRef.current.start(
+          renderedDigitalCaptureRef.current.createPlaybackRouting(0),
+        );
+        outputPlaybackRef.current.start(
+          renderedDigitalCaptureRef.current.createPlaybackRouting(1),
+        );
+      } else {
+        inputPlaybackRef.current.start();
+        outputPlaybackRef.current.start();
       }
     } catch (error) {
+      inputPlaybackRef.current.stop();
+      outputPlaybackRef.current.stop();
+      try {
+        await renderedDigitalCaptureRef.current.abort();
+      } catch {
+        // Preserve the original setup failure if teardown also fails.
+      }
+      if (backendTestStarted) {
+        try {
+          await fetch('/api/test/stop', { method: 'POST' });
+        } catch {
+          // Preserve the original setup failure.
+        }
+      }
       setFailureMessage(
         error instanceof Error ? error.message : 'Backend test setup failed.',
       );
+      startInProgressRef.current = false;
+      setPhase('idle');
       return;
     }
     console.log('[TestDashboard] /api/test/start returned');
 
-    metrics.connect();
-    metrics.clearEvents();
-    trackerRef.current.startTest({ adaptivePlaybackEnabled });
-
-    // Start both playback instances
-    inputPlaybackRef.current.start();
-    outputPlaybackRef.current.start();
-
     console.log('[TestDashboard] Calling ws.connect()...');
     wsRef.current.connect();
+    startInProgressRef.current = false;
     setPhase('running');
-  }, [metrics, adaptivePlaybackEnabled]);
+  }, [
+    metrics,
+    adaptivePlaybackEnabled,
+    renderedDigitalCaptureEnabled,
+  ]);
 
   // -- Once WS connects, start stream + file source --
   const hasStartedStreamRef = useRef(false);
@@ -348,7 +579,54 @@ export function TestDashboard() {
           return;
         }
         console.log('[TestDashboard] Starting file streaming now');
-        fileSourceRef.current.startStreaming();
+        if (!renderedDigitalCaptureEnabledRef.current) {
+          fileSourceRef.current.startStreaming();
+          return;
+        }
+        void (async () => {
+          const snapshot = (
+            fileSourceRef.current.getLoadedPcmSnapshot?.() ?? null
+          );
+          if (
+            snapshot === null
+            || snapshot.sampleRateHz !== 16000
+            || snapshot.sampleCount !== RENDERED_DIGITAL_SOURCE_FRAMES
+            || snapshot.sampleCount
+              % RENDERED_DIGITAL_SOURCE_CHUNK_FRAMES !== 0
+          ) {
+            throw new Error(
+              'The selected file is not the exact 60-second PCM preflight.',
+            );
+          }
+          const schedule = inputPlaybackRef.current.queueAudio(snapshot.pcm);
+          if (schedule === null) {
+            throw new Error('The common-clock source could not be scheduled.');
+          }
+          renderedDigitalSourceSnapshotRef.current = snapshot;
+          renderedDigitalSourceScheduleRef.current = schedule;
+          const sourceClock = await (
+            renderedDigitalCaptureRef.current.armSourceClock({
+              sourceStartContextFrame: (
+                schedule.scheduledStartContextFrameFloor
+              ),
+              sourceFrameCount: snapshot.sampleCount,
+              sourceChunkFrames: RENDERED_DIGITAL_SOURCE_CHUNK_FRAMES,
+            })
+          );
+          if (
+            phaseRef.current !== 'running'
+            || serverTerminalStateRef.current !== 'pending'
+          ) {
+            return;
+          }
+          fileSourceRef.current.startStreaming(sourceClock);
+        })().catch((error: unknown) => {
+          const message = error instanceof Error
+            ? error.message
+            : 'Common-clock source setup failed.';
+          serverTerminalStateRef.current = 'error';
+          void finishTestRef.current?.('failed', message);
+        });
       }, 500);
     }
     if (phase !== 'running' && phase !== 'draining') {
@@ -381,6 +659,12 @@ export function TestDashboard() {
   ) => {
     if (finishStartedRef.current) return;
     finishStartedRef.current = true;
+    if (driftUpdateTimerRef.current) {
+      clearInterval(driftUpdateTimerRef.current);
+      driftUpdateTimerRef.current = null;
+    }
+    let terminalPhase = finishedPhase;
+    let terminalMessage = message;
     console.log('[TestDashboard] finishTest called');
     if (fileStartTimerRef.current !== null) {
       clearTimeout(fileStartTimerRef.current);
@@ -402,6 +686,25 @@ export function TestDashboard() {
     runCleanupStep('input playback stop', () => inputPlaybackRef.current.stop());
     runCleanupStep('output playback stop', () => outputPlaybackRef.current.stop());
 
+    if (renderedDigitalCaptureEnabledRef.current) {
+      try {
+        renderedDigitalCaptureResultRef.current = await (
+          renderedDigitalCaptureRef.current.stop()
+        );
+      } catch (error) {
+        try {
+          await renderedDigitalCaptureRef.current.abort();
+        } catch {
+          // Capture teardown is best-effort; the failed terminal state and
+          // backend stop request below must still be completed.
+        }
+        terminalPhase = 'failed';
+        terminalMessage = error instanceof Error
+          ? error.message
+          : 'Rendered-digital capture could not be finalized.';
+      }
+    }
+
     try {
       await fetch('/api/test/stop', { method: 'POST' });
     } catch (error) {
@@ -411,8 +714,10 @@ export function TestDashboard() {
         clearInterval(driftUpdateTimerRef.current);
         driftUpdateTimerRef.current = null;
       }
-      setFailureMessage(finishedPhase === 'failed' ? message : '');
-      setPhase(finishedPhase);
+      setFailureMessage(
+        terminalPhase === 'failed' ? terminalMessage : '',
+      );
+      setPhase(terminalPhase);
     }
   }, [metrics]);
 
@@ -473,25 +778,102 @@ export function TestDashboard() {
   const handleStop = useCallback(async () => {
     console.log('[TestDashboard] handleStop called');
     fileSourceRef.current.stopStreaming();
-    await finishTestRef.current?.();
+    await finishTestRef.current?.(
+      renderedDigitalCaptureEnabledRef.current ? 'failed' : 'completed',
+      renderedDigitalCaptureEnabledRef.current
+        ? 'Rendered-digital preflight was stopped before completion.'
+        : '',
+    );
   }, []);
 
-  // -- CSV export --
+  // -- Evidence export --
   const handleExport = useCallback(async () => {
     console.log('[TestDashboard] handleExport called');
+    const clientEvents = trackerRef.current.getEvents();
+    let backendEvents = [];
     try {
       const resp = await fetch('/api/test/export');
+      if (!resp.ok) throw new Error(`Export returned HTTP ${resp.status}.`);
       const data = await resp.json();
-      const clientEvents = trackerRef.current.getEvents();
-      console.log(`[TestDashboard] Export: ${clientEvents.length} client events, ${data.events?.length ?? 0} backend events`);
-      exportTimingDataAsCSV(clientEvents, data.events || []);
+      backendEvents = data.events || [];
     } catch (err) {
       console.error('[TestDashboard] Export failed:', err);
-      const clientEvents = trackerRef.current.getEvents();
-      console.log(`[TestDashboard] Fallback export with ${clientEvents.length} client events`);
-      exportTimingDataAsCSV(clientEvents, []);
     }
-  }, []);
+    console.log(
+      `[TestDashboard] Export: ${clientEvents.length} client events, `
+      + `${backendEvents.length} backend events`,
+    );
+
+    if (!renderedDigitalCaptureEnabledRef.current) {
+      exportTimingDataAsCSV(clientEvents, backendEvents);
+      return;
+    }
+    try {
+      const capture = renderedDigitalCaptureResultRef.current;
+      const sourceSnapshot = renderedDigitalSourceSnapshotRef.current;
+      const sourceSchedule = renderedDigitalSourceScheduleRef.current;
+      const config = captureConfigRef.current;
+      if (!capture || !sourceSnapshot || !sourceSchedule || !config) {
+        throw new Error(
+          'Rendered-digital evidence is incomplete and cannot be exported.',
+        );
+      }
+      if (phaseRef.current !== 'completed') {
+        throw new Error(
+          'Only a normally completed preflight can produce a formal bundle.',
+        );
+      }
+      const timingCsv = serializeTimingDataAsCSV(
+        clientEvents,
+        backendEvents,
+      );
+      const blockLedgerCsv = serializeRenderedDigitalBlockLedger(
+        capture.blocks,
+      );
+      const manifest = await buildRenderedDigitalManifest({
+        capture,
+        sourceSnapshot,
+        sourceSchedule,
+        config,
+        clientEvents,
+        adaptivePlaybackEnabled,
+        timingCsv,
+        blockLedgerCsv,
+        dashboardPhase: 'completed',
+        translatedTransportEvidence: translatedTransportEvidenceRef.current,
+      });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const base = `rendered-digital-preflight-${timestamp}`;
+      downloadPrivateArtifact(
+        timingCsv,
+        'text/csv;charset=utf-8',
+        `${base}.timing.csv`,
+      );
+      downloadPrivateArtifact(
+        blockLedgerCsv,
+        'text/csv;charset=utf-8',
+        `${base}.blocks.csv`,
+      );
+      downloadPrivateArtifact(
+        `${JSON.stringify(manifest, null, 2)}\n`,
+        'application/json',
+        `${base}.manifest.json`,
+      );
+      downloadPrivateArtifact(
+        capture.wavBytes,
+        'audio/wav',
+        `${base}.stereo.wav`,
+      );
+      setFailureMessage('');
+    } catch (error) {
+      console.error('[TestDashboard] Evidence bundle export failed:', error);
+      setFailureMessage(
+        error instanceof Error
+          ? `Evidence export failed: ${error.message}`
+          : 'Evidence export failed.',
+      );
+    }
+  }, [adaptivePlaybackEnabled]);
 
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -504,13 +886,29 @@ export function TestDashboard() {
     [],
   );
 
+  const handleNewTest = useCallback(() => {
+    renderedDigitalCaptureResultRef.current = null;
+    renderedDigitalSourceSnapshotRef.current = null;
+    renderedDigitalSourceScheduleRef.current = null;
+    captureConfigRef.current = null;
+    translatedTransportEvidenceRef.current = {
+      received: [],
+      scheduled: [],
+    };
+    setFailureMessage('');
+    setPhase('idle');
+  }, []);
+
   const progressPct = fileSource.duration > 0
     ? (fileSource.position / fileSource.duration) * 100
     : 0;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 p-6">
-      <div className="max-w-4xl mx-auto space-y-6">
+      <div
+        className="max-w-4xl mx-auto space-y-6"
+        data-s2s-phase={phase}
+      >
         {/* Header */}
         <div className="bg-white rounded-2xl shadow-xl p-6">
           <div className="flex items-center justify-between">
@@ -534,8 +932,9 @@ export function TestDashboard() {
               <input
                 type="file"
                 accept=".wav,.mp3"
+                data-s2s-control="audio-file"
                 onChange={handleFileChange}
-                disabled={phase === 'running' || phase === 'draining'}
+                disabled={phase !== 'idle'}
                 className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
               />
             </label>
@@ -544,15 +943,26 @@ export function TestDashboard() {
               <button
                 onClick={handleStart}
                 disabled={!fileSource.isLoaded}
+                data-s2s-control="start-test"
                 className="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-700 transition-colors"
               >
                 Start Test
               </button>
             )}
 
+            {phase === 'starting' && (
+              <p
+                className="px-3 py-2 text-sm text-blue-700"
+                data-s2s-status="starting"
+              >
+                Preparing the evidence window…
+              </p>
+            )}
+
             {(phase === 'running' || phase === 'draining') && (
               <button
                 onClick={handleStop}
+                data-s2s-control="stop-test"
                 className="px-6 py-2 bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 transition-colors"
               >
                 Stop Test
@@ -563,12 +973,16 @@ export function TestDashboard() {
               <div className="flex gap-2">
                 <button
                   onClick={handleExport}
+                  data-s2s-control="export-evidence"
                   className="px-6 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
                 >
-                  Export CSV
+                  {renderedDigitalCaptureEnabled
+                    ? 'Export Evidence'
+                    : 'Export CSV'}
                 </button>
                 <button
-                  onClick={() => setPhase('idle')}
+                  onClick={handleNewTest}
+                  data-s2s-control="new-test"
                   className="px-6 py-2 bg-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-300 transition-colors"
                 >
                   New Test
@@ -577,12 +991,16 @@ export function TestDashboard() {
             )}
           </div>
 
-          {failureMessage && (phase === 'failed' || phase === 'idle') && (
+          {failureMessage && (
             <div
               role="alert"
               className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm"
             >
-              {phase === 'failed' ? 'Test failed' : 'Could not start test'}:{' '}
+              {phase === 'failed'
+                ? 'Test failed'
+                : phase === 'completed'
+                  ? 'Evidence issue'
+                  : 'Could not start test'}:{' '}
               {failureMessage}
             </div>
           )}
@@ -602,6 +1020,35 @@ export function TestDashboard() {
               </span>
             </span>
           </label>
+
+          <label className="mt-4 flex items-start gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={renderedDigitalCaptureEnabled}
+              onChange={(event) => (
+                setRenderedDigitalCaptureEnabled(event.target.checked)
+              )}
+              disabled={phase !== 'idle'}
+              data-s2s-control="rendered-digital-capture"
+              className="mt-0.5 h-4 w-4"
+            />
+            <span>
+              60-second rendered-digital common-clock preflight
+              <span className="block text-xs text-amber-700">
+                Default off. Captures private source and translated PCM before
+                the monitor mute; keep all exported audio untracked.
+              </span>
+            </span>
+          </label>
+
+          {renderedDigitalCapture.isCapturing && (
+            <p
+              className="mt-2 text-xs text-amber-700"
+              data-s2s-status="rendered-digital-capturing"
+            >
+              Common-clock PCM capture is active.
+            </p>
+          )}
 
           {/* File Info */}
           {fileSource.isLoaded && (

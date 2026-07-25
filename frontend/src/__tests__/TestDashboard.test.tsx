@@ -11,6 +11,19 @@ const mockGetPlaybackPosition = vi.fn(() => 0);
 const mockPlaybackStart = vi.fn();
 const mockPlaybackStop = vi.fn();
 const mockQueueAudio = vi.fn();
+const mockRenderedCaptureStart = vi.fn(async () => ({
+  audioContext: {},
+  recorderNode: {},
+}));
+const mockCreatePlaybackRouting = vi.fn((captureInputIndex: number) => ({
+  audioContext: { sampleRate: 16000 },
+  captureNode: {},
+  captureInputIndex,
+}));
+const mockCaptureCurrentContextFrame = vi.fn(() => 16000);
+const mockArmSourceClock = vi.fn();
+const mockRenderedCaptureStop = vi.fn();
+const mockRenderedCaptureAbort = vi.fn(async () => {});
 const mockTrackerStartTest = vi.fn();
 const mockLogChunkSent = vi.fn();
 const mockLogAudioReceived = vi.fn();
@@ -65,11 +78,23 @@ vi.mock('../hooks/useAudioPlayback', () => ({
   }),
 }));
 
+vi.mock('../hooks/useRenderedDigitalCapture', () => ({
+  useRenderedDigitalCapture: vi.fn(() => ({
+    isCapturing: false,
+    start: mockRenderedCaptureStart,
+    createPlaybackRouting: mockCreatePlaybackRouting,
+    getCurrentContextFrame: mockCaptureCurrentContextFrame,
+    armSourceClock: mockArmSourceClock,
+    stop: mockRenderedCaptureStop,
+    abort: mockRenderedCaptureAbort,
+  })),
+}));
+
 vi.mock('../hooks/useWebSocket', () => ({
   useWebSocket: vi.fn(() => ({
     isConnected: false,
     status: 'disconnected',
-    sendMessage: vi.fn(),
+    sendMessage: vi.fn(() => true),
     sendAudio: vi.fn(),
     connect: vi.fn(),
     disconnect: vi.fn(),
@@ -97,6 +122,8 @@ vi.mock('../hooks/useTimingTracker', () => ({
     logPlaybackScheduled: vi.fn(),
     logPlaybackClockSample: mockLogPlaybackClockSample,
     logPlaybackQueueSample: vi.fn(),
+    logServerTerminal: vi.fn(),
+    logInputEnded: vi.fn(),
     getEvents: vi.fn(() => []),
     getSendCount: vi.fn(() => 0),
     getReceiveCount: vi.fn(() => 0),
@@ -303,6 +330,8 @@ describe('TestDashboard', () => {
       sampleRate: 16000,
       initialMuted: true,
       adaptivePlayback: false,
+      minimumScheduleLeadSeconds: 0,
+      quantizeScheduleToSampleFrames: false,
     });
     expect(calls[1][0]).toEqual(expect.objectContaining({
       sampleRate: 16000,
@@ -322,6 +351,51 @@ describe('TestDashboard', () => {
 
     playbackOptions[1].onClockSample?.(clockEvent);
     expect(mockLogPlaybackClockSample).toHaveBeenCalledWith(clockEvent);
+  });
+
+  it('keeps raw rendered-digital capture default-off', () => {
+    render(<TestDashboard />);
+
+    const checkbox = screen.getByRole('checkbox', {
+      name: /rendered-digital common-clock preflight/i,
+    });
+    expect(checkbox).not.toBeChecked();
+    expect(mockRenderedCaptureStart).not.toHaveBeenCalled();
+    expect(screen.getByText(/keep all exported audio untracked/i))
+      .toBeInTheDocument();
+  });
+
+  it('starts both playback paths on one capture-owned context when opted in', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+    render(<TestDashboard />);
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /rendered-digital common-clock preflight/i,
+    }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    expect(mockRenderedCaptureStart).toHaveBeenCalledTimes(1);
+    expect(mockCreatePlaybackRouting.mock.calls.map(([index]) => index))
+      .toEqual([0, 1]);
+    expect(mockPlaybackStart).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ captureInputIndex: 0 }),
+    );
+    expect(mockPlaybackStart).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ captureInputIndex: 1 }),
+    );
   });
 
   it('opts only the test transport into audio metadata v1 and records observations', async () => {
@@ -525,7 +599,7 @@ describe('TestDashboard', () => {
     const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
     const { useWebSocket } = await import('../hooks/useWebSocket');
     let completeSource: (() => void) | undefined;
-    const sendMessage = vi.fn();
+    const sendMessage = vi.fn(() => true);
 
     vi.mocked(useFileAudioSource).mockImplementation((options) => {
       completeSource = options.onComplete;
@@ -565,7 +639,7 @@ describe('TestDashboard', () => {
       const { useWebSocket } = await import('../hooks/useWebSocket');
       let completeSource: (() => void) | undefined;
       let notifyStatus: ((status: SessionStatus, message: string) => void) | undefined;
-      const sendMessage = vi.fn();
+      const sendMessage = vi.fn(() => true);
       const disconnect = vi.fn();
 
       vi.mocked(useFileAudioSource).mockImplementation((options) => {
@@ -665,7 +739,7 @@ describe('TestDashboard', () => {
       vi.mocked(useWebSocket).mockReturnValue({
         isConnected: false,
         status: 'disconnected',
-        sendMessage: vi.fn(),
+        sendMessage: vi.fn(() => true),
         sendAudio: vi.fn(),
         connect: vi.fn(),
         disconnect: vi.fn(),
@@ -695,7 +769,7 @@ describe('TestDashboard', () => {
       return {
         isConnected: false,
         status: 'disconnected',
-        sendMessage: vi.fn(),
+        sendMessage: vi.fn(() => true),
         sendAudio: vi.fn(),
         connect: vi.fn(),
         disconnect,
@@ -743,7 +817,7 @@ describe('TestDashboard', () => {
     vi.mocked(useWebSocket).mockReturnValue({
       isConnected: false,
       status: 'connected',
-      sendMessage: vi.fn(),
+      sendMessage: vi.fn(() => true),
       sendAudio: vi.fn(() => false),
       connect: vi.fn(),
       disconnect,
@@ -773,6 +847,78 @@ describe('TestDashboard', () => {
     expect(disconnect).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('alert')).toHaveTextContent(
       'Test failed: Audio capture stopped because a chunk could not be sent.',
+    );
+  });
+
+  it('records the formal send frame only after WebSocket handoff succeeds', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    let emitChunk: Parameters<typeof useFileAudioSource>[0]['onChunk']
+      | undefined;
+    const sendAudio = vi.fn(() => true);
+
+    vi.mocked(useFileAudioSource).mockImplementation((options) => {
+      emitChunk = options.onChunk;
+      return {
+        isLoaded: true,
+        isStreaming: false,
+        duration: 60,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming: vi.fn(),
+        stopStreaming: vi.fn(),
+      };
+    });
+    vi.mocked(useWebSocket).mockReturnValue({
+      isConnected: false,
+      status: 'connected',
+      sendMessage: vi.fn(() => true),
+      sendAudio,
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+    });
+
+    render(<TestDashboard />);
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /rendered-digital common-clock preflight/i,
+    }));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    const now = vi.spyOn(performance, 'now').mockReturnValue(1234);
+    await act(async () => {
+      emitChunk?.(new ArrayBuffer(9600), {
+        chunkIndex: 0,
+        sampleRateHz: 16000,
+        sourceSampleStart: 0,
+        sourceSampleEndExclusive: 4800,
+        inputPcmSha256: 'a'.repeat(64),
+        inputPcmSampleCount: 960000,
+        emittedAtMs: 300,
+        inputSampleZeroClientMs: 0,
+        inputSourceBoundaryContextFrame: 14400,
+        inputSourceBoundaryDeliveredAfterContextFrame: 14464,
+        inputSourceBoundaryReceivedContextFrameBefore: 14480,
+        inputSourceBoundaryReceivedContextFrameAfter: 14480,
+        inputSourceBoundaryReceivedClientMs: 1200,
+        inputChunkEmittedContextFrame: 14500,
+      });
+      await Promise.resolve();
+    });
+    now.mockRestore();
+
+    expect(sendAudio).toHaveBeenCalledTimes(1);
+    expect(mockCaptureCurrentContextFrame).toHaveBeenCalledTimes(1);
+    expect(
+      mockCaptureCurrentContextFrame.mock.invocationCallOrder[0],
+    ).toBeGreaterThan(sendAudio.mock.invocationCallOrder[0]);
+    expect(mockLogChunkSent).toHaveBeenCalledWith(
+      9600,
+      expect.objectContaining({
+        emittedAtMs: 1234,
+        inputChunkEmittedContextFrame: 16000,
+      }),
     );
   });
 
@@ -888,7 +1034,7 @@ describe('TestDashboard', () => {
         return {
           isConnected: true,
           status: 'connected',
-          sendMessage: vi.fn(),
+          sendMessage: vi.fn(() => true),
           sendAudio: vi.fn(),
           connect: vi.fn(),
           disconnect: vi.fn(),
@@ -926,7 +1072,7 @@ describe('TestDashboard', () => {
       vi.mocked(useWebSocket).mockReturnValue({
         isConnected: false,
         status: 'disconnected',
-        sendMessage: vi.fn(),
+        sendMessage: vi.fn(() => true),
         sendAudio: vi.fn(),
         connect: vi.fn(),
         disconnect: vi.fn(),

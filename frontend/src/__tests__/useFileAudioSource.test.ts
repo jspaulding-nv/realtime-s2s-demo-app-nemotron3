@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { createHash } from 'node:crypto';
 import { useFileAudioSource } from '../hooks/useFileAudioSource';
+import type {
+  RenderedDigitalSourceClockTick,
+} from '../types/renderedDigitalCapture';
 import { pcm16LeBytes, pcm16MonoWave } from './wavTestFixtures';
 
 // Mock AudioBuffer that works in jsdom
@@ -223,6 +226,123 @@ describe('useFileAudioSource', () => {
     });
     expect(first.emittedAtMs - first.inputSampleZeroClientMs).toBe(300);
     expect(second.emittedAtMs - first.inputSampleZeroClientMs).toBe(600);
+  });
+
+  it('uses contiguous AudioContext frame ticks as the formal send clock', async () => {
+    let listener: ((
+      tick: RenderedDigitalSourceClockTick,
+    ) => void) | null = null;
+    let currentContextFrame = 0;
+    const unsubscribe = vi.fn();
+    const sourceClock = {
+      sampleRateHz: 16000,
+      sourceStartContextFrame: 3200,
+      sourceFrameCount: 19200,
+      sourceChunkFrames: 4800,
+      sourceZeroClientMs: 250,
+      getCurrentContextFrame: () => currentContextFrame,
+      subscribe: vi.fn((
+        callback: (tick: RenderedDigitalSourceClockTick) => void,
+      ) => {
+        listener = callback;
+        return unsubscribe;
+      }),
+    };
+    const onError = vi.fn();
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete, onError }),
+    );
+    await act(async () => {
+      await result.current.loadFile(createMockFile('clocked.wav'));
+    });
+
+    act(() => result.current.startStreaming(sourceClock));
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(result.current.getLoadedPcmSnapshot?.()).toMatchObject({
+      sampleRateHz: 16000,
+      sampleCount: 19200,
+      pcmSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+
+    for (let index = 0; index < 4; index += 1) {
+      const boundary = 3200 + (index + 1) * 4800;
+      currentContextFrame = boundary + 160;
+      act(() => listener?.({
+        chunkIndex: index,
+        sourceSampleStart: index * 4800,
+        sourceSampleEndExclusive: (index + 1) * 4800,
+        boundaryContextFrame: boundary,
+        deliveredAfterContextFrame: boundary + 64,
+        receivedContextFrameBefore: boundary + 128,
+        receivedContextFrameAfter: boundary + 128,
+        receivedAtClientMs: 550 + index * 300,
+      }));
+    }
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(onChunk).toHaveBeenCalledTimes(4);
+    expect(onChunk.mock.calls.map((call) => call[1])).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          chunkIndex: 0,
+          inputSampleZeroClientMs: 250,
+          inputSourceBoundaryContextFrame: 8000,
+          inputSourceBoundaryDeliveredAfterContextFrame: 8064,
+          inputSourceBoundaryReceivedContextFrameBefore: 8128,
+          inputSourceBoundaryReceivedContextFrameAfter: 8128,
+          inputSourceBoundaryReceivedClientMs: 550,
+          inputChunkEmittedContextFrame: 8160,
+        }),
+        expect.objectContaining({
+          chunkIndex: 3,
+          inputSourceBoundaryContextFrame: 22400,
+        }),
+      ]),
+    );
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed on a reordered common-clock boundary', async () => {
+    let listener: ((
+      tick: RenderedDigitalSourceClockTick,
+    ) => void) | null = null;
+    const onError = vi.fn();
+    const { result } = renderHook(() =>
+      useFileAudioSource({ onChunk, onComplete, onError }),
+    );
+    await act(async () => {
+      await result.current.loadFile(createMockFile('clocked.wav'));
+    });
+    act(() => result.current.startStreaming({
+      sampleRateHz: 16000,
+      sourceStartContextFrame: 0,
+      sourceFrameCount: 19200,
+      sourceChunkFrames: 4800,
+      sourceZeroClientMs: 0,
+      getCurrentContextFrame: () => 9600,
+      subscribe: (callback) => {
+        listener = callback;
+        return vi.fn();
+      },
+    }));
+
+    act(() => listener?.({
+      chunkIndex: 1,
+      sourceSampleStart: 4800,
+      sourceSampleEndExclusive: 9600,
+      boundaryContextFrame: 9600,
+      deliveredAfterContextFrame: 9600,
+      receivedContextFrameBefore: 9600,
+      receivedContextFrameAfter: 9600,
+      receivedAtClientMs: 600,
+    }));
+
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      'Common-clock source pacing was missing, duplicated, or reordered.',
+    );
+    expect(result.current.isStreaming).toBe(false);
   });
 
   it('hashes the exact padded PCM bytes transmitted by every chunk', async () => {

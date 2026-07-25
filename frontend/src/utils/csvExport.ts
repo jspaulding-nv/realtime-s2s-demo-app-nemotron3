@@ -1,10 +1,10 @@
 import type { ClientTimingEvent, BackendTimingEvent } from '../types/timing';
 
-export function exportTimingDataAsCSV(
+export function serializeTimingDataAsCSV(
   clientEvents: ClientTimingEvent[],
   backendEvents: BackendTimingEvent[],
-): void {
-  const header = [
+): string {
+  const columns = [
     'source',
     'stage',
     'timestamp_ms',
@@ -17,6 +17,7 @@ export function exportTimingDataAsCSV(
     'queue_depth_sec',
     'playback_rate',
     'playback_mode',
+    'terminal_status',
     'adaptive_playback_enabled',
     'audio_metadata_protocol_version',
     'stream_generation',
@@ -36,6 +37,12 @@ export function exportTimingDataAsCSV(
     'input_pcm_sha256',
     'input_pcm_sample_count',
     'input_ledger_valid',
+    'input_source_boundary_context_frame',
+    'input_source_boundary_delivered_after_context_frame',
+    'input_source_boundary_received_context_frame_before',
+    'input_source_boundary_received_context_frame_after',
+    'input_source_boundary_received_client_ms',
+    'input_chunk_emitted_context_frame',
     'source_end_boundary_client_ms',
     'source_end_to_binary_receipt_ms',
     'source_end_to_parent_complete_ms',
@@ -43,6 +50,8 @@ export function exportTimingDataAsCSV(
     'audio_context_time_at_schedule_sec',
     'scheduled_start_context_sec',
     'scheduled_end_context_sec',
+    'scheduled_start_context_frame_floor',
+    'scheduled_end_context_frame_exclusive',
     'projected_scheduled_start_client_ms',
     'source_end_to_projected_scheduled_start_ms',
     'playback_clock_session_id',
@@ -56,7 +65,8 @@ export function exportTimingDataAsCSV(
     'clock_sample_output_performance_client_ms',
     'clock_sample_basis',
     'clock_sample_queue_end_context_sec',
-  ].join(',');
+  ];
+  const header = columns.join(',');
   const rows: string[] = [header];
 
   for (const e of clientEvents) {
@@ -74,6 +84,7 @@ export function exportTimingDataAsCSV(
         e.queueDepthSec?.toFixed(6) ?? '',
         e.playbackRate?.toFixed(2) ?? '',
         e.playbackMode ?? '',
+        e.terminalStatus ?? '',
         e.adaptivePlaybackEnabled === undefined
           ? ''
           : String(e.adaptivePlaybackEnabled),
@@ -99,6 +110,12 @@ export function exportTimingDataAsCSV(
         e.inputPcmSha256 ?? '',
         e.inputPcmSampleCount ?? '',
         e.inputLedgerValid === undefined ? '' : String(e.inputLedgerValid),
+        e.inputSourceBoundaryContextFrame ?? '',
+        e.inputSourceBoundaryDeliveredAfterContextFrame ?? '',
+        e.inputSourceBoundaryReceivedContextFrameBefore ?? '',
+        e.inputSourceBoundaryReceivedContextFrameAfter ?? '',
+        e.inputSourceBoundaryReceivedClientMs?.toFixed(3) ?? '',
+        e.inputChunkEmittedContextFrame ?? '',
         e.sourceEndBoundaryClientMs?.toFixed(3) ?? '',
         e.sourceEndToBinaryReceiptMs?.toFixed(3) ?? '',
         e.sourceEndToParentCompleteMs?.toFixed(3) ?? '',
@@ -106,6 +123,8 @@ export function exportTimingDataAsCSV(
         e.audioContextTimeAtScheduleSec?.toFixed(6) ?? '',
         e.scheduledStartContextSec?.toFixed(6) ?? '',
         e.scheduledEndContextSec?.toFixed(6) ?? '',
+        e.scheduledStartContextFrameFloor ?? '',
+        e.scheduledEndContextFrameExclusive ?? '',
         e.projectedScheduledStartClientMs?.toFixed(3) ?? '',
         e.sourceEndToProjectedScheduledStartMs?.toFixed(3) ?? '',
         e.playbackClockSessionId ?? '',
@@ -124,23 +143,24 @@ export function exportTimingDataAsCSV(
   }
 
   for (const e of backendEvents) {
-    rows.push(
-      [
-        'backend',
-        e.stage,
-        (e.wall_clock * 1000).toFixed(2),
-        e.chunk_index,
-        e.source_position_sec.toFixed(3),
-        e.audio_bytes_len,
-        '', '', '', '', '', '', '',
-        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-        '', '', '', '',
-      ].join(','),
-    );
+    const row = Array<string | number>(columns.length).fill('');
+    row[0] = 'backend';
+    row[1] = e.stage;
+    row[2] = (e.wall_clock * 1000).toFixed(2);
+    row[3] = e.chunk_index;
+    row[4] = e.source_position_sec.toFixed(3);
+    row[5] = e.audio_bytes_len;
+    rows.push(row.join(','));
   }
 
-  const csv = rows.join('\n');
+  return rows.join('\n');
+}
+
+export function exportTimingDataAsCSV(
+  clientEvents: ClientTimingEvent[],
+  backendEvents: BackendTimingEvent[],
+): void {
+  const csv = serializeTimingDataAsCSV(clientEvents, backendEvents);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -153,7 +173,7 @@ export function exportTimingDataAsCSV(
   a.click();
   // Clean up after a short delay to ensure download starts
   setTimeout(() => {
-    document.body.removeChild(a);
+    a.remove();
     URL.revokeObjectURL(url);
   }, 100);
 }

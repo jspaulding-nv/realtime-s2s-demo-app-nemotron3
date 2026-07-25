@@ -135,6 +135,8 @@ describe('useTimingTracker', () => {
       audioContextTimeAtScheduleSeconds: 10,
       scheduledStartContextSeconds: 15.2,
       scheduledEndContextSeconds: 15.295238,
+      scheduledStartContextFrameFloor: 243200,
+      scheduledEndContextFrameExclusive: 244724,
       projectedScheduledStartClientMs: performance.now() + 5200,
       audioBytes: 3200,
       sourceDurationSeconds: 0.1,
@@ -164,6 +166,34 @@ describe('useTimingTracker', () => {
         playbackRate: 1.05,
       }),
     ]);
+  });
+
+  it('records a transcript-free terminal boundary', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+    act(() => result.current.logServerTerminal('completed', 1234.5));
+
+    expect(result.current.getEvents()).toEqual([
+      expect.objectContaining({
+        stage: 'server_terminal',
+        terminalStatus: 'completed',
+        audioBytes: 0,
+      }),
+    ]);
+  });
+
+  it('records the explicit end-of-input boundary after sent source audio', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+    act(() => result.current.logChunkSent(9600));
+    act(() => result.current.logInputEnded(1300));
+
+    expect(result.current.getEvents().at(-1)).toMatchObject({
+      stage: 'input_ended',
+      chunkIndex: -1,
+      sourcePositionSec: 0.3,
+      audioBytes: 0,
+    });
   });
 
   it('records privacy-safe browser clock samples', () => {
@@ -265,6 +295,8 @@ describe('useTimingTracker', () => {
       audioContextTimeAtScheduleSeconds: 10,
       scheduledStartContextSeconds: 12,
       scheduledEndContextSeconds: 12.1,
+      scheduledStartContextFrameFloor: 192000,
+      scheduledEndContextFrameExclusive: 193600,
       projectedScheduledStartClientMs: 3801,
       audioBytes: 3200,
       sourceDurationSeconds: 0.1,
@@ -459,6 +491,94 @@ describe('useTimingTracker', () => {
     }));
 
     expect(result.current.getEvents()[0].inputLedgerValid).toBe(true);
+  });
+
+  it('uses exact render-clock boundaries instead of the approximate client anchor', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      // The estimated client anchor is deliberately 8 ms late. This would
+      // fail the legacy timer check, but the render-thread boundary proves
+      // that the common-clock send was not issued early.
+      emittedAtMs: 1300,
+      inputSampleZeroClientMs: 1008,
+      inputSourceBoundaryContextFrame: 8000,
+      inputSourceBoundaryDeliveredAfterContextFrame: 8064,
+      inputSourceBoundaryReceivedContextFrameBefore: 8080,
+      inputSourceBoundaryReceivedContextFrameAfter: 8080,
+      inputSourceBoundaryReceivedClientMs: 1299.5,
+      inputChunkEmittedContextFrame: 8090,
+    }));
+
+    expect(result.current.getEvents()[0]).toMatchObject({
+      inputLedgerValid: true,
+      inputSourceBoundaryContextFrame: 8000,
+      inputSourceBoundaryDeliveredAfterContextFrame: 8064,
+    });
+  });
+
+  it('rejects partial or inconsistent render-clock boundary evidence', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1300,
+      inputSampleZeroClientMs: 1000,
+      inputSourceBoundaryContextFrame: 8000,
+    }));
+    expect(result.current.getEvents()[0].inputLedgerValid).toBe(false);
+
+    act(() => result.current.startTest());
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1300,
+      inputSampleZeroClientMs: 1000,
+      inputSourceBoundaryContextFrame: 8000,
+      inputSourceBoundaryDeliveredAfterContextFrame: 7999,
+      inputSourceBoundaryReceivedContextFrameBefore: 8000,
+      inputSourceBoundaryReceivedContextFrameAfter: 8000,
+      inputSourceBoundaryReceivedClientMs: 1299,
+      inputChunkEmittedContextFrame: 8000,
+    }));
+    expect(result.current.getEvents()[0].inputLedgerValid).toBe(false);
+  });
+
+  it('rejects a common-clock send after a stalled main thread', () => {
+    const { result } = renderHook(() => useTimingTracker());
+    act(() => result.current.startTest());
+
+    act(() => result.current.logChunkSent(9600, {
+      ...INPUT_PCM,
+      chunkIndex: 0,
+      sampleRateHz: 16000,
+      sourceSampleStart: 0,
+      sourceSampleEndExclusive: 4800,
+      emittedAtMs: 1450,
+      inputSampleZeroClientMs: 1000,
+      inputSourceBoundaryContextFrame: 8000,
+      inputSourceBoundaryDeliveredAfterContextFrame: 8064,
+      inputSourceBoundaryReceivedContextFrameBefore: 9700,
+      inputSourceBoundaryReceivedContextFrameAfter: 9700,
+      inputSourceBoundaryReceivedClientMs: 1449,
+      inputChunkEmittedContextFrame: 9700,
+    }));
+
+    expect(result.current.getEvents()[0].inputLedgerValid).toBe(false);
   });
 
   it('accepts late chunks and retains their real source-boundary delay', () => {

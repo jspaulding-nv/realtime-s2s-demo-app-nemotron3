@@ -173,6 +173,24 @@ async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_config_uses_process_start_repository_provenance(
+    client: AsyncClient,
+):
+    process_snapshot = {"commit": "a" * 40, "dirty": False}
+    with (
+        patch("main.PROCESS_REPOSITORY_PROVENANCE", process_snapshot),
+        patch(
+            "main.get_repository_provenance",
+            return_value={"commit": "b" * 40, "dirty": True},
+        ) as rediscover,
+    ):
+        response = await client.get("/api/config")
+
+    assert response.json()["repositoryProvenance"] == process_snapshot
+    rediscover.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_staged_lifespan_does_not_open_monolithic_connection():
     with (
         patch("main.staged_pipeline_config.pipeline_mode", "staged"),
