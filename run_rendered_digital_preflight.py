@@ -381,6 +381,12 @@ def _nested_value(payload: Mapping[str, Any], *keys: str) -> Any:
 def validate_api_config(payload: Mapping[str, Any], commit: str) -> None:
     """Fail early unless the backend advertises the registered runtime."""
 
+    exact_numeric_paths = {
+        ("stagedConfig", "nmtRpcTimeoutSeconds"),
+        ("stagedConfig", "ttsRpcTimeoutSeconds"),
+        ("stagedConfig", "ttsMaxSegmentAudioSeconds"),
+        ("stagedConfig", "closeTimeoutSeconds"),
+    }
     required_values: tuple[tuple[tuple[str, ...], Any], ...] = (
         (("pipelineMode",), "staged"),
         (("repositoryProvenance", "commit"), commit),
@@ -442,7 +448,15 @@ def validate_api_config(payload: Mapping[str, Any], commit: str) -> None:
         )
     for key_path, expected in required_values:
         actual = _nested_value(payload, *key_path)
-        if type(actual) is not type(expected) or actual != expected:
+        if key_path in exact_numeric_paths:
+            matches = (
+                not isinstance(actual, bool)
+                and isinstance(actual, (int, float))
+                and actual == expected
+            )
+        else:
+            matches = type(actual) is type(expected) and actual == expected
+        if not matches:
             raise PreflightRunnerError(
                 f"/api/config field {'.'.join(key_path)} does not match "
                 "the registered preflight runtime"

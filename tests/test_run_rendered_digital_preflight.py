@@ -50,15 +50,15 @@ def valid_api_config():
             "nmtQueueMaxSize": 4,
             "ttsQueueMaxSize": 4,
             "outputQueueMaxSize": 4,
-            "nmtRpcTimeoutSeconds": 15,
-            "ttsRpcTimeoutSeconds": 60,
-            "ttsMaxSegmentAudioSeconds": 60,
+            "nmtRpcTimeoutSeconds": 15.0,
+            "ttsRpcTimeoutSeconds": 60.0,
+            "ttsMaxSegmentAudioSeconds": 60.0,
             "ttsMaxRetries": 1,
             "ttsResponseChunkTelemetryEnabled": False,
             "ttsSubsegmentMaxChars": 0,
             "ttsSubsegmentMinChars": 12,
             "ttsIncrementalAtomicFallbackMaxChars": 4,
-            "closeTimeoutSeconds": 10,
+            "closeTimeoutSeconds": 10.0,
             "ttsIncrementalPublishEnabled": True,
             "ttsIncrementalFrameMs": 100,
         },
@@ -311,6 +311,29 @@ def test_require_clean_repository_detects_checkout_change(tmp_path):
 
 def test_validate_api_config_accepts_registered_runtime():
     runner.validate_api_config(valid_api_config(), COMMIT)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [15, 15.0],
+)
+def test_validate_api_config_accepts_exact_numeric_timeout_forms(value):
+    config = valid_api_config()
+    config["stagedConfig"]["nmtRpcTimeoutSeconds"] = value
+
+    runner.validate_api_config(config, COMMIT)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, "15", 15.001, float("nan")],
+)
+def test_validate_api_config_rejects_invalid_numeric_timeout_forms(value):
+    config = valid_api_config()
+    config["stagedConfig"]["nmtRpcTimeoutSeconds"] = value
+
+    with pytest.raises(runner.PreflightRunnerError, match="does not match"):
+        runner.validate_api_config(config, COMMIT)
 
 
 @pytest.mark.parametrize(

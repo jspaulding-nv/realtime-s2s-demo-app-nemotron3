@@ -1389,8 +1389,15 @@ Implemented in the working branch, but **not yet live-run or accepted**:
   contains no environment, names, or secrets and is finalized with the clean
   commit plus browser manifest SHA-256.
 - Completed the automated implementation checks: frontend build/lint and 202
-  tests passed; backend/analysis/runner suites passed 1,008 tests with one
+  tests passed; backend/analysis/runner suites passed 1,014 tests with one
   skipped environment-specific case.
+- The first clean-commit runner invocation failed closed before capture because
+  FastAPI serialized registered timeout values as JSON numbers decoded to
+  Python floats (for example, `15.0`) while the runner fixture required the
+  integer type. The runner now accepts only equal integer/float representations
+  for the four float-backed timeout/duration fields and still rejects booleans,
+  strings, non-finite values, or numeric drift. Regression tests cover the
+  actual API shape; no browser/model capture occurred during the failed attempt.
 
 The claim boundary remains intentionally narrow. This gate measures
 rendered-digital graph output on one sample clock; it does not prove physical
