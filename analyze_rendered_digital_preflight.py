@@ -55,13 +55,18 @@ APPROVED_TTS_IMAGE_DIGEST = (
     "sha256:6eacebdc45b35199bf2782c1f0c27d102aef5361ae3ea874e27bf3b8f6d5333d"
 )
 APPROVED_WORKLET_MODULE_SHA256 = (
-    "0a0206154739d0731f200629d8b2ae341e9c3176336936ef33fbfd40dc52d189"
+    "8baf6193f097acc3c2663ca91299a19f68b1e7c17deaa586db339a073a7d0a5d"
 )
 QUEUE_P95_OBJECTIVE_SECONDS = 5.0
 QUEUE_PEAK_LIMIT_SECONDS = 10.0
 CSV_FLOAT_TOLERANCE_SECONDS = 0.000_002
 CSV_CLIENT_TOLERANCE_MS = 0.01
 RENDER_QUANTUM_FRAMES = 128
+INPUT_CLOCK_RATE_MIN_RATIO = 0.99
+INPUT_CLOCK_RATE_MAX_RATIO = 1.01
+INPUT_CLOCK_INTERIOR_RATE_TOLERANCE = 0.01
+INPUT_CLOCK_RECEIPT_LAG_LIMIT_MS = 100.0
+CLIENT_CLOCK_ORIGIN_TOLERANCE_MS = 0.02
 MAX_JSON_BYTES = 1_000_000
 MAX_LEDGER_BYTES = 2_000_000
 MAX_TIMING_BYTES = 64_000_000
@@ -515,6 +520,10 @@ class InputClockEvidence:
     maximum_worklet_delivery_lag_frames: int
     maximum_main_receipt_lag_frames: int
     maximum_chunk_emission_lag_frames: int
+    expected_boundary_span_ms: float
+    observed_boundary_span_ms: float
+    wall_to_source_ratio: float
+    maximum_elapsed_drift_ms: float
 
 
 @dataclass(frozen=True)
@@ -1634,6 +1643,12 @@ def _validate_input_ledger(
         raise _invalid("input_ledger", "input ledger must contain 200 chunks")
     source = manifest["source_reference"]
     previous_received_ms = -math.inf
+    first_boundary: int | None = None
+    first_received_ms: float | None = None
+    last_boundary: int | None = None
+    last_received_ms: float | None = None
+    first_client_clock_origin_ms: float | None = None
+    maximum_elapsed_drift_ms = 0.0
     maximum_worklet_delivery_lag_frames = 0
     maximum_main_receipt_lag_frames = 0
     maximum_chunk_emission_lag_frames = 0
@@ -1736,12 +1751,88 @@ def _validate_input_ledger(
             context,
             minimum=0,
         )
+        timestamp_ms = _csv_float(
+            row,
+            "timestamp_ms",
+            context,
+            minimum=0,
+        )
         if (
             received_ms < previous_received_ms
             or emitted_ms + CSV_CLIENT_TOLERANCE_MS < received_ms
         ):
             raise _invalid("input_ledger", f"{context} is reordered")
+        client_clock_origin_ms = emitted_ms - timestamp_ms
+        if first_client_clock_origin_ms is None:
+            first_client_clock_origin_ms = client_clock_origin_ms
+        elif (
+            abs(client_clock_origin_ms - first_client_clock_origin_ms)
+            > CLIENT_CLOCK_ORIGIN_TOLERANCE_MS
+        ):
+            raise _invalid(
+                "input_ledger",
+                f"{context} contradicts the client monotonic clock origin",
+            )
+        if first_boundary is None or first_received_ms is None:
+            first_boundary = boundary
+            first_received_ms = received_ms
+        expected_elapsed_ms = (
+            (boundary - first_boundary) / SAMPLE_RATE_HZ * 1000.0
+        )
+        observed_elapsed_ms = received_ms - first_received_ms
+        maximum_elapsed_drift_ms = max(
+            maximum_elapsed_drift_ms,
+            abs(observed_elapsed_ms - expected_elapsed_ms),
+        )
+        allowed_elapsed_drift_ms = (
+            INPUT_CLOCK_RECEIPT_LAG_LIMIT_MS
+            + expected_elapsed_ms * INPUT_CLOCK_INTERIOR_RATE_TOLERANCE
+        )
+        if (
+            abs(observed_elapsed_ms - expected_elapsed_ms)
+            > allowed_elapsed_drift_ms + CSV_CLIENT_TOLERANCE_MS
+        ):
+            raise _invalid(
+                "input_pacing",
+                f"{context} is outside the registered cumulative "
+                "wall-clock pacing envelope",
+            )
+        last_boundary = boundary
+        last_received_ms = received_ms
         previous_received_ms = received_ms
+    if (
+        first_boundary is None
+        or first_received_ms is None
+        or last_boundary is None
+        or last_received_ms is None
+        or last_boundary <= first_boundary
+    ):
+        raise _invalid("input_pacing", "source boundary span is unavailable")
+    expected_boundary_span_ms = (
+        (last_boundary - first_boundary) / SAMPLE_RATE_HZ * 1000.0
+    )
+    observed_boundary_span_ms = last_received_ms - first_received_ms
+    minimum_span_ms = (
+        expected_boundary_span_ms * INPUT_CLOCK_RATE_MIN_RATIO
+    )
+    maximum_span_ms = (
+        expected_boundary_span_ms * INPUT_CLOCK_RATE_MAX_RATIO
+    )
+    wall_to_source_ratio = (
+        observed_boundary_span_ms / expected_boundary_span_ms
+    )
+    if (
+        observed_boundary_span_ms + CSV_CLIENT_TOLERANCE_MS
+        < minimum_span_ms
+        or observed_boundary_span_ms - CSV_CLIENT_TOLERANCE_MS
+        > maximum_span_ms
+    ):
+        raise _invalid(
+            "input_pacing",
+            "source boundary wall-clock pacing is outside the registered "
+            f"one-percent envelope (client/source ratio="
+            f"{wall_to_source_ratio:.6f})",
+        )
     return InputClockEvidence(
         maximum_worklet_delivery_lag_frames=(
             maximum_worklet_delivery_lag_frames
@@ -1750,6 +1841,10 @@ def _validate_input_ledger(
         maximum_chunk_emission_lag_frames=(
             maximum_chunk_emission_lag_frames
         ),
+        expected_boundary_span_ms=round(expected_boundary_span_ms, 6),
+        observed_boundary_span_ms=round(observed_boundary_span_ms, 6),
+        wall_to_source_ratio=round(wall_to_source_ratio, 9),
+        maximum_elapsed_drift_ms=round(maximum_elapsed_drift_ms, 6),
     )
 
 
@@ -2405,6 +2500,20 @@ def _base_report(status: str) -> dict[str, Any]:
             "maximum_main_receipt_lag_ms": None,
             "maximum_chunk_emission_lag_ms": None,
         },
+        "input_common_clock_rate": {
+            "minimum_ratio_inclusive": INPUT_CLOCK_RATE_MIN_RATIO,
+            "maximum_ratio_inclusive": INPUT_CLOCK_RATE_MAX_RATIO,
+            "expected_boundary_span_ms": None,
+            "observed_boundary_span_ms": None,
+            "wall_to_source_ratio": None,
+            "maximum_elapsed_drift_ms": None,
+            "interior_rate_tolerance": (
+                INPUT_CLOCK_INTERIOR_RATE_TOLERANCE
+            ),
+            "receipt_lag_allowance_ms": (
+                INPUT_CLOCK_RECEIPT_LAG_LIMIT_MS
+            ),
+        },
         "evidence": None,
         "claim_boundary": {
             "semantic_latency_status": "not_evaluated",
@@ -2493,6 +2602,20 @@ def validate_bundle(
                 input_clock.maximum_chunk_emission_lag_frames
                 / SAMPLE_RATE_HZ
                 * 1000.0
+            ),
+        }
+    )
+    report["input_common_clock_rate"].update(
+        {
+            "expected_boundary_span_ms": (
+                input_clock.expected_boundary_span_ms
+            ),
+            "observed_boundary_span_ms": (
+                input_clock.observed_boundary_span_ms
+            ),
+            "wall_to_source_ratio": input_clock.wall_to_source_ratio,
+            "maximum_elapsed_drift_ms": (
+                input_clock.maximum_elapsed_drift_ms
             ),
         }
     )

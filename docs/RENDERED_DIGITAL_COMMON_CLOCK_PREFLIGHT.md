@@ -101,6 +101,25 @@ more than 1,600 frames (100 ms) after the source boundary. After all 200
 with chunk index `-1`, zero audio bytes, and source position 60.0 seconds. It
 must occur before the server terminal row.
 
+Processor readiness and the formal capture epoch are separate. Headless
+Chrome can jump its AudioContext frame axis while the newly loaded worklet is
+still in its silent startup window. The worklet reports readiness but records
+no PCM and applies no continuity claim before `arm_source_clock`. The first
+render quantum after that arm starts the evidence epoch and must occur no
+later than the already scheduled source start. Every later render quantum
+must tile the AudioContext frame axis exactly; a later gap remains fatal.
+
+The offline validator also binds the AudioContext source clock to monotonic
+wall time. The first and last of the 200 boundary receipts span 955,200 source
+frames, or exactly 59.7 seconds. Their `performance.now()` receipt span must
+be between 0.99x and 1.01x of that source-clock span, inclusive. A faster or
+slower virtual audio sink makes the bundle `INVALID`; it cannot manufacture a
+low-latency result. The validator also checks every intermediate boundary:
+cumulative client/source drift may not exceed the registered 100 ms receipt
+lag allowance plus 1% of elapsed source time. The chunk timestamp and
+post-WebSocket `performance.now()` value must preserve one consistent client
+clock origin.
+
 The capture continues beyond the 60-second source interval until:
 
 1. the server emits its single terminal `completed` status;
@@ -171,7 +190,7 @@ runtime:
 | TTS frame duration | 100 ms |
 | Post-NMT TTS splitting | Disabled |
 | Application provenance | Frontend and backend processes started clean from the same commit |
-| Recorder worklet SHA-256 | `0a0206154739d0731f200629d8b2ae341e9c3176336936ef33fbfd40dc52d189` |
+| Recorder worklet SHA-256 | `8baf6193f097acc3c2663ca91299a19f68b1e7c17deaa586db339a073a7d0a5d` |
 
 The image release tags in this repository are Nemotron ASR Streaming `1.2.0`,
 Riva Translate 1.6B `1.5.2`, and Magpie multilingual TTS `1.7.0`. The
@@ -487,6 +506,12 @@ The validator fails closed on, among other conditions:
 - missing, duplicated, reordered, early, or more-than-one-quantum-late source
   boundary observations, or a main-thread receipt/WebSocket handoff more than
   100 ms after its source boundary;
+- a capture epoch that begins after the scheduled source start, any
+  post-arm render-quantum discontinuity, or a first-to-last source-boundary
+  receipt span outside 0.99x through 1.01x of the exact 59.7-second
+  AudioContext span;
+- an intermediate source boundary outside the cumulative 100 ms plus 1%
+  pacing envelope, or contradictory elapsed/absolute client-clock fields;
 - a missing, duplicated, early, or inconsistent `input_ended` row instead of
   one row after all 200 chunks and before the server terminal;
 - a gap, overlap, reorder, or digest mismatch in the worklet block ledger;
