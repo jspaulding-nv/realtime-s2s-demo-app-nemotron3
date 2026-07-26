@@ -1484,9 +1484,9 @@ rules are unchanged.
 
 The change follows a transcript-free synthetic Chrome graph-load diagnostic.
 A 30-second translated burst reproduced `noncontiguous_render_quantum`: the
-observed `currentFrame` rewound by one 128-frame render quantum relative to
-the expected frame. The initial exploratory sweep was not provenance-bound
-and is superseded by the hardened comparison below.
+observed `currentFrame` was one 128-frame render quantum behind the expected
+frame. The initial exploratory sweep was not provenance-bound and is
+superseded by the hardened comparison below.
 
 The 2026-07-26 rerun verified the registered worklet SHA-256, recorded the
 sanitized Chrome version and browser-binary SHA-256, awaited all translated
@@ -1495,7 +1495,7 @@ ticks, captured PCM blocks, lifecycle messages, and clock rate, and failed
 closed on any incomplete repeat. On Chrome `149.0.7827.155`, five repeats at
 each candidate duration produced 0/5 failures at 100 ms, 1/5 at 250 ms, 2/5
 at 300 ms, and 1/5 at 500 ms. This mixed result does not prove that larger
-publication frames prevent the rewind. A separate 65-second 500 ms run
+publication frames prevent the discontinuity. A separate 65-second 500 ms run
 scheduled all 60 expected translated sources, emitted all 200 source ticks,
 recorded zero capture errors, and measured an AudioContext/wall-clock rate of
 1.000351.
@@ -1506,6 +1506,50 @@ several responses before publication, but neither its browser-stability
 benefit nor its incremental latency is established by the synthetic sweep.
 The formal live run must decide the mechanical queue outcome, and later
 semantic review must measure listener-relevant phrase delay.
+
+## 2026-07-26: 500 ms formal run failed on the worklet frame clock
+
+The formal run from clean commit
+`3ebe28c494892b3b22904fa592238e3250d01924` failed fast after 166 source
+chunks with `noncontiguous_render_quantum`: expected frame `803712`, observed
+frame `803584`, delta `-128`. The runner correctly exported no evidence bundle
+and no report. Pre-capture Docker attestation
+`66910766b66445b4d75ea83e06e9340c1bf95c48c8cd87e087a9374492ebca98`
+bound the run. A separate post-run status check found all three pinned
+services healthy with zero restarts. The result shows that 500 ms publication
+did not eliminate the discontinuity.
+
+A generated-PCM shadow diagnostic then reproduced the event in one of five
+65-second Chrome `149.0.7827.155` repeats. The exact recorder and shadow
+worklet both reported expected frame `458752` and observed frame `458624`. The
+worklet frame label repeated for one 128-frame callback, jumped 256 frames on
+the next callback, and then advanced normally. Across the complete four-before
+plus event plus sixteen-after trace, every decoded generated-source marker
+advanced exactly 128 frames. This classifies the reproduced event as a
+repeated clock label with immediate catch-up and a contiguous generated
+source-marker stream at the shadow input. It does not establish translated-mix
+or physical-output continuity. Four later repeats had no event.
+
+Chromium lock contention remains a source-backed hypothesis rather than a
+confirmed root cause. In the pinned Chrome source, the real-time destination
+[advances its frame counter before the worklet-global
+update](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc#273);
+the
+[worklet update uses the graph lock through a non-blocking
+`TryLock`](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/base_audio_context.cc#977);
+and both
+[`AudioNode.connect()`](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/audio_node.cc#150)
+and
+[scheduled-source start handling](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/base_audio_context.cc#778)
+use that lock. A skipped global update is therefore consistent with the trace,
+but the trace does not observe the lock itself.
+
+The next focused trial should preserve PCM and normalize only one exact
+zero-step/next-quantum-catch-up pair, expose an integer-only event counter, and
+fail on a second event or any other clock shape. PCM, lifecycle, wall-clock
+pacing, queue, and audience-latency gates remain unchanged. See
+[Chrome render-clock shadow diagnostic
+result](RENDER_CLOCK_SHADOW_RESULT_2026-07-26.md).
 
 ## Handoff checklist
 

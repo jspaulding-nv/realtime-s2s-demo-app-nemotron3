@@ -204,12 +204,13 @@ binary SHA-256
 and the registered worklet SHA-256 above. Five six-second repeats per duration
 produced 0/5 failures at 100 ms, 1/5 at 250 ms, 2/5 at 300 ms, and 1/5 at
 500 ms. The mixed result does not establish a monotonic relationship between
-publication duration and the Chrome frame rewind. A separate 65-second
+publication duration and the Chrome frame discontinuity. A separate 65-second
 500 ms run scheduled all 60 expected translated sources, emitted all 200
 source ticks, recorded zero capture errors, and measured a clock rate of
 1.000351. These transcript-free probes diagnose graph scheduling behavior;
-they neither prove the 500 ms change fixes the rewind nor provide accepted
-audience-latency evidence. The formal live run remains the decision gate.
+they neither prove the 500 ms change fixes the discontinuity nor provide
+accepted audience-latency evidence. The formal live run remains the decision
+gate.
 
 Historical Magpie response-cadence telemetry measured a 139 ms median response
 duration and a 19 ms median interval between responses. The 500 ms publisher
@@ -217,6 +218,49 @@ may hold several responses before publication, but its actual incremental
 latency has not yet been measured. The formal run must measure the mechanical
 queue outcome, and later semantic review must measure listener-relevant phrase
 delay.
+
+### 2026-07-26 formal result: 500 ms did not eliminate the discontinuity
+
+The formal run from clean commit
+`3ebe28c494892b3b22904fa592238e3250d01924` failed fast after 166 source
+chunks with `noncontiguous_render_quantum`: expected frame `803712`, observed
+frame `803584`, delta `-128`. No evidence bundle or report was exported.
+Pre-capture Docker attestation
+`66910766b66445b4d75ea83e06e9340c1bf95c48c8cd87e087a9374492ebca98`
+bound the run. A separate post-run status check found all three pinned
+services healthy with zero restarts.
+
+The bounded shadow diagnostic reproduced the event in one of five 65-second
+Chrome `149.0.7827.155` repeats. The exact recorder and shadow worklet both
+reported expected frame `458752` and observed frame `458624`. On the next
+callback, the worklet clock advanced 256 frames and returned to its logical
+frame. Every
+generated source marker advanced exactly 128 frames through the complete
+21-entry trace. The reproduced event is therefore a repeated worklet clock
+label with immediate catch-up and a contiguous generated source-marker stream
+at the shadow input. It does not establish translated-mix or physical-output
+continuity. Four later repeats had no event.
+
+The root cause remains an inference. In the exact Chrome tag, the real-time
+destination
+[advances its frame counter before the worklet-global
+update](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc#273);
+the
+[update uses the graph lock through a non-blocking
+`TryLock`](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/base_audio_context.cc#977);
+and both
+[`AudioNode.connect()`](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/audio_node.cc#150)
+and
+[scheduled-source start handling](https://chromium.googlesource.com/chromium/src/+/refs/tags/149.0.7827.155/third_party/blink/renderer/modules/webaudio/base_audio_context.cc#778)
+take that lock. This is consistent with, but does not prove, a skipped global
+update during graph mutation.
+
+Do not generally weaken the continuity gate. The next focused trial should
+normalize only one exact repeated-frame/immediate-catch-up pair, preserve the
+PCM blocks, record an integer-only event count, and reject a second event or
+any other shape. See the
+[full shadow result and claim
+boundary](RENDER_CLOCK_SHADOW_RESULT_2026-07-26.md).
 
 Reproduce the transcript-free graph-load comparison without starting or
 contacting Riva:
@@ -238,7 +282,8 @@ python3 probe_rendered_digital_graph_load.py \
   --frame-ms 500 \
   --repeats 1 \
   --probe-seconds 65 \
-  --burst-at-seconds 6
+  --burst-at-seconds 6 \
+  --trace-rewind
 ```
 
 The utility verifies the registered worklet hash before launch, serves only
@@ -246,8 +291,9 @@ those bytes on localhost, generates its own PCM, and prints a fixed schema of
 numeric counters, clock rates, allowlisted recorder codes, the sanitized
 Chrome version, and the browser-binary/worklet hashes. It validates the
 16 kHz AudioContext, expected translated-node count, source ticks, captured
-PCM blocks, and recorder lifecycle. It does not inspect audio content, connect
-to the Riva services, or mutate Docker.
+PCM blocks, recorder lifecycle, exact/shadow agreement, all 21 bounded trace
+entries, and generated marker arithmetic. It does not inspect audio content,
+connect to the Riva services, or mutate Docker.
 
 The image release tags in this repository are Nemotron ASR Streaming `1.2.0`,
 Riva Translate 1.6B `1.5.2`, and Magpie multilingual TTS `1.7.0`. The

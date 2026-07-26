@@ -44,6 +44,11 @@ WORKLET_PATH = (
 SAMPLE_RATE_HZ = 16_000
 SOURCE_FRAME_COUNT = 960_000
 SOURCE_CHUNK_FRAMES = 4_800
+RENDER_QUANTUM_FRAMES = 128
+SOURCE_ALIGNMENT_FRAMES = math.lcm(
+    SOURCE_CHUNK_FRAMES,
+    RENDER_QUANTUM_FRAMES,
+)
 CAPTURE_BLOCK_FRAMES = 8_000
 SAFE_INTEGER_MAX = (1 << 53) - 1
 MIN_CLOCK_RATE = 0.99
@@ -78,6 +83,183 @@ SAFE_MESSAGE_TYPES = frozenset(
         "stopped",
     }
 )
+SHADOW_TRACE_BEFORE = 4
+SHADOW_TRACE_AFTER = 16
+SHADOW_TRACE_LIMIT = (
+    SHADOW_TRACE_BEFORE + 1 + SHADOW_TRACE_AFTER
+)
+SHADOW_MARKER_PERIOD = 4_093
+SHADOW_MARKER_SCALE = 8_192
+
+
+SHADOW_WORKLET_SOURCE = rb"""
+/* global AudioWorkletProcessor, currentFrame, currentTime, registerProcessor, sampleRate */
+
+const MARKER_PERIOD = 4093;
+const MARKER_SCALE = 8192;
+const TRACE_BEFORE = 4;
+const TRACE_AFTER = 16;
+
+function safeInteger(value, minimum = 0) {
+  return Number.isSafeInteger(value) && value >= minimum;
+}
+
+function decodeMarker(sample, referenceFrame) {
+  if (!Number.isFinite(sample) || !safeInteger(referenceFrame)) return null;
+  const code = Math.round(sample * MARKER_SCALE) - 1;
+  if (code < 0 || code >= MARKER_PERIOD) return null;
+  const cycle = Math.round((referenceFrame - code) / MARKER_PERIOD);
+  const decoded = code + cycle * MARKER_PERIOD;
+  return safeInteger(decoded) ? decoded : null;
+}
+
+class RenderClockShadowProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.armed = false;
+    this.sourceStartContextFrame = null;
+    this.sourceFrameCount = null;
+    this.captureStartContextFrame = null;
+    this.callbackOrdinal = 0;
+    this.previousObservedContextFrame = null;
+    this.previousDecodedSourceFrame = null;
+    this.preTrace = [];
+    this.trace = [];
+    this.firstAnomalyOrdinal = null;
+    this.postAnomalyRemaining = TRACE_AFTER;
+    this.resultSent = false;
+    this.port.onmessage = ({data}) => {
+      if (data?.type === 'arm') {
+        if (
+          this.armed
+          || !safeInteger(data.sourceStartContextFrame)
+          || !safeInteger(data.sourceFrameCount, 1)
+        ) {
+          this.sendResult('invalid');
+          return;
+        }
+        this.sourceStartContextFrame = data.sourceStartContextFrame;
+        this.sourceFrameCount = data.sourceFrameCount;
+        this.armed = true;
+        this.captureStartContextFrame = null;
+        this.callbackOrdinal = 0;
+        this.previousObservedContextFrame = null;
+        this.previousDecodedSourceFrame = null;
+        this.preTrace = [];
+        this.trace = [];
+        this.firstAnomalyOrdinal = null;
+        this.postAnomalyRemaining = TRACE_AFTER;
+        this.port.postMessage({type: 'shadow_armed'});
+      } else if (data?.type === 'stop') {
+        this.sendResult(
+          this.firstAnomalyOrdinal === null ? 'no_anomaly' : 'anomaly',
+        );
+      }
+    };
+    this.port.postMessage({type: 'shadow_ready'});
+  }
+
+  sendResult(status) {
+    if (this.resultSent) return;
+    this.resultSent = true;
+    const anomaly = (
+      this.firstAnomalyOrdinal === null
+        ? null
+        : this.trace.find(
+          entry => entry.callbackOrdinal === this.firstAnomalyOrdinal,
+        ) ?? null
+    );
+    this.port.postMessage({
+      type: 'shadow_result',
+      status,
+      firstAnomalyOrdinal: this.firstAnomalyOrdinal,
+      firstExpectedContextFrame: anomaly?.expectedContextFrame ?? null,
+      firstObservedContextFrame: anomaly?.observedContextFrame ?? null,
+      trace: this.trace,
+    });
+  }
+
+  process(inputs, outputs) {
+    const output = outputs[0]?.[0];
+    const frameCount = output?.length ?? 128;
+    output?.fill(0);
+    if (!this.armed || this.resultSent) return true;
+
+    const observedContextFrame = currentFrame;
+    if (this.captureStartContextFrame === null) {
+      this.captureStartContextFrame = observedContextFrame;
+    }
+    const logicalContextFrame = (
+      this.captureStartContextFrame + this.callbackOrdinal * frameCount
+    );
+    const expectedContextFrame = (
+      this.previousObservedContextFrame === null
+        ? observedContextFrame
+        : this.previousObservedContextFrame + frameCount
+    );
+    const stepFrames = (
+      this.previousObservedContextFrame === null
+        ? null
+        : observedContextFrame - this.previousObservedContextFrame
+    );
+    const workletCurrentTimeFrame = Math.round(currentTime * sampleRate);
+
+    const logicalSourceFrame = (
+      logicalContextFrame - this.sourceStartContextFrame
+    );
+    const sourceIsActive = (
+      logicalSourceFrame >= 0
+      && logicalSourceFrame < this.sourceFrameCount
+    );
+    const sourceSample = inputs[0]?.[0]?.[0];
+    const decodedSourceFrame = sourceIsActive
+      ? decodeMarker(sourceSample, logicalSourceFrame)
+      : null;
+    const sourceStepFrames = (
+      decodedSourceFrame === null
+      || this.previousDecodedSourceFrame === null
+        ? null
+        : decodedSourceFrame - this.previousDecodedSourceFrame
+    );
+    if (decodedSourceFrame !== null) {
+      this.previousDecodedSourceFrame = decodedSourceFrame;
+    }
+
+    const entry = {
+      callbackOrdinal: this.callbackOrdinal,
+      frameCount,
+      expectedContextFrame,
+      observedContextFrame,
+      logicalContextFrame,
+      axisOffsetFrames: observedContextFrame - logicalContextFrame,
+      stepFrames,
+      workletCurrentTimeFrame,
+      decodedSourceFrame,
+      sourceStepFrames,
+    };
+    const anomaly = observedContextFrame !== expectedContextFrame;
+    if (this.firstAnomalyOrdinal === null) {
+      if (anomaly) {
+        this.firstAnomalyOrdinal = this.callbackOrdinal;
+        this.trace = [...this.preTrace, entry];
+      } else {
+        this.preTrace.push(entry);
+        if (this.preTrace.length > TRACE_BEFORE) this.preTrace.shift();
+      }
+    } else if (this.postAnomalyRemaining > 0) {
+      this.trace.push(entry);
+      this.postAnomalyRemaining -= 1;
+      if (this.postAnomalyRemaining === 0) this.sendResult('anomaly');
+    }
+
+    this.previousObservedContextFrame = observedContextFrame;
+    this.callbackOrdinal += 1;
+    return true;
+  }
+}
+
+registerProcessor('render-clock-shadow', RenderClockShadowProcessor);
+"""
 
 
 PROBE_EXPRESSION = r"""
@@ -87,7 +269,9 @@ PROBE_EXPRESSION = r"""
   const burstAudioSeconds = __BURST_AUDIO_SECONDS__;
   const burstAtSeconds = __BURST_AT_SECONDS__;
   const probeSeconds = __PROBE_SECONDS__;
+  const sourceFrameCount = __SOURCE_FRAME_COUNT__;
   const maximumFrames = __MAXIMUM_CAPTURE_FRAMES__;
+  const traceRewind = __TRACE_REWIND__;
   const context = new AudioContext({
     sampleRate: sampleRateHz,
     latencyHint: 'interactive',
@@ -114,6 +298,45 @@ PROBE_EXPRESSION = r"""
   sink.gain.value = 1;
   node.connect(sink);
   sink.connect(context.destination);
+  let shadowNode = null;
+  let shadowReadyResolve;
+  let shadowArmedResolve;
+  let shadowResultResolve;
+  const shadowReady = new Promise(resolve => {
+    shadowReadyResolve = resolve;
+  });
+  const shadowArmed = new Promise(resolve => {
+    shadowArmedResolve = resolve;
+  });
+  const shadowResult = new Promise(resolve => {
+    shadowResultResolve = resolve;
+  });
+  if (traceRewind) {
+    await context.audioWorklet.addModule('/shadow-worklet.js');
+    shadowNode = new AudioWorkletNode(
+      context,
+      'render-clock-shadow',
+      {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: 1,
+        channelCountMode: 'explicit',
+        channelInterpretation: 'discrete',
+      },
+    );
+    shadowNode.port.onmessage = ({data}) => {
+      if (data?.type === 'shadow_ready') {
+        shadowReadyResolve();
+      } else if (data?.type === 'shadow_armed') {
+        shadowArmedResolve();
+      } else if (data?.type === 'shadow_result') {
+        shadowResultResolve(data);
+      }
+    };
+    shadowNode.connect(sink);
+    await shadowReady;
+  }
 
   const result = {
     audioContextSampleRateHz: context.sampleRate,
@@ -125,6 +348,7 @@ PROBE_EXPRESSION = r"""
     lastTickClientMs: null,
     messageCounts: {},
     sourceStartContextFrame: null,
+    shadowTrace: traceRewind ? null : {status: 'not_requested'},
     tickCount: 0,
     translatedSourcesScheduled: 0,
     wallElapsedMs: null,
@@ -152,6 +376,9 @@ PROBE_EXPRESSION = r"""
       result.lastTickClientMs = now;
       result.tickCount += 1;
     } else if (type === 'capture_error') {
+      const mainContextFrameAtDeliveryBefore = Math.round(
+        context.currentTime * sampleRateHz
+      );
       const rawExpected = (
         data.code === 'capture_started_after_source'
           ? data.sourceStartContextFrame
@@ -173,6 +400,11 @@ PROBE_EXPRESSION = r"""
             : null
         ),
         elapsedClientMs: performance.now() - wallStart,
+        mainContextFrameAtDeliveryBefore,
+        mainContextFrameAtDeliveryAfter: Math.round(
+          context.currentTime * sampleRateHz
+        ),
+        mainContextStateAtDelivery: context.state,
       });
       startedResolve();
       stoppedResolve();
@@ -191,21 +423,38 @@ PROBE_EXPRESSION = r"""
   monitor.connect(context.destination);
   const sourceBuffer = context.createBuffer(
     1,
-    960000,
+    sourceFrameCount,
     sampleRateHz,
   );
+  if (traceRewind) {
+    const marker = sourceBuffer.getChannelData(0);
+    for (let index = 0; index < marker.length; index += 1) {
+      marker[index] = ((index % 4093) + 1) / 8192;
+    }
+  }
   const source = context.createBufferSource();
   source.buffer = sourceBuffer;
   source.connect(monitor);
   source.connect(node, 0, 0);
+  if (shadowNode !== null) source.connect(shadowNode, 0, 0);
   source.start(sourceStartContextFrame / sampleRateHz);
   node.port.postMessage({
     type: 'arm_source_clock',
     sourceStartContextFrame,
-    sourceFrameCount: 960000,
+    sourceFrameCount,
     sourceChunkFrames: 4800,
   });
-  await started;
+  if (shadowNode !== null) {
+    shadowNode.port.postMessage({
+      type: 'arm',
+      sourceStartContextFrame,
+      sourceFrameCount,
+    });
+  }
+  await Promise.all([
+    started,
+    ...(shadowNode === null ? [] : [shadowArmed]),
+  ]);
 
   wallStart = performance.now();
   const contextStart = context.currentTime;
@@ -255,10 +504,19 @@ PROBE_EXPRESSION = r"""
   const wallEnd = performance.now();
   const contextEnd = context.currentTime;
   node.port.postMessage({type: 'stop'});
+  if (shadowNode !== null) shadowNode.port.postMessage({type: 'stop'});
   await Promise.race([
     stopped,
     new Promise(resolve => setTimeout(resolve, 1000)),
   ]);
+  if (shadowNode !== null) {
+    result.shadowTrace = await Promise.race([
+      shadowResult,
+      new Promise(resolve => {
+        setTimeout(() => resolve({status: 'incomplete'}), 1000);
+      }),
+    ]);
+  }
   result.wallElapsedMs = wallEnd - wallStart;
   result.contextElapsedMs = (contextEnd - contextStart) * 1000;
   result.clockRate = result.contextElapsedMs / result.wallElapsedMs;
@@ -272,10 +530,14 @@ class ProbeHandler(BaseHTTPRequestHandler):
     """Serve only the diagnostic page and the exact tracked worklet."""
 
     worklet_bytes = b""
+    shadow_worklet_bytes = b""
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path == "/worklet.js":
             body = self.worklet_bytes
+            content_type = "text/javascript"
+        elif self.path == "/shadow-worklet.js":
+            body = self.shadow_worklet_bytes
             content_type = "text/javascript"
         else:
             body = b"<!doctype html><title>Recorder graph probe</title>"
@@ -290,14 +552,19 @@ class ProbeHandler(BaseHTTPRequestHandler):
         return
 
 
-def _safe_nonnegative_integer(value: Any) -> int | None:
+def _safe_integer(value: Any) -> int | None:
     if (
         isinstance(value, int)
         and not isinstance(value, bool)
-        and 0 <= value <= SAFE_INTEGER_MAX
+        and -SAFE_INTEGER_MAX <= value <= SAFE_INTEGER_MAX
     ):
         return value
     return None
+
+
+def _safe_nonnegative_integer(value: Any) -> int | None:
+    parsed = _safe_integer(value)
+    return parsed if parsed is not None and parsed >= 0 else None
 
 
 def _safe_finite_number(value: Any) -> float | None:
@@ -308,6 +575,82 @@ def _safe_finite_number(value: Any) -> float | None:
     ):
         return float(value)
     return None
+
+
+def _sanitize_shadow_trace(value: Any) -> dict[str, Any]:
+    payload = value if isinstance(value, Mapping) else {}
+    raw_status = payload.get("status")
+    status = (
+        raw_status
+        if raw_status in {
+            "anomaly",
+            "incomplete",
+            "invalid",
+            "no_anomaly",
+            "not_requested",
+        }
+        else "unknown"
+    )
+    result: dict[str, Any] = {
+        "status": status,
+        "first_anomaly_ordinal": _safe_nonnegative_integer(
+            payload.get("firstAnomalyOrdinal")
+        ),
+        "first_expected_context_frame": _safe_nonnegative_integer(
+            payload.get("firstExpectedContextFrame")
+        ),
+        "first_observed_context_frame": _safe_nonnegative_integer(
+            payload.get("firstObservedContextFrame")
+        ),
+    }
+    safe_entries: list[dict[str, Any]] = []
+    raw_entries = payload.get("trace")
+    result["trace_entry_count"] = (
+        min(len(raw_entries), SHADOW_TRACE_LIMIT + 1)
+        if isinstance(raw_entries, list)
+        else 0
+    )
+    if isinstance(raw_entries, list):
+        for raw_entry in raw_entries[:SHADOW_TRACE_LIMIT]:
+            entry = raw_entry if isinstance(raw_entry, Mapping) else {}
+            safe_entries.append(
+                {
+                    "callback_ordinal": _safe_nonnegative_integer(
+                        entry.get("callbackOrdinal")
+                    ),
+                    "frame_count": _safe_nonnegative_integer(
+                        entry.get("frameCount")
+                    ),
+                    "expected_context_frame": _safe_nonnegative_integer(
+                        entry.get("expectedContextFrame")
+                    ),
+                    "observed_context_frame": _safe_nonnegative_integer(
+                        entry.get("observedContextFrame")
+                    ),
+                    "logical_context_frame": _safe_nonnegative_integer(
+                        entry.get("logicalContextFrame")
+                    ),
+                    "axis_offset_frames": _safe_integer(
+                        entry.get("axisOffsetFrames")
+                    ),
+                    "step_frames": _safe_integer(
+                        entry.get("stepFrames")
+                    ),
+                    "worklet_current_time_frame": (
+                        _safe_nonnegative_integer(
+                            entry.get("workletCurrentTimeFrame")
+                        )
+                    ),
+                    "decoded_source_frame": _safe_nonnegative_integer(
+                        entry.get("decodedSourceFrame")
+                    ),
+                    "source_step_frames": _safe_integer(
+                        entry.get("sourceStepFrames")
+                    ),
+                }
+            )
+    result["trace"] = safe_entries
+    return result
 
 
 def sanitize_probe_result(value: Any) -> dict[str, Any]:
@@ -371,9 +714,32 @@ def sanitize_probe_result(value: Any) -> dict[str, Any]:
                 "elapsed_client_ms": _safe_finite_number(
                     error.get("elapsedClientMs")
                 ),
+                "main_context_frame_at_delivery_before": (
+                    _safe_nonnegative_integer(
+                        error.get("mainContextFrameAtDeliveryBefore")
+                    )
+                ),
+                "main_context_frame_at_delivery_after": (
+                    _safe_nonnegative_integer(
+                        error.get("mainContextFrameAtDeliveryAfter")
+                    )
+                ),
+                "main_context_state_at_delivery": (
+                    error.get("mainContextStateAtDelivery")
+                    if error.get("mainContextStateAtDelivery") in {
+                        "closed",
+                        "interrupted",
+                        "running",
+                        "suspended",
+                    }
+                    else "unknown"
+                ),
             }
             capture_errors.append(safe_error)
     result["capture_errors"] = capture_errors
+    result["shadow_trace"] = _sanitize_shadow_trace(
+        payload.get("shadowTrace")
+    )
     return result
 
 
@@ -389,17 +755,38 @@ def _translated_source_count(
     return math.ceil(total_frames / publication_frames)
 
 
-def _minimum_source_tick_count(probe_seconds: float) -> int:
-    source_seconds = SOURCE_FRAME_COUNT / SAMPLE_RATE_HZ
+def _source_frame_count(
+    probe_seconds: float,
+    *,
+    trace_rewind: bool,
+) -> int:
+    if not trace_rewind:
+        return SOURCE_FRAME_COUNT
+    required_frames = max(
+        SOURCE_FRAME_COUNT,
+        math.ceil((probe_seconds + 1) * SAMPLE_RATE_HZ),
+    )
+    return (
+        math.ceil(required_frames / SOURCE_ALIGNMENT_FRAMES)
+        * SOURCE_ALIGNMENT_FRAMES
+    )
+
+
+def _minimum_source_tick_count(
+    probe_seconds: float,
+    *,
+    source_frame_count: int = SOURCE_FRAME_COUNT,
+) -> int:
+    source_seconds = source_frame_count / SAMPLE_RATE_HZ
     chunk_seconds = SOURCE_CHUNK_FRAMES / SAMPLE_RATE_HZ
     if probe_seconds * MIN_CLOCK_RATE >= source_seconds + chunk_seconds:
-        return SOURCE_FRAME_COUNT // SOURCE_CHUNK_FRAMES
+        return source_frame_count // SOURCE_CHUNK_FRAMES
     observable_seconds = min(
         probe_seconds * MIN_CLOCK_RATE,
         source_seconds,
     )
     return min(
-        SOURCE_FRAME_COUNT // SOURCE_CHUNK_FRAMES,
+        source_frame_count // SOURCE_CHUNK_FRAMES,
         max(
             1,
             math.floor(
@@ -423,6 +810,7 @@ def validate_probe_result(
     result: Mapping[str, Any],
     *,
     expected_translated_sources: int,
+    maximum_source_ticks: int | None = None,
     minimum_pcm_blocks: int,
     minimum_source_ticks: int,
 ) -> list[str]:
@@ -454,7 +842,8 @@ def validate_probe_result(
         failures.append("translated_source_count")
 
     source_ticks = result.get("source_tick_count")
-    maximum_source_ticks = SOURCE_FRAME_COUNT // SOURCE_CHUNK_FRAMES
+    if maximum_source_ticks is None:
+        maximum_source_ticks = SOURCE_FRAME_COUNT // SOURCE_CHUNK_FRAMES
     if (
         not isinstance(source_ticks, int)
         or not minimum_source_ticks <= source_ticks <= maximum_source_ticks
@@ -500,6 +889,265 @@ def validate_probe_result(
             failures.append("pcm_block_count")
 
     return failures
+
+
+def validate_shadow_trace(
+    shadow_trace: Mapping[str, Any],
+) -> list[str]:
+    """Validate the complete bounded trace before interpreting it."""
+
+    failures: list[str] = []
+    raw_entries = shadow_trace.get("trace")
+    entries = raw_entries if isinstance(raw_entries, list) else []
+    if (
+        shadow_trace.get("trace_entry_count") != SHADOW_TRACE_LIMIT
+        or len(entries) != SHADOW_TRACE_LIMIT
+    ):
+        return ["shadow_trace_incomplete"]
+    if not all(isinstance(entry, Mapping) for entry in entries):
+        return ["shadow_trace_structure"]
+
+    ordinal = shadow_trace.get("first_anomaly_ordinal")
+    anomaly_index = SHADOW_TRACE_BEFORE
+    anomaly = entries[anomaly_index]
+    if (
+        not isinstance(ordinal, int)
+        or anomaly.get("callback_ordinal") != ordinal
+        or shadow_trace.get("first_expected_context_frame")
+        != anomaly.get("expected_context_frame")
+        or shadow_trace.get("first_observed_context_frame")
+        != anomaly.get("observed_context_frame")
+    ):
+        failures.append("shadow_anomaly_identity")
+
+    quantum = anomaly.get("frame_count")
+    if not isinstance(quantum, int) or quantum <= 0:
+        return failures + ["shadow_frame_count"]
+
+    first_ordinal = entries[0].get("callback_ordinal")
+    first_logical = entries[0].get("logical_context_frame")
+    if not isinstance(first_ordinal, int) or not isinstance(
+        first_logical, int
+    ):
+        return failures + ["shadow_trace_structure"]
+
+    previous: Mapping[str, Any] | None = None
+    for index, entry in enumerate(entries):
+        observed = entry.get("observed_context_frame")
+        logical = entry.get("logical_context_frame")
+        decoded = entry.get("decoded_source_frame")
+        if (
+            entry.get("callback_ordinal") != first_ordinal + index
+            or entry.get("frame_count") != quantum
+            or logical != first_logical + index * quantum
+            or not isinstance(observed, int)
+            or not isinstance(logical, int)
+            or entry.get("axis_offset_frames") != observed - logical
+            or entry.get("worklet_current_time_frame") != observed
+            or not isinstance(decoded, int)
+            or not isinstance(entry.get("source_step_frames"), int)
+        ):
+            failures.append("shadow_trace_structure")
+            break
+        if previous is not None:
+            previous_observed = previous.get("observed_context_frame")
+            previous_decoded = previous.get("decoded_source_frame")
+            if (
+                not isinstance(previous_observed, int)
+                or entry.get("expected_context_frame")
+                != previous_observed + quantum
+                or entry.get("step_frames")
+                != observed - previous_observed
+                or not isinstance(previous_decoded, int)
+                or entry.get("source_step_frames")
+                != decoded - previous_decoded
+            ):
+                failures.append("shadow_trace_arithmetic")
+                break
+        previous = entry
+
+    if any(
+        entry.get("axis_offset_frames") != 0
+        or entry.get("step_frames") != quantum
+        for entry in entries[:anomaly_index]
+    ):
+        failures.append("shadow_pre_anomaly_state")
+    if (
+        anomaly.get("axis_offset_frames") != -quantum
+        or anomaly.get("step_frames") != 0
+    ):
+        failures.append("shadow_first_anomaly_shape")
+    return list(dict.fromkeys(failures))
+
+
+def classify_shadow_trace(
+    shadow_trace: Mapping[str, Any],
+) -> dict[str, str]:
+    """Classify a complete bounded, generated-PCM render-clock trace."""
+
+    if shadow_trace.get("status") == "no_anomaly":
+        return {
+            "clock_behavior": "not_reproduced",
+            "main_clock_relation": "not_observed",
+            "media_behavior": "not_observed",
+        }
+    if (
+        shadow_trace.get("status") != "anomaly"
+        or validate_shadow_trace(shadow_trace)
+    ):
+        return {
+            "clock_behavior": "unresolved",
+            "main_clock_relation": "not_observed",
+            "media_behavior": "unresolved",
+        }
+
+    entries = shadow_trace["trace"]
+    anomaly_index = SHADOW_TRACE_BEFORE
+    anomaly = entries[anomaly_index]
+    quantum = anomaly["frame_count"]
+    later = entries[anomaly_index + 1 :]
+
+    catch_up_index = next(
+        (
+            index
+            for index, entry in enumerate(later)
+            if entry.get("axis_offset_frames") == 0
+            and entry.get("step_frames") == 2 * quantum
+        ),
+        None,
+    )
+    if catch_up_index is not None:
+        before_catch_up = later[:catch_up_index]
+        after_catch_up = later[catch_up_index + 1 :]
+        if all(
+            entry.get("axis_offset_frames") == -quantum
+            and entry.get("step_frames") == quantum
+            for entry in before_catch_up
+        ) and all(
+            entry.get("axis_offset_frames") == 0
+            and entry.get("step_frames") == quantum
+            for entry in after_catch_up
+        ):
+            clock_behavior = "repeated_frame_then_catch_up"
+        else:
+            clock_behavior = "one_quantum_discontinuity_other"
+    elif all(
+        entry.get("axis_offset_frames") == -quantum
+        and entry.get("step_frames") == quantum
+        for entry in later
+    ):
+        clock_behavior = "sustained_one_quantum_offset_within_trace"
+    else:
+        clock_behavior = "one_quantum_discontinuity_other"
+
+    source_steps = [
+        entry.get("source_step_frames")
+        for entry in entries[anomaly_index:]
+    ]
+    if all(step == quantum for step in source_steps):
+        media_behavior = "samples_contiguous"
+    elif (
+        all(step in {0, quantum, 2 * quantum} for step in source_steps)
+        and 0 in source_steps
+        and 2 * quantum in source_steps
+    ):
+        media_behavior = "samples_duplicated_and_dropped"
+    elif (
+        all(step in {0, quantum} for step in source_steps)
+        and 0 in source_steps
+    ):
+        media_behavior = "samples_duplicated"
+    elif (
+        all(step in {quantum, 2 * quantum} for step in source_steps)
+        and 2 * quantum in source_steps
+    ):
+        media_behavior = "samples_dropped"
+    else:
+        media_behavior = "other"
+
+    return {
+        "clock_behavior": clock_behavior,
+        "main_clock_relation": "evaluated_at_message_delivery",
+        "media_behavior": media_behavior,
+    }
+
+
+def evaluate_rewind_diagnostic(
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reconcile the exact fail-closed recorder with the shadow trace."""
+
+    raw_errors = result.get("capture_errors")
+    errors = raw_errors if isinstance(raw_errors, list) else []
+    raw_shadow = result.get("shadow_trace")
+    shadow = raw_shadow if isinstance(raw_shadow, Mapping) else {}
+    classification = classify_shadow_trace(shadow)
+    failure_codes: list[str] = []
+
+    if not errors:
+        no_anomaly_shape = (
+            shadow.get("status") == "no_anomaly"
+            and shadow.get("first_anomaly_ordinal") is None
+            and shadow.get("first_expected_context_frame") is None
+            and shadow.get("first_observed_context_frame") is None
+            and shadow.get("trace_entry_count") == 0
+            and shadow.get("trace") == []
+        )
+        if no_anomaly_shape:
+            status = "not_reproduced"
+        else:
+            status = "invalid"
+            failure_codes.append("exact_shadow_disagreement")
+        return {
+            "classification": classification,
+            "failure_codes": failure_codes,
+            "status": status,
+        }
+
+    if len(errors) != 1:
+        failure_codes.append("exact_error_count")
+    exact = errors[0] if isinstance(errors[0], Mapping) else {}
+    if exact.get("code") != "noncontiguous_render_quantum":
+        failure_codes.append("unexpected_exact_error")
+    if shadow.get("status") != "anomaly":
+        failure_codes.append("shadow_trace_missing")
+    if (
+        exact.get("expected_context_frame")
+        != shadow.get("first_expected_context_frame")
+        or exact.get("observed_context_frame")
+        != shadow.get("first_observed_context_frame")
+    ):
+        failure_codes.append("exact_shadow_disagreement")
+
+    failure_codes.extend(validate_shadow_trace(shadow))
+    if classification["clock_behavior"] == "unresolved":
+        failure_codes.append("clock_classification_unresolved")
+    if classification["media_behavior"] in {"not_observed", "unresolved"}:
+        failure_codes.append("media_classification_unresolved")
+
+    main_before = exact.get("main_context_frame_at_delivery_before")
+    main_after = exact.get("main_context_frame_at_delivery_after")
+    expected = exact.get("expected_context_frame")
+    if (
+        isinstance(main_before, int)
+        and isinstance(main_after, int)
+        and isinstance(expected, int)
+        and main_before >= expected
+        and main_after >= main_before
+        and exact.get("main_context_state_at_delivery") == "running"
+    ):
+        classification["main_clock_relation"] = (
+            "running_at_or_past_expected_when_error_delivered"
+        )
+    else:
+        classification["main_clock_relation"] = "unresolved"
+        failure_codes.append("main_clock_delivery_observation_unresolved")
+
+    return {
+        "classification": classification,
+        "failure_codes": failure_codes,
+        "status": "invalid" if failure_codes else "traced",
+    }
 
 
 def _sanitize_browser_product(value: Any) -> dict[str, str | None]:
@@ -575,6 +1223,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="explicit Chrome/Chromium executable",
     )
+    parser.add_argument(
+        "--trace-rewind",
+        action="store_true",
+        help=(
+            "attach a generated-PCM shadow worklet that traces a recorder "
+            "clock discontinuity without changing the strict recorder"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.probe_seconds <= args.burst_at_seconds + 0.5:
         parser.error(
@@ -647,9 +1303,14 @@ def _probe_expression(
     burst_audio_seconds: float,
     burst_at_seconds: float,
     probe_seconds: float,
+    trace_rewind: bool = False,
 ) -> str:
     maximum_capture_frames = math.ceil(
         (probe_seconds + 5) * SAMPLE_RATE_HZ
+    )
+    source_frame_count = _source_frame_count(
+        probe_seconds,
+        trace_rewind=trace_rewind,
     )
     return (
         PROBE_EXPRESSION
@@ -657,6 +1318,8 @@ def _probe_expression(
         .replace("__BURST_AUDIO_SECONDS__", repr(burst_audio_seconds))
         .replace("__BURST_AT_SECONDS__", repr(burst_at_seconds))
         .replace("__PROBE_SECONDS__", repr(probe_seconds))
+        .replace("__SOURCE_FRAME_COUNT__", str(source_frame_count))
+        .replace("__TRACE_REWIND__", "true" if trace_rewind else "false")
         .replace(
             "__MAXIMUM_CAPTURE_FRAMES__",
             str(maximum_capture_frames),
@@ -728,8 +1391,31 @@ def _terminate_chrome(chrome: subprocess.Popen[bytes] | None) -> None:
         pass
 
 
+def _record_failed(
+    record: Mapping[str, Any],
+    *,
+    trace_rewind: bool,
+) -> bool:
+    validation = record.get("validation")
+    if (
+        not isinstance(validation, Mapping)
+        or validation.get("status") != "pass"
+    ):
+        return True
+    if not trace_rewind:
+        return False
+    diagnostic = record.get("rewind_diagnostic")
+    return (
+        not isinstance(diagnostic, Mapping)
+        or diagnostic.get("status") not in {"not_reproduced", "traced"}
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     worklet_bytes, worklet_sha256 = _registered_worklet_bytes(WORKLET_PATH)
+    shadow_worklet_sha256 = hashlib.sha256(
+        SHADOW_WORKLET_SOURCE
+    ).hexdigest()
     chrome_path = preflight.find_chrome(args.chrome)
     browser_binary_sha256 = preflight.sha256_file(chrome_path)
 
@@ -744,6 +1430,7 @@ def run(args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
     try:
         ProbeHandler.worklet_bytes = worklet_bytes
+        ProbeHandler.shadow_worklet_bytes = SHADOW_WORKLET_SOURCE
         server = ThreadingHTTPServer(("127.0.0.1", 0), ProbeHandler)
         server_thread = threading.Thread(
             target=server.serve_forever,
@@ -803,6 +1490,11 @@ def run(args: argparse.Namespace) -> int:
             "browser_kind": browser_product["kind"],
             "browser_version": browser_product["version"],
             "worklet_sha256": worklet_sha256,
+            **(
+                {"shadow_worklet_sha256": shadow_worklet_sha256}
+                if args.trace_rewind
+                else {}
+            ),
         }
         cdp.call(
             "Page.navigate",
@@ -819,6 +1511,7 @@ def run(args: argparse.Namespace) -> int:
                         burst_audio_seconds=args.burst_audio_seconds,
                         burst_at_seconds=args.burst_at_seconds,
                         probe_seconds=args.probe_seconds,
+                        trace_rewind=args.trace_rewind,
                     ),
                     timeout_seconds=args.probe_seconds + 15,
                 )
@@ -826,8 +1519,13 @@ def run(args: argparse.Namespace) -> int:
                     publication_frame_ms=frame_ms,
                     burst_audio_seconds=args.burst_audio_seconds,
                 )
+                source_frame_count = _source_frame_count(
+                    args.probe_seconds,
+                    trace_rewind=args.trace_rewind,
+                )
                 minimum_source_ticks = _minimum_source_tick_count(
-                    args.probe_seconds
+                    args.probe_seconds,
+                    source_frame_count=source_frame_count,
                 )
                 minimum_pcm_blocks = _minimum_pcm_block_count(
                     args.probe_seconds
@@ -836,6 +1534,9 @@ def run(args: argparse.Namespace) -> int:
                     result,
                     expected_translated_sources=(
                         expected_translated_sources
+                    ),
+                    maximum_source_ticks=(
+                        source_frame_count // SOURCE_CHUNK_FRAMES
                     ),
                     minimum_pcm_blocks=minimum_pcm_blocks,
                     minimum_source_ticks=minimum_source_ticks,
@@ -852,8 +1553,18 @@ def run(args: argparse.Namespace) -> int:
                         "failure_codes": failure_codes,
                         "minimum_pcm_blocks": minimum_pcm_blocks,
                         "minimum_source_ticks": minimum_source_ticks,
+                        "source_frame_count": source_frame_count,
                         "status": "fail" if failure_codes else "pass",
                     },
+                    **(
+                        {
+                            "rewind_diagnostic": (
+                                evaluate_rewind_diagnostic(result)
+                            )
+                        }
+                        if args.trace_rewind
+                        else {}
+                    ),
                 }
                 results.append(record)
                 print(
@@ -869,7 +1580,10 @@ def run(args: argparse.Namespace) -> int:
         summary = {
             str(frame_ms): {
                 "failures": sum(
-                    record["validation"]["status"] == "fail"
+                    _record_failed(
+                        record,
+                        trace_rewind=args.trace_rewind,
+                    )
                     for record in results
                     if record["frame_ms"] == frame_ms
                 ),
@@ -880,18 +1594,38 @@ def run(args: argparse.Namespace) -> int:
             }
             for frame_ms in args.frame_ms
         }
+        rewind_summary = (
+            {
+                status: sum(
+                    record.get("rewind_diagnostic", {}).get("status")
+                    == status
+                    for record in results
+                )
+                for status in ("invalid", "not_reproduced", "traced")
+            }
+            if args.trace_rewind
+            else None
+        )
         print(
             json.dumps(
                 {
                     "overall_status": (
                         "fail"
                         if any(
-                            record["validation"]["status"] == "fail"
+                            _record_failed(
+                                record,
+                                trace_rewind=args.trace_rewind,
+                            )
                             for record in results
                         )
                         else "pass"
                     ),
                     "provenance": provenance,
+                    **(
+                        {"rewind_diagnostic_summary": rewind_summary}
+                        if rewind_summary is not None
+                        else {}
+                    ),
                     "summary": summary,
                 },
                 ensure_ascii=True,
@@ -902,7 +1636,10 @@ def run(args: argparse.Namespace) -> int:
         return (
             1
             if any(
-                record["validation"]["status"] == "fail"
+                _record_failed(
+                    record,
+                    trace_rewind=args.trace_rewind,
+                )
                 for record in results
             )
             else 0
