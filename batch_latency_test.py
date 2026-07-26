@@ -251,6 +251,83 @@ def _positive_int(value: Any) -> bool:
 
 _MISSING = object()
 _SUPPORTED_STAGED_TELEMETRY_SCHEMAS = {1, 2, 3}
+_PUBLISHER_HANDOFF_FIELDS = (
+    "publish_requested_monotonic_ms",
+    "event_loop_callback_started_monotonic_ms",
+    "output_capacity_acquired_monotonic_ms",
+)
+_PUBLISHER_HANDOFF_BLOCKED_TOLERANCE_MS = 10.0
+_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS = 1e-3
+_VALID_EMISSION_REASONS = frozenset(
+    {"punctuation", "length", "age", "final_flush"}
+)
+_PIPELINE_EVENT_SAFE_FIELDS = frozenset(
+    {
+        "session_id",
+        "stage",
+        "event",
+        "monotonic_ms",
+        "sequence_id",
+        "parent_sequence_id",
+        "subsequence_id",
+        "subsequence_count",
+        "asr_final_id",
+        "contributing_final_ids",
+        "emission_reason",
+        "source_start_ms",
+        "source_end_ms",
+        "queue_depth",
+        "queue_capacity",
+        "queue_residence_ms",
+        "processing_duration_ms",
+        "blocked_put_ms",
+        "text_chars",
+        "parent_text_chars",
+        "audio_bytes",
+        "audio_duration_ms",
+        "retry_count",
+        "error_code",
+        "audio_frame_id",
+        "audio_frame_count",
+        "atomic_fallback_applied",
+        *_PUBLISHER_HANDOFF_FIELDS,
+    }
+)
+_WEBSOCKET_FRAME_SAFE_FIELDS = frozenset(
+    {
+        "sequence_id",
+        "parent_sequence_id",
+        "audio_frame_id",
+        "audio_bytes",
+        "send_started_monotonic_ms",
+        "sent_monotonic_ms",
+    }
+)
+_TTS_RESPONSE_SIDECAR_SAFE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "segments_observed",
+        "response_chunk_count",
+        "chunks",
+    }
+)
+_TTS_RESPONSE_CHUNK_SAFE_FIELDS = frozenset(
+    {
+        "parent_sequence_id",
+        "subsequence_id",
+        "subsequence_count",
+        "response_index",
+        "response_count",
+        "audio_bytes",
+        "cumulative_audio_bytes",
+        "audio_duration_ms",
+        "cumulative_audio_duration_ms",
+        "received_monotonic_ms",
+        "since_request_start_ms",
+        "since_previous_response_ms",
+        "retry_count",
+    }
+)
 _SUBSEGMENT_LIFECYCLE_EVENTS = (
     ("target_splitter", "emitted"),
     ("tts", "enqueued"),
@@ -1146,6 +1223,1015 @@ def _validate_staged_pipeline_integrity_v2(
     return errors
 
 
+def _nonnegative_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _handoff_timestamp(
+    value: Any,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> float | None:
+    if not _nonnegative_finite_number(value):
+        errors.append(f"{field_name} must be non-negative and finite")
+        return None
+    return float(value)
+
+
+def _reject_unsafe_telemetry_fields(
+    value: dict[str, Any],
+    *,
+    allowed_fields: frozenset[str],
+    field_name: str,
+    errors: list[str],
+) -> None:
+    unexpected = sorted(set(value) - allowed_fields)
+    if unexpected:
+        errors.append(
+            f"{field_name} contains private or unsupported payload fields: "
+            + ", ".join(unexpected)
+        )
+
+
+def _publisher_frame_metadata(
+    event: dict[str, Any],
+    *,
+    summary_session_id: Any,
+    field_name: str,
+    errors: list[str],
+) -> tuple[Any, ...] | None:
+    """Validate privacy-safe values retained on one successful frame row."""
+    valid = True
+    session_id = event.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id != summary_session_id
+    ):
+        errors.append(
+            f"{field_name}.session_id must be nonempty and match "
+            "the staged summary"
+        )
+        valid = False
+
+    error_code = event.get("error_code", "")
+    if not isinstance(error_code, str) or error_code:
+        errors.append(
+            f"{field_name}.error_code must be the empty success code"
+        )
+        valid = False
+
+    emission_reason = event.get("emission_reason")
+    if (
+        emission_reason is not None
+        and emission_reason not in _VALID_EMISSION_REASONS
+    ):
+        errors.append(
+            f"{field_name}.emission_reason is not a fixed supported value"
+        )
+        valid = False
+
+    asr_final_id = event.get("asr_final_id")
+    if asr_final_id is not None and (
+        not isinstance(asr_final_id, int)
+        or isinstance(asr_final_id, bool)
+        or asr_final_id < 0
+    ):
+        errors.append(
+            f"{field_name}.asr_final_id must be a non-negative integer or null"
+        )
+        valid = False
+
+    contributing_final_ids = event.get("contributing_final_ids", ())
+    if not isinstance(contributing_final_ids, (list, tuple)) or any(
+        not isinstance(final_id, int)
+        or isinstance(final_id, bool)
+        or final_id < 0
+        for final_id in contributing_final_ids
+    ):
+        errors.append(
+            f"{field_name}.contributing_final_ids must contain only "
+            "non-negative integer IDs"
+        )
+        valid = False
+        normalized_final_ids: tuple[int, ...] = ()
+    else:
+        normalized_final_ids = tuple(contributing_final_ids)
+        if len(set(normalized_final_ids)) != len(normalized_final_ids):
+            errors.append(
+                f"{field_name}.contributing_final_ids must not contain "
+                "duplicates"
+            )
+            valid = False
+
+    source_values: list[float | None] = []
+    for source_field in ("source_start_ms", "source_end_ms"):
+        value = event.get(source_field)
+        if value is None:
+            source_values.append(None)
+        elif not _nonnegative_finite_number(value):
+            errors.append(
+                f"{field_name}.{source_field} must be non-negative, finite, "
+                "or null"
+            )
+            source_values.append(None)
+            valid = False
+        else:
+            source_values.append(float(value))
+    if (
+        source_values[0] is not None
+        and source_values[1] is not None
+        and source_values[1] < source_values[0]
+    ):
+        errors.append(
+            f"{field_name}.source_end_ms cannot precede source_start_ms"
+        )
+        valid = False
+
+    if not valid:
+        return None
+    return (
+        session_id,
+        error_code,
+        emission_reason,
+        asr_final_id,
+        normalized_final_ids,
+        *source_values,
+    )
+
+
+def _validate_v3_response_chunk_sidecar(
+    staged_pipeline: dict[str, Any],
+    expected_frames: list[tuple[tuple[int, int], int, int]],
+    *,
+    frame_bytes_per_ms: float | None,
+    errors: list[str],
+) -> dict[tuple[int, int, int], list[dict[str, Any]]]:
+    """Validate the required privacy-safe response-chunk diagnostic."""
+    sidecar = staged_pipeline.get("tts_response_chunk_telemetry")
+    if not isinstance(sidecar, dict):
+        errors.append(
+            "enabled TTS response-chunk telemetry requires "
+            "tts_response_chunk_telemetry"
+        )
+        return {}
+    _reject_unsafe_telemetry_fields(
+        sidecar,
+        allowed_fields=_TTS_RESPONSE_SIDECAR_SAFE_FIELDS,
+        field_name="tts_response_chunk_telemetry",
+        errors=errors,
+    )
+    if sidecar.get("schema_version") != 1:
+        errors.append("tts_response_chunk_telemetry.schema_version must be 1")
+
+    chunks = sidecar.get("chunks")
+    if not isinstance(chunks, list):
+        errors.append("tts_response_chunk_telemetry.chunks must be a list")
+        return {}
+    response_chunk_count = sidecar.get("response_chunk_count")
+    if (
+        not isinstance(response_chunk_count, int)
+        or isinstance(response_chunk_count, bool)
+        or response_chunk_count < 0
+    ):
+        errors.append(
+            "tts_response_chunk_telemetry.response_chunk_count must be "
+            "a non-negative integer"
+        )
+    elif response_chunk_count != len(chunks):
+        errors.append(
+            "tts_response_chunk_telemetry.response_chunk_count must match "
+            "the chunk row count"
+        )
+
+    expected_parent_bytes: dict[int, int] = {}
+    expected_parent_retries: dict[int, int] = {}
+    for (parent_id, _frame_id), audio_bytes, retry_count in expected_frames:
+        expected_parent_bytes[parent_id] = (
+            expected_parent_bytes.get(parent_id, 0) + audio_bytes
+        )
+        previous_retry = expected_parent_retries.setdefault(
+            parent_id,
+            retry_count,
+        )
+        if previous_retry != retry_count:
+            errors.append(
+                f"frame retry_count changed within parent {parent_id}"
+            )
+
+    grouped: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    for index, chunk in enumerate(chunks):
+        field_name = f"tts_response_chunk_telemetry.chunks[{index}]"
+        if not isinstance(chunk, dict):
+            errors.append(f"{field_name} must be an object")
+            continue
+        _reject_unsafe_telemetry_fields(
+            chunk,
+            allowed_fields=_TTS_RESPONSE_CHUNK_SAFE_FIELDS,
+            field_name=field_name,
+            errors=errors,
+        )
+        parent = chunk.get("parent_sequence_id")
+        subsequence_id = chunk.get("subsequence_id")
+        subsequence_count = chunk.get("subsequence_count")
+        if (
+            not isinstance(parent, int)
+            or isinstance(parent, bool)
+            or parent < 0
+        ):
+            errors.append(f"{field_name}.parent_sequence_id is invalid")
+            continue
+        if (
+            subsequence_id != 0
+            or isinstance(subsequence_id, bool)
+            or subsequence_count != 1
+            or isinstance(subsequence_count, bool)
+        ):
+            errors.append(
+                f"{field_name} must use the schema-v3 request identity "
+                "subsequence_id=0, subsequence_count=1"
+            )
+            continue
+
+        parsed: dict[str, Any] = {}
+        for integer_field, positive in (
+            ("response_index", False),
+            ("response_count", True),
+            ("audio_bytes", True),
+            ("cumulative_audio_bytes", True),
+        ):
+            value = chunk.get(integer_field)
+            valid = (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and (value > 0 if positive else value >= 0)
+            )
+            if not valid:
+                qualifier = "positive" if positive else "non-negative"
+                errors.append(
+                    f"{field_name}.{integer_field} must be a {qualifier} integer"
+                )
+            else:
+                parsed[integer_field] = value
+        retry_count = chunk.get("retry_count")
+        if (
+            not isinstance(retry_count, int)
+            or isinstance(retry_count, bool)
+            or retry_count not in {0, 1}
+        ):
+            errors.append(
+                f"{field_name}.retry_count must be zero or one"
+            )
+        else:
+            parsed["retry_count"] = retry_count
+        for timing_field in (
+            "audio_duration_ms",
+            "cumulative_audio_duration_ms",
+            "received_monotonic_ms",
+            "since_request_start_ms",
+            "since_previous_response_ms",
+        ):
+            timing = _handoff_timestamp(
+                chunk.get(timing_field),
+                field_name=f"{field_name}.{timing_field}",
+                errors=errors,
+            )
+            if timing is not None:
+                parsed[timing_field] = timing
+        if len(parsed) == 10:
+            grouped.setdefault((parent, 0, 1), []).append(parsed)
+
+    expected_keys = {
+        (parent_id, 0, 1) for parent_id in expected_parent_bytes
+    }
+    if set(grouped) != expected_keys:
+        errors.append(
+            "TTS response-chunk identities must exactly cover canonical "
+            "frame parents"
+        )
+    segments_observed = sidecar.get("segments_observed")
+    if (
+        not isinstance(segments_observed, int)
+        or isinstance(segments_observed, bool)
+        or segments_observed < 0
+    ):
+        errors.append(
+            "tts_response_chunk_telemetry.segments_observed must be "
+            "a non-negative integer"
+        )
+    elif segments_observed != len(grouped):
+        errors.append(
+            "tts_response_chunk_telemetry.segments_observed must match "
+            "the observed request count"
+        )
+
+    for (parent_id, _subsequence_id, _subsequence_count), rows in grouped.items():
+        declared_count = rows[0]["response_count"]
+        if (
+            declared_count != len(rows)
+            or any(row["response_count"] != declared_count for row in rows)
+        ):
+            errors.append(
+                f"parent {parent_id} TTS response_count must match its chunk rows"
+            )
+            continue
+        if [row["response_index"] for row in rows] != list(
+            range(declared_count)
+        ):
+            errors.append(
+                f"parent {parent_id} TTS response indices must be contiguous "
+                "from zero"
+            )
+
+        cumulative_bytes = 0
+        cumulative_duration_ms = 0.0
+        request_started_ms = (
+            rows[0]["received_monotonic_ms"]
+            - rows[0]["since_request_start_ms"]
+        )
+        if request_started_ms < 0:
+            errors.append(
+                f"parent {parent_id} TTS response request start is negative"
+            )
+        previous_received_ms = request_started_ms
+        for row in rows:
+            cumulative_bytes += row["audio_bytes"]
+            cumulative_duration_ms += row["audio_duration_ms"]
+            if row["cumulative_audio_bytes"] != cumulative_bytes:
+                errors.append(
+                    f"parent {parent_id} TTS response cumulative bytes "
+                    "do not reconcile"
+                )
+            if not math.isclose(
+                row["cumulative_audio_duration_ms"],
+                cumulative_duration_ms,
+                rel_tol=0.0,
+                abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+            ):
+                errors.append(
+                    f"parent {parent_id} TTS response cumulative duration "
+                    "does not reconcile"
+                )
+            received_ms = row["received_monotonic_ms"]
+            if received_ms < previous_received_ms:
+                errors.append(
+                    f"parent {parent_id} TTS response timestamps are inverted"
+                )
+            if not math.isclose(
+                row["since_previous_response_ms"],
+                received_ms - previous_received_ms,
+                rel_tol=0.0,
+                abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+            ):
+                errors.append(
+                    f"parent {parent_id} TTS response inter-arrival timing "
+                    "does not reconcile"
+                )
+            if not math.isclose(
+                row["since_request_start_ms"],
+                received_ms - request_started_ms,
+                rel_tol=0.0,
+                abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+            ):
+                errors.append(
+                    f"parent {parent_id} TTS response request timing "
+                    "does not reconcile"
+                )
+            if (
+                frame_bytes_per_ms is not None
+                and not math.isclose(
+                    row["audio_duration_ms"],
+                    row["audio_bytes"] / frame_bytes_per_ms,
+                    rel_tol=0.0,
+                    abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+                )
+            ):
+                errors.append(
+                    f"parent {parent_id} TTS response duration does not "
+                    "reconcile with audio bytes"
+                )
+            if row["retry_count"] != expected_parent_retries.get(parent_id):
+                errors.append(
+                    f"parent {parent_id} TTS response retry attribution "
+                    "does not match canonical frames"
+                )
+            previous_received_ms = received_ms
+        if cumulative_bytes != expected_parent_bytes.get(parent_id):
+            errors.append(
+                f"parent {parent_id} TTS response bytes do not match "
+                "canonical frames"
+            )
+    return grouped
+
+
+def _validate_v3_response_frame_boundaries(
+    staged_pipeline: dict[str, Any],
+    response_groups: dict[
+        tuple[int, int, int],
+        list[dict[str, Any]],
+    ],
+    canonical_keys: list[tuple[int, int]] | None,
+    canonical_bytes: list[int] | None,
+    received_rows: list[dict[str, Any]],
+    errors: list[str],
+) -> None:
+    """Reconcile response chunks with TTS lifecycle and frame readiness."""
+    if canonical_keys is None or canonical_bytes is None:
+        return
+    parent_summaries = staged_pipeline.get("produced_parent_summaries")
+    if not isinstance(parent_summaries, list):
+        return
+    parent_metadata: dict[int, tuple[int, int, bool]] = {}
+    for item in parent_summaries:
+        if not isinstance(item, dict):
+            continue
+        parent_id = item.get("parent_sequence_id")
+        audio_bytes = item.get("audio_bytes")
+        retry_count = item.get("retry_count")
+        fallback_applied = item.get("atomic_fallback_applied", False)
+        if (
+            isinstance(parent_id, int)
+            and not isinstance(parent_id, bool)
+            and parent_id >= 0
+            and _positive_int(audio_bytes)
+            and isinstance(retry_count, int)
+            and not isinstance(retry_count, bool)
+            and retry_count in {0, 1}
+            and isinstance(fallback_applied, bool)
+        ):
+            parent_metadata[parent_id] = (
+                audio_bytes,
+                retry_count,
+                fallback_applied,
+            )
+
+    lifecycle: dict[str, dict[int, dict[str, Any]]] = {
+        "first_audio": {},
+        "completed": {},
+    }
+    events = staged_pipeline.get("events")
+    if not isinstance(events, list):
+        return
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or event.get("stage") != "tts":
+            continue
+        event_name = event.get("event")
+        if event_name not in lifecycle:
+            continue
+        parent_id = event.get("sequence_id")
+        if (
+            not isinstance(parent_id, int)
+            or isinstance(parent_id, bool)
+            or parent_id < 0
+        ):
+            errors.append(
+                f"events[{index}] TTS lifecycle sequence_id is invalid"
+            )
+            continue
+        if parent_id in lifecycle[event_name]:
+            errors.append(
+                f"parent {parent_id} must have exactly one "
+                f"tts/{event_name} lifecycle row"
+            )
+            continue
+        monotonic_ms = _handoff_timestamp(
+            event.get("monotonic_ms"),
+            field_name=f"events[{index}].monotonic_ms",
+            errors=errors,
+        )
+        lifecycle[event_name][parent_id] = {
+            "monotonic_ms": monotonic_ms,
+            "audio_bytes": event.get("audio_bytes"),
+            "retry_count": event.get("retry_count"),
+        }
+
+    expected_parents = set(parent_metadata)
+    for event_name, rows in lifecycle.items():
+        if set(rows) != expected_parents:
+            errors.append(
+                f"tts/{event_name} lifecycle rows must exactly cover "
+                "canonical frame parents"
+            )
+
+    received_by_key = {
+        row.get("key"): row for row in received_rows if row.get("key") is not None
+    }
+    parent_cumulative_bytes: dict[int, int] = {}
+    for key, frame_audio_bytes in zip(canonical_keys, canonical_bytes):
+        parent_id, _frame_id = key
+        metadata = parent_metadata.get(parent_id)
+        response_rows = response_groups.get((parent_id, 0, 1))
+        received = received_by_key.get(key)
+        if metadata is None or not response_rows or received is None:
+            continue
+        expected_audio_bytes, expected_retry, fallback_applied = metadata
+        first_audio = lifecycle["first_audio"].get(parent_id)
+        completed = lifecycle["completed"].get(parent_id)
+        if first_audio is None or completed is None:
+            continue
+        first_audio_ms = first_audio["monotonic_ms"]
+        completed_ms = completed["monotonic_ms"]
+        if (
+            first_audio_ms is not None
+            and not math.isclose(
+                first_audio_ms,
+                response_rows[0]["received_monotonic_ms"],
+                rel_tol=0.0,
+                abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+            )
+        ):
+            errors.append(
+                f"parent {parent_id} tts/first_audio does not match "
+                "the first response chunk"
+            )
+        if (
+            completed_ms is not None
+            and response_rows[-1]["received_monotonic_ms"]
+            > completed_ms + _PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS
+        ):
+            errors.append(
+                f"parent {parent_id} final response chunk follows "
+                "tts/completed"
+            )
+        if (
+            completed["audio_bytes"] != expected_audio_bytes
+            or completed["retry_count"] != expected_retry
+        ):
+            errors.append(
+                f"parent {parent_id} tts/completed bytes or retry "
+                "do not match its canonical completion"
+            )
+
+        ready_ms = received.get("monotonic_ms")
+        if ready_ms is None or completed_ms is None:
+            continue
+        if fallback_applied:
+            if not math.isclose(
+                ready_ms,
+                completed_ms,
+                rel_tol=0.0,
+                abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+            ):
+                errors.append(
+                    f"atomic fallback parent {parent_id} frame-ready timing "
+                    "must match tts/completed"
+                )
+            continue
+
+        cumulative = (
+            parent_cumulative_bytes.get(parent_id, 0) + frame_audio_bytes
+        )
+        parent_cumulative_bytes[parent_id] = cumulative
+        response_boundary = next(
+            (
+                row
+                for row in response_rows
+                if row["cumulative_audio_bytes"] >= cumulative
+            ),
+            None,
+        )
+        if response_boundary is None or not math.isclose(
+            ready_ms,
+            response_boundary["received_monotonic_ms"],
+            rel_tol=0.0,
+            abs_tol=_PUBLISHER_HANDOFF_TIMING_TOLERANCE_MS,
+        ):
+            errors.append(
+                f"direct frame {key} readiness does not match cumulative "
+                "TTS response bytes"
+            )
+
+
+def _validate_v3_publisher_handoff_telemetry(
+    staged_pipeline: dict[str, Any],
+    staged_config: dict[str, Any] | None,
+    canonical_keys: list[tuple[int, int]] | None,
+    canonical_bytes: list[int] | None,
+    errors: list[str],
+) -> None:
+    """Fail closed for the optional privacy-safe publisher-handoff trace."""
+    marker_name = "tts_publisher_handoff_telemetry_enabled"
+    marker_present = marker_name in staged_pipeline
+    marker = staged_pipeline.get(marker_name, _MISSING)
+    if marker_present and not isinstance(marker, bool):
+        errors.append(
+            "tts_publisher_handoff_telemetry_enabled must be a boolean"
+        )
+    elif marker is False:
+        errors.append(
+            "tts_publisher_handoff_telemetry_enabled=false is invalid; "
+            "legacy captures must omit the marker"
+        )
+
+    config_marker: Any = _MISSING
+    config_marker_valid = True
+    config_marker_present = False
+    if staged_config is not None:
+        config_marker_name = "ttsPublisherHandoffTelemetryEnabled"
+        config_marker_present = config_marker_name in staged_config
+        config_marker = staged_config.get(
+            config_marker_name,
+            _MISSING,
+        )
+        if config_marker_present and not isinstance(config_marker, bool):
+            errors.append(
+                "/api/config.stagedConfig."
+                "ttsPublisherHandoffTelemetryEnabled must be a boolean"
+            )
+            config_marker_valid = False
+        if config_marker_present and config_marker_valid:
+            computed_capability = (
+                staged_config.get("ttsIncrementalPublishEnabled") is True
+                and staged_config.get("ttsResponseChunkTelemetryEnabled")
+                is True
+            )
+            if config_marker is not computed_capability:
+                errors.append(
+                    "/api/config.stagedConfig."
+                    "ttsPublisherHandoffTelemetryEnabled must equal "
+                    "ttsIncrementalPublishEnabled && "
+                    "ttsResponseChunkTelemetryEnabled"
+                )
+
+    events = staged_pipeline.get("events")
+    websocket_events = staged_pipeline.get("websocket_send_events")
+    has_boundary_fields = (
+        isinstance(events, list)
+        and any(
+            isinstance(event, dict)
+            and any(field in event for field in _PUBLISHER_HANDOFF_FIELDS)
+            for event in events
+        )
+    )
+    has_send_started = (
+        isinstance(websocket_events, list)
+        and any(
+            isinstance(event, dict)
+            and "send_started_monotonic_ms" in event
+            for event in websocket_events
+        )
+    )
+    if marker is not True:
+        if config_marker is True:
+            errors.append(
+                "enabled publisher-handoff config is missing the active "
+                "summary marker"
+            )
+        if has_boundary_fields or has_send_started:
+            errors.append(
+                "publisher-handoff timing fields require "
+                "tts_publisher_handoff_telemetry_enabled=true"
+            )
+        return
+    if not config_marker_present or config_marker is not True:
+        errors.append(
+            "tts_publisher_handoff_telemetry_enabled=true requires "
+            "/api/config.stagedConfig."
+            "ttsPublisherHandoffTelemetryEnabled=true"
+        )
+    if staged_pipeline.get("tts_response_chunk_telemetry_enabled") is not True:
+        errors.append(
+            "publisher-handoff telemetry requires "
+            "tts_response_chunk_telemetry_enabled=true"
+        )
+    if (
+        staged_config is None
+        or staged_config.get("ttsResponseChunkTelemetryEnabled") is not True
+    ):
+        errors.append(
+            "publisher-handoff telemetry requires "
+            "/api/config.stagedConfig."
+            "ttsResponseChunkTelemetryEnabled=true"
+        )
+
+    if not isinstance(events, list) or not isinstance(websocket_events, list):
+        return
+    event_names = (
+        ("tts", "frame_received"),
+        ("output", "frame_enqueued"),
+        ("output", "frame_dequeued"),
+    )
+    frame_rows: dict[
+        tuple[str, str],
+        list[dict[str, Any]],
+    ] = {event_name: [] for event_name in event_names}
+    summary_session_id = staged_pipeline.get("session_id")
+    if not isinstance(summary_session_id, str) or not summary_session_id:
+        errors.append(
+            "publisher-handoff telemetry requires a nonempty summary session_id"
+        )
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        event_name = (event.get("stage"), event.get("event"))
+        if (
+            event_name != ("output", "frame_enqueued")
+            and any(field in event for field in _PUBLISHER_HANDOFF_FIELDS)
+        ):
+            errors.append(
+                f"events[{index}] publisher-handoff fields require "
+                "output/frame_enqueued"
+            )
+        if event_name not in frame_rows:
+            continue
+        _reject_unsafe_telemetry_fields(
+            event,
+            allowed_fields=_PIPELINE_EVENT_SAFE_FIELDS,
+            field_name=f"events[{index}]",
+            errors=errors,
+        )
+        key = _audio_frame_key(
+            event,
+            field_name=f"events[{index}]",
+            errors=errors,
+            sequence_alias=event.get("sequence_id"),
+        )
+        audio_bytes = event.get("audio_bytes")
+        retry_count = event.get("retry_count")
+        monotonic_ms = _handoff_timestamp(
+            event.get("monotonic_ms"),
+            field_name=f"events[{index}].monotonic_ms",
+            errors=errors,
+        )
+        if not _positive_int(audio_bytes):
+            errors.append(f"events[{index}].audio_bytes is invalid")
+        if (
+            not isinstance(retry_count, int)
+            or isinstance(retry_count, bool)
+            or retry_count not in {0, 1}
+        ):
+            errors.append(
+                f"events[{index}].retry_count must be zero or one"
+            )
+        normalized: dict[str, Any] = {
+            "key": key,
+            "audio_bytes": audio_bytes,
+            "retry_count": retry_count,
+            "monotonic_ms": monotonic_ms,
+            "metadata": _publisher_frame_metadata(
+                event,
+                summary_session_id=summary_session_id,
+                field_name=f"events[{index}]",
+                errors=errors,
+            ),
+        }
+        if event_name == ("output", "frame_enqueued"):
+            for timing_field in _PUBLISHER_HANDOFF_FIELDS:
+                normalized[timing_field] = _handoff_timestamp(
+                    event.get(timing_field),
+                    field_name=f"events[{index}].{timing_field}",
+                    errors=errors,
+                )
+            blocked_put_ms = _handoff_timestamp(
+                event.get("blocked_put_ms"),
+                field_name=f"events[{index}].blocked_put_ms",
+                errors=errors,
+            )
+            normalized["blocked_put_ms"] = blocked_put_ms
+        frame_rows[event_name].append(normalized)
+
+    expected_pairs = (
+        list(zip(canonical_keys, canonical_bytes))
+        if canonical_keys is not None and canonical_bytes is not None
+        else None
+    )
+    layer_records: dict[
+        tuple[str, str],
+        list[tuple[tuple[int, int] | None, Any, Any]],
+    ] = {
+        event_name: [
+            (row["key"], row["audio_bytes"], row["retry_count"])
+            for row in rows
+        ]
+        for event_name, rows in frame_rows.items()
+    }
+    if expected_pairs is not None:
+        for (stage, event_name), rows in layer_records.items():
+            if [(key, audio_bytes) for key, audio_bytes, _retry in rows] != (
+                expected_pairs
+            ):
+                errors.append(
+                    f"{stage}/{event_name} must contain exactly one canonical "
+                    "frame row in published order"
+                )
+        retries = [
+            retry_count
+            for _key, _audio_bytes, retry_count in layer_records[
+                ("tts", "frame_received")
+            ]
+        ]
+        for (stage, event_name), rows in layer_records.items():
+            if [retry for _key, _audio_bytes, retry in rows] != retries:
+                errors.append(
+                    f"{stage}/{event_name} retry coverage must exactly match "
+                    "tts/frame_received"
+                )
+        canonical_metadata = [
+            row["metadata"]
+            for row in frame_rows[("tts", "frame_received")]
+        ]
+        for (stage, event_name), rows in frame_rows.items():
+            if [row["metadata"] for row in rows] != canonical_metadata:
+                errors.append(
+                    f"{stage}/{event_name} source and session metadata must "
+                    "exactly match tts/frame_received"
+                )
+        raw_parent_summaries = staged_pipeline.get(
+            "produced_parent_summaries"
+        )
+        parent_retry = {
+            item.get("parent_sequence_id"): item.get("retry_count")
+            for item in (
+                raw_parent_summaries
+                if isinstance(raw_parent_summaries, list)
+                else []
+            )
+            if isinstance(item, dict)
+        }
+        for key, _audio_bytes, retry_count in layer_records[
+            ("tts", "frame_received")
+        ]:
+            if key is not None and retry_count != parent_retry.get(key[0]):
+                errors.append(
+                    f"frame {key} retry_count must match its parent completion"
+                )
+
+    websocket_rows: list[dict[str, Any]] = []
+    for index, event in enumerate(websocket_events):
+        if not isinstance(event, dict):
+            continue
+        _reject_unsafe_telemetry_fields(
+            event,
+            allowed_fields=_WEBSOCKET_FRAME_SAFE_FIELDS,
+            field_name=f"websocket_send_events[{index}]",
+            errors=errors,
+        )
+        key = _audio_frame_key(
+            event,
+            field_name=f"websocket_send_events[{index}]",
+            errors=errors,
+            sequence_alias=event.get("sequence_id"),
+        )
+        audio_bytes = event.get("audio_bytes")
+        if not _positive_int(audio_bytes):
+            errors.append(
+                f"websocket_send_events[{index}].audio_bytes is invalid"
+            )
+        websocket_rows.append(
+            {
+                "key": key,
+                "audio_bytes": audio_bytes,
+                "send_started_monotonic_ms": _handoff_timestamp(
+                    event.get("send_started_monotonic_ms"),
+                    field_name=(
+                        f"websocket_send_events[{index}]."
+                        "send_started_monotonic_ms"
+                    ),
+                    errors=errors,
+                ),
+                "sent_monotonic_ms": _handoff_timestamp(
+                    event.get("sent_monotonic_ms"),
+                    field_name=(
+                        f"websocket_send_events[{index}].sent_monotonic_ms"
+                    ),
+                    errors=errors,
+                ),
+            }
+        )
+    if (
+        expected_pairs is not None
+        and [
+            (row["key"], row["audio_bytes"]) for row in websocket_rows
+        ]
+        != expected_pairs
+    ):
+        errors.append(
+            "websocket_send_events must contain exactly one canonical "
+            "frame row in published order"
+        )
+
+    layer_lengths_match = (
+        canonical_keys is not None
+        and all(
+            len(rows) == len(canonical_keys)
+            for rows in (*frame_rows.values(), websocket_rows)
+        )
+    )
+    if layer_lengths_match:
+        boundary_columns = {
+            name: []
+            for name in (
+                "frame_received",
+                "publish_requested",
+                "callback_started",
+                "capacity_acquired",
+                "frame_enqueued",
+                "frame_dequeued",
+                "send_started",
+                "sent",
+            )
+        }
+        for index, key in enumerate(canonical_keys):
+            received = frame_rows[("tts", "frame_received")][index]
+            enqueued = frame_rows[("output", "frame_enqueued")][index]
+            dequeued = frame_rows[("output", "frame_dequeued")][index]
+            websocket = websocket_rows[index]
+            ordered = (
+                received["monotonic_ms"],
+                enqueued["publish_requested_monotonic_ms"],
+                enqueued["event_loop_callback_started_monotonic_ms"],
+                enqueued["output_capacity_acquired_monotonic_ms"],
+                enqueued["monotonic_ms"],
+                dequeued["monotonic_ms"],
+                websocket["send_started_monotonic_ms"],
+                websocket["sent_monotonic_ms"],
+            )
+            for boundary_name, value in zip(boundary_columns, ordered):
+                boundary_columns[boundary_name].append(value)
+            if all(value is not None for value in ordered) and any(
+                later < earlier
+                for earlier, later in zip(ordered, ordered[1:])
+            ):
+                errors.append(
+                    f"publisher-handoff timestamps are inverted for frame {key}"
+                )
+            callback_ms = enqueued[
+                "event_loop_callback_started_monotonic_ms"
+            ]
+            capacity_ms = enqueued[
+                "output_capacity_acquired_monotonic_ms"
+            ]
+            blocked_put_ms = enqueued["blocked_put_ms"]
+            if (
+                callback_ms is not None
+                and capacity_ms is not None
+                and blocked_put_ms is not None
+                and blocked_put_ms > 0
+                and not math.isclose(
+                    blocked_put_ms,
+                    capacity_ms - callback_ms,
+                    rel_tol=0.0,
+                    abs_tol=_PUBLISHER_HANDOFF_BLOCKED_TOLERANCE_MS,
+                )
+            ):
+                errors.append(
+                    f"output/frame_enqueued blocked_put_ms does not reconcile "
+                    f"with capacity wait for frame {key}"
+                )
+        for boundary_name, values in boundary_columns.items():
+            if all(value is not None for value in values) and any(
+                later < earlier
+                for earlier, later in zip(values, values[1:])
+            ):
+                errors.append(
+                    f"publisher-handoff {boundary_name} timestamps must be "
+                    "globally nondecreasing in canonical frame order"
+                )
+
+    expected_frames: list[tuple[tuple[int, int], int, int]] = []
+    if expected_pairs is not None:
+        tts_rows = layer_records[("tts", "frame_received")]
+        if len(tts_rows) == len(expected_pairs):
+            expected_frames = [
+                (key, audio_bytes, retry_count)
+                for key, audio_bytes, retry_count in tts_rows
+                if key is not None
+                and _positive_int(audio_bytes)
+                and isinstance(retry_count, int)
+                and not isinstance(retry_count, bool)
+                and retry_count in {0, 1}
+            ]
+    frame_bytes_per_ms: float | None = None
+    frame_bytes = staged_pipeline.get("tts_incremental_frame_bytes")
+    frame_ms = (
+        staged_config.get("ttsIncrementalFrameMs")
+        if staged_config is not None
+        else None
+    )
+    if _positive_int(frame_bytes) and _positive_int(frame_ms):
+        frame_bytes_per_ms = frame_bytes / frame_ms
+    response_groups = _validate_v3_response_chunk_sidecar(
+        staged_pipeline,
+        expected_frames,
+        frame_bytes_per_ms=frame_bytes_per_ms,
+        errors=errors,
+    )
+    _validate_v3_response_frame_boundaries(
+        staged_pipeline,
+        response_groups,
+        canonical_keys,
+        canonical_bytes,
+        frame_rows[("tts", "frame_received")],
+        errors,
+    )
+
+
 def _validate_staged_pipeline_integrity_v3(
     staged_pipeline: dict[str, Any],
     staged_config: dict[str, Any] | None,
@@ -1921,6 +3007,13 @@ def _validate_staged_pipeline_integrity_v3(
                 errors.append(
                     f"max_queue_depths.{queue_name} is outside configured capacity"
                 )
+    _validate_v3_publisher_handoff_telemetry(
+        staged_pipeline,
+        staged_config,
+        canonical_keys,
+        canonical_bytes,
+        errors,
+    )
     return errors
 
 

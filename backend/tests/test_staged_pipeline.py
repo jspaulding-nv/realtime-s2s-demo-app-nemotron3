@@ -14,6 +14,7 @@ from staged_models import (
     ASRTranscript,
     AsrFinal,
     EmissionReason,
+    PipelineEvent,
     StagedOutputEvent,
     StagedOutputEventKind,
     SynthesizedAudioFrame,
@@ -1753,6 +1754,14 @@ class IncrementalFakeTTS(FakeTTSClient):
             first_audio_monotonic_ms=first_audio_ms,
             completed_monotonic_ms=completed_ms,
             atomic_fallback_applied=self.atomic_fallback_applied,
+            response_chunks=(
+                TTSResponseChunkMetric(
+                    response_index=0,
+                    audio_bytes=committed_bytes,
+                    cumulative_audio_bytes=committed_bytes,
+                    received_monotonic_ms=first_audio_ms,
+                ),
+            ),
         )
 
 
@@ -1845,6 +1854,47 @@ def streaming_completion(
     )
 
 
+def test_pipeline_event_publisher_handoff_fields_are_all_or_none_and_ordered():
+    event = PipelineEvent(
+        session_id="publisher-handoff-contract",
+        stage="output",
+        event="frame_enqueued",
+        monotonic_ms=40,
+        sequence_id=0,
+        audio_frame_id=0,
+        publish_requested_monotonic_ms=10,
+        event_loop_callback_started_monotonic_ms=20,
+        output_capacity_acquired_monotonic_ms=30,
+    )
+
+    assert event.to_dict()[
+        "publish_requested_monotonic_ms"
+    ] == 10
+    assert event.to_dict()[
+        "event_loop_callback_started_monotonic_ms"
+    ] == 20
+    assert event.to_dict()[
+        "output_capacity_acquired_monotonic_ms"
+    ] == 30
+
+    without_handoff = replace(
+        event,
+        publish_requested_monotonic_ms=None,
+        event_loop_callback_started_monotonic_ms=None,
+        output_capacity_acquired_monotonic_ms=None,
+    ).to_dict()
+    assert "publish_requested_monotonic_ms" not in without_handoff
+    assert "event_loop_callback_started_monotonic_ms" not in without_handoff
+    assert "output_capacity_acquired_monotonic_ms" not in without_handoff
+
+    with pytest.raises(ValueError, match="provided together"):
+        replace(event, output_capacity_acquired_monotonic_ms=None)
+    with pytest.raises(ValueError, match="nondecreasing"):
+        replace(event, event_loop_callback_started_monotonic_ms=9)
+    with pytest.raises(ValueError, match="frame_enqueued"):
+        replace(event, event="frame_dequeued")
+
+
 @pytest.mark.asyncio
 async def test_incremental_clean_order_is_frames_parent_marker_then_complete():
     tts = IncrementalFakeTTS()
@@ -1897,6 +1947,13 @@ async def test_incremental_clean_order_is_frames_parent_marker_then_complete():
     assert summary["dequeued_audio_frame_keys"] == expected_keys
     assert summary["published_audio_frame_bytes"] == [3_200, 800]
     assert summary["dequeued_audio_frame_bytes"] == [3_200, 800]
+    assert "tts_publisher_handoff_telemetry_enabled" not in summary
+    assert all(
+        "publish_requested_monotonic_ms" not in event
+        and "event_loop_callback_started_monotonic_ms" not in event
+        and "output_capacity_acquired_monotonic_ms" not in event
+        for event in summary["events"]
+    )
     assert summary["completed_sequence_ids"] == [0]
     assert summary["incomplete_sequence_ids"] == []
     assert summary["produced_parent_summaries"] == [
@@ -2110,6 +2167,184 @@ async def test_incremental_output_capacity_one_backpressures_worker():
 
 
 @pytest.mark.asyncio
+async def test_incremental_handoff_telemetry_is_ordered_and_identity_bound():
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient([final(0, "One parent."), COMPLETE]),
+        nmt_client=FakeNMTClient(),
+        tts_client=IncrementalFakeTTS(frame_sizes=(3_200, 800)),
+        config=config(
+            output_queue_maxsize=4,
+            tts_incremental_publish_enabled=True,
+            tts_incremental_frame_ms=100,
+            tts_response_chunk_telemetry_enabled=True,
+        ),
+        session_id="incremental-handoff-telemetry",
+    )
+
+    await session.start()
+    session.finish_input()
+    await drain_incremental(session)
+    summary = session.summary(include_events=True)
+
+    assert summary["telemetry_schema_version"] == 3
+    assert summary["tts_publisher_handoff_telemetry_enabled"] is True
+    enqueued = [
+        event
+        for event in summary["events"]
+        if (event["stage"], event["event"])
+        == ("output", "frame_enqueued")
+    ]
+    dequeued = {
+        (event["parent_sequence_id"], event["audio_frame_id"]): event
+        for event in summary["events"]
+        if (event["stage"], event["event"])
+        == ("output", "frame_dequeued")
+    }
+
+    assert [
+        (event["parent_sequence_id"], event["audio_frame_id"])
+        for event in enqueued
+    ] == [(0, 0), (0, 1)]
+    for event in enqueued:
+        key = (event["parent_sequence_id"], event["audio_frame_id"])
+        assert (
+            0
+            <= event["publish_requested_monotonic_ms"]
+            <= event["event_loop_callback_started_monotonic_ms"]
+            <= event["output_capacity_acquired_monotonic_ms"]
+            <= event["monotonic_ms"]
+            <= dequeued[key]["monotonic_ms"]
+        )
+        assert "text" not in event
+        assert "audio" not in event
+
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_frame_sink_failure_after_commit_keeps_one_queue_slot():
+    sink_observation = {}
+
+    def event_sink(event):
+        if (event.stage, event.event) != ("output", "frame_enqueued"):
+            return
+        queued = tuple(session._output_queue._queue)
+        sink_observation.update(
+            {
+                "queue_size": session._output_queue.qsize(),
+                "available_slots": session._queue_slots["output"]._value,
+                "frame_keys": tuple(
+                    item.payload.frame.frame_key for item in queued
+                ),
+            }
+        )
+        raise RuntimeError("sensitive sink detail must not be retained")
+
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(),
+        nmt_client=FakeNMTClient(),
+        tts_client=IncrementalFakeTTS(frame_sizes=(1_600,)),
+        config=config(
+            output_queue_maxsize=1,
+            tts_incremental_publish_enabled=True,
+            tts_response_chunk_telemetry_enabled=True,
+        ),
+        session_id="incremental-post-commit-sink-failure",
+        event_sink=event_sink,
+    )
+    session._state = StagedPipelineState.RUNNING
+    frame = streaming_frame(streaming_translation())
+
+    committed = await session._enqueue_incremental_frame(
+        frame,
+        abort_event=asyncio.Event(),
+        publish_requested_monotonic_ms=now_ms(),
+    )
+
+    assert committed is True
+    assert sink_observation == {
+        "queue_size": 1,
+        "available_slots": 0,
+        "frame_keys": ((0, 0),),
+    }
+    assert session._output_queue.qsize() == 1
+    assert session._queue_slots["output"]._value == 0
+    assert session.summary()["published_audio_frame_keys"] == [
+        {"parent_sequence_id": 0, "audio_frame_id": 0}
+    ]
+    assert session.summary()["audio_frames_produced"] == 1
+    assert [
+        (event.stage, event.event, event.audio_frame_id)
+        for event in session.telemetry
+        if event.event == "frame_enqueued"
+    ] == [("output", "frame_enqueued", 0)]
+    assert session.summary()["cleanup_errors"] == [
+        {
+            "stage": "telemetry",
+            "code": "RuntimeError",
+            "error": "event sink failed after committed output frame",
+        }
+    ]
+    assert "sensitive sink detail" not in json.dumps(
+        session.summary()["cleanup_errors"]
+    )
+
+    output = await session.next_output(timeout_s=1)
+    assert output.frame.frame_key == (0, 0)
+    assert session._output_queue.empty()
+    assert session._queue_slots["output"]._value == 1
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_immediate_capacity_reports_zero_blocked_put():
+    clock_values = iter((20.0, 30.0, 40.0, 50.0, 60.0))
+    session = StagedPipelineSession(
+        asr_client=FakeASRClient(),
+        nmt_client=FakeNMTClient(),
+        tts_client=IncrementalFakeTTS(frame_sizes=(1_600,)),
+        config=config(
+            output_queue_maxsize=1,
+            tts_incremental_publish_enabled=True,
+            tts_response_chunk_telemetry_enabled=True,
+        ),
+        session_id="incremental-immediate-capacity",
+        clock_ms=lambda: next(clock_values),
+    )
+    session._state = StagedPipelineState.RUNNING
+    frame = replace(
+        streaming_frame(streaming_translation()),
+        received_monotonic_ms=5.0,
+    )
+
+    committed = await session._enqueue_incremental_frame(
+        frame,
+        abort_event=asyncio.Event(),
+        publish_requested_monotonic_ms=10.0,
+    )
+
+    assert committed is True
+    enqueue = next(
+        event
+        for event in session.telemetry
+        if (event.stage, event.event) == ("output", "frame_enqueued")
+    )
+    assert enqueue.event_loop_callback_started_monotonic_ms == 20.0
+    assert enqueue.output_capacity_acquired_monotonic_ms == 30.0
+    assert (
+        enqueue.output_capacity_acquired_monotonic_ms
+        - enqueue.event_loop_callback_started_monotonic_ms
+    ) == 10.0
+    assert enqueue.blocked_put_ms == 0.0
+    assert session.summary()["blocked_put_counts"]["output"] == 0
+
+    assert (
+        await session.next_output(timeout_s=1)
+    ).frame.frame_key == (0, 0)
+    await session.aclose()
+
+
+@pytest.mark.asyncio
 async def test_incremental_abort_wins_simultaneous_output_capacity_race():
     session = StagedPipelineSession(
         asr_client=FakeASRClient(),
@@ -2118,6 +2353,7 @@ async def test_incremental_abort_wins_simultaneous_output_capacity_race():
         config=config(
             output_queue_maxsize=1,
             tts_incremental_publish_enabled=True,
+            tts_response_chunk_telemetry_enabled=True,
         ),
         session_id="incremental-abort-capacity-race",
     )
@@ -2132,6 +2368,7 @@ async def test_incremental_abort_wins_simultaneous_output_capacity_race():
         session._enqueue_incremental_frame(
             frame,
             abort_event=abort_event,
+            publish_requested_monotonic_ms=now_ms(),
         )
     )
     await asyncio.sleep(0)
@@ -2146,6 +2383,9 @@ async def test_incremental_abort_wins_simultaneous_output_capacity_race():
     assert output_slots._value == 1
     assert session.summary()["audio_frames_produced"] == 0
     assert session.summary()["published_audio_frame_keys"] == []
+    assert not any(
+        event.event == "frame_enqueued" for event in session.telemetry
+    )
 
     await session._enqueue(
         session._output_queue,

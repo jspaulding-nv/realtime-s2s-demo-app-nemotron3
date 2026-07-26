@@ -162,6 +162,10 @@ async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
         "ttsResponseChunkTelemetryEnabled": (
             staged_pipeline_config.tts_response_chunk_telemetry_enabled
         ),
+        "ttsPublisherHandoffTelemetryEnabled": (
+            staged_pipeline_config
+            .tts_publisher_handoff_telemetry_enabled
+        ),
         "ttsSubsegmentMaxChars": (
             staged_pipeline_config.tts_subsegment_max_chars
         ),
@@ -237,6 +241,31 @@ async def test_config_advertises_audio_metadata_v1_for_schema_v3_staged(
     assert response.json()["audioMetadataProtocolVersions"] == [1]
     assert response.json()["stagedConfig"]["telemetrySchemaVersion"] == 3
     assert response.json()["stagedConfig"]["ttsIncrementalFrameMs"] == 500
+
+
+@pytest.mark.asyncio
+async def test_config_exposes_computed_publisher_handoff_capability(
+    client: AsyncClient,
+):
+    with (
+        patch(
+            "main.staged_pipeline_config.tts_incremental_publish_enabled",
+            True,
+        ),
+        patch(
+            "main.staged_pipeline_config.tts_response_chunk_telemetry_enabled",
+            True,
+        ),
+    ):
+        response = await client.get("/api/config")
+
+    assert response.status_code == 200
+    assert (
+        response.json()["stagedConfig"][
+            "ttsPublisherHandoffTelemetryEnabled"
+        ]
+        is True
+    )
 
 
 @pytest.mark.asyncio

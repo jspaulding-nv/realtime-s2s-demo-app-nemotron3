@@ -931,8 +931,28 @@ class TranslationSession:
                     }
                     if not await self._send_json_unlocked(header):
                         return False
+            handoff_telemetry_enabled = (
+                include_frame
+                and bool(
+                    getattr(
+                        getattr(self._staged_pipeline, "config", None),
+                        "tts_publisher_handoff_telemetry_enabled",
+                        False,
+                    )
+                )
+            )
+            send_started_ms = (
+                time.monotonic_ns() / 1_000_000
+                if handoff_telemetry_enabled
+                else None
+            )
             if not await self._send_audio_unlocked(audio):
                 return False
+            sent_ms = (
+                time.monotonic_ns() / 1_000_000
+                if handoff_telemetry_enabled
+                else None
+            )
             timing_logger.log_audio_sent_to_client(len(audio))
             if include_frame:
                 if self._staged_stream_sample_rate_hz is None:
@@ -965,7 +985,11 @@ class TranslationSession:
                     self._staged_audio_sequence_ids_sent.append(sequence_id)
             event = {
                 "sequence_id": sequence_id,
-                "sent_monotonic_ms": time.monotonic_ns() / 1_000_000,
+                "sent_monotonic_ms": (
+                    sent_ms
+                    if sent_ms is not None
+                    else time.monotonic_ns() / 1_000_000
+                ),
                 "audio_bytes": len(audio),
             }
             if include_frame:
@@ -975,6 +999,8 @@ class TranslationSession:
                         "audio_frame_id": audio_frame_id,
                     }
                 )
+                if send_started_ms is not None:
+                    event["send_started_monotonic_ms"] = send_started_ms
             elif include_composite:
                 event.update(
                     {

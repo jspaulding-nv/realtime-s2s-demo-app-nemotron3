@@ -1653,6 +1653,64 @@ listener backlog.
 See [Stage-burst attribution](STAGE_BURST_ATTRIBUTION.md) and
 [formal attribution result](STAGE_BURST_ATTRIBUTION_RESULT_2026-07-26.md).
 
+## 2026-07-26: default-off TTS publisher-handoff diagnostic
+
+Added a default-off, privacy-safe diagnostic for the rare interval between a
+Magpie response making enough PCM available and that frame reaching the
+listener WebSocket. It activates only when schema-3 incremental publication
+and the existing response-chunk sidecar are both enabled. The API exposes the
+computed capability, and the staged summary emits an active-only marker.
+
+Each successfully committed frame now carries an all-or-none monotonic chain:
+publication request, event-loop callback start, output-capacity acquisition,
+queue commit, dequeue, WebSocket send start, and successful send completion.
+The implementation preserves the legacy meaning of `blocked_put_ms`: it is
+positive only when the output queue was observed full. Queue-commit telemetry
+is prevalidated, timestamped immediately before `put_nowait`, and emitted after
+commit so an external telemetry-sink failure cannot cause committed PCM to be
+retried.
+
+The batch gate and streaming-latency analyzer fail closed on missing,
+duplicated, reordered, inconsistent, or value-smuggled frame evidence. They
+reconcile response cumulative bytes to the frame-ready timestamp, parent
+totals, retry counts, lifecycle times, and WebSocket completion. Direct
+handoff distributions exclude deliberate atomic-fallback frames. For
+multi-frame response bursts, the analyzer separates propagated
+prior-frame-commit wait from worker/adapter work after publication can proceed,
+preventing earlier output backpressure from being charged repeatedly as a new
+TTS delay.
+
+The canary runner now has a one-arm `handoff` mode. It requires an ignored
+output root, defaults that mode to the registered 500 ms frame profile, and
+generates both handoff-component and stage/burst reports. The promoted sequence
+is a one-minute Sample 01 integrity preflight followed by a five-minute Sample
+02 diagnostic, with all three samples available as a fixed-profile sequential
+extension.
+
+Implementation validation passed the complete automated Python gate with 1,193
+tests and one environment-specific skip, including the 463-test backend suite,
+102-test batch module, and 37-test streaming-latency analyzer module. All 211
+frontend tests, frontend lint, and the production build passed with the
+bundled Node.js 22 runtime.
+
+See [TTS publisher-handoff diagnostic](PUBLISHER_HANDOFF_DIAGNOSTIC.md).
+
+The subsequent live gate completed on the same clean commit. The 60-second
+Sample 01 preflight reconciled 116 frames; the promoted 300-second Sample 02
+run reconciled 650. Neither run had a frame-ready-to-enqueue interval over
+100 ms, and the five-minute maximum was 8.690 ms. No NMT, TTS, or output
+admission blocked.
+
+The five-minute no-drop listener schedule still failed its audience objective:
+queue p95 was 12.104 seconds, peak queue was 21.991 seconds, and 46.361 seconds
+were spent above ten seconds. Its strongest aligned 30-second window delivered
+41.657 seconds of translated media and grew the queue by 10.092 seconds. This
+rejects publisher-handoff optimization as the next intervention for the
+observed window and promotes generated-duration/burst mitigation plus semantic
+landmark measurement.
+
+See [TTS publisher-handoff live result](PUBLISHER_HANDOFF_RESULT_2026-07-26.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1693,8 +1751,11 @@ See [Stage-burst attribution](STAGE_BURST_ATTRIBUTION.md) and
   scheduled-playback gate
 - [x] Attribute all three formal schema-3 traces across model stages,
   publication, transport, and listener burst windows
-- [ ] Instrument the TTS-worker-to-publisher handoff and run the unsplit
-  one-minute preflight plus five-minute diagnostic
+- [x] Instrument and validate the TTS-worker-to-publisher handoff
+- [x] Run the unsplit one-minute publisher-handoff preflight and five-minute
+  Sample 02 diagnostic
+- [ ] Repeat publisher-handoff telemetry over complete long-form samples before
+  claiming the historical late-sample anomaly is eliminated
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries

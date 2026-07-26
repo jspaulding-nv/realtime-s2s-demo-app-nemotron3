@@ -301,6 +301,19 @@ See [Stage-burst attribution](STAGE_BURST_ATTRIBUTION.md) for the method and
 [the 2026-07-26 formal result](STAGE_BURST_ATTRIBUTION_RESULT_2026-07-26.md)
 for the current interpretation.
 
+### Attribute the TTS publisher handoff
+
+When stage/burst analysis finds a material frame-ready-to-output-enqueue tail,
+enable the default-off publisher-handoff diagnostic. It preserves the same
+schema-3 PCM and queue policy while separating prior-frame serialization,
+worker-to-event-loop dispatch, capacity acquisition, queue residence, and
+WebSocket send timing. Start with its one-minute fail-closed preflight before
+running the promoted five-minute Sample 02 diagnostic.
+
+See [TTS publisher-handoff diagnostic](PUBLISHER_HANDOFF_DIAGNOSTIC.md) for the
+exact feature contract, commands, privacy boundary, artifacts, and decision
+rule.
+
 ## What can be claimed
 
 After a complete run, it is reasonable to claim that the pinned staged

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run one shared source prefix through matched atomic (schema 1) and
-# incremental-publication (schema 3) arms. This script owns only its FastAPI
-# child processes; it never starts, stops, or mutates the Riva NIM containers.
+# Run one shared source prefix through either matched atomic/schema-1 and
+# incremental/schema-3 arms, or one schema-3 publisher-handoff diagnostic arm.
+# This script owns only its FastAPI child processes; it never starts, stops, or
+# mutates the Riva NIM containers.
 
 REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$REPOSITORY_ROOT"
@@ -18,7 +19,17 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CANARY_SOURCE="${CANARY_SOURCE:-test_audio/long-form-01.mp3}"
 CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS:-60}"
-CANARY_INCREMENTAL_FRAME_MS="${CANARY_INCREMENTAL_FRAME_MS:-100}"
+CANARY_MODE="${CANARY_MODE:-matched}"
+if [[ -z "${CANARY_INCREMENTAL_FRAME_MS:-}" ]]; then
+  if [[ "$CANARY_MODE" == "handoff" ]]; then
+    # Match the registered 500 ms profile used by the retained three-sample
+    # publisher-gap baseline. Callers may override this for sensitivity runs.
+    CANARY_INCREMENTAL_FRAME_MS=500
+  else
+    # Preserve the historical matched-canary profile.
+    CANARY_INCREMENTAL_FRAME_MS=100
+  fi
+fi
 CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS="${CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS:-4}"
 CANARY_BACKEND_PORT="${CANARY_BACKEND_PORT:-8100}"
 CANARY_OUTPUT_ROOT="${CANARY_OUTPUT_ROOT:-experiment_results}"
@@ -60,6 +71,8 @@ for setting in \
 done
 [[ "$ALLOW_DIRTY_CANARY" == "0" || "$ALLOW_DIRTY_CANARY" == "1" ]] ||
   fail_usage "ALLOW_DIRTY_CANARY must be 0 or 1"
+[[ "$CANARY_MODE" == "matched" || "$CANARY_MODE" == "handoff" ]] ||
+  fail_usage "CANARY_MODE must be matched or handoff"
 [[ "$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS" =~ ^[0-9]+$ ]] ||
   fail_usage \
     "CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS must be a non-negative integer"
@@ -68,7 +81,7 @@ EVIDENCE_CLASS="formal"
 if [[ "$ALLOW_DIRTY_CANARY" == "1" ]]; then
   EVIDENCE_CLASS="non-formal-probe"
   echo \
-    "NON-FORMAL PROBE: clean-worktree and ignored-output evidence gates are bypassed." \
+    "NON-FORMAL PROBE: the clean-worktree evidence gate is bypassed; ignored output remains mandatory." \
     >&2
 elif [[ -n "$(git status --porcelain)" ]]; then
   fail_usage \
@@ -81,9 +94,8 @@ case "$OUTPUT_RESOLVED" in
   *) fail_usage "CANARY_OUTPUT_ROOT must resolve inside the repository" ;;
 esac
 OUTPUT_RELATIVE="${OUTPUT_RESOLVED#"$REPOSITORY_ROOT"/}"
-if [[ "$EVIDENCE_CLASS" == "formal" ]] &&
-  ! git check-ignore --quiet -- "$OUTPUT_RELATIVE"; then
-  fail_usage "Formal evidence requires an ignored CANARY_OUTPUT_ROOT"
+if ! git check-ignore --quiet -- "$OUTPUT_RELATIVE"; then
+  fail_usage "Canary evidence requires an ignored CANARY_OUTPUT_ROOT"
 fi
 mkdir -p -- "$OUTPUT_RESOLVED"
 CANARY_OUTPUT_ROOT="$(realpath -e -- "$OUTPUT_RESOLVED")"
@@ -230,7 +242,14 @@ fi
   fail_usage "ffmpeg is required to create the shared source prefix"
 
 SHORT_COMMIT="$(git rev-parse --short HEAD)"
-RUN_ID="streaming-tts-canary-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT_COMMIT}"
+if [[ "$CANARY_MODE" == "handoff" ]]; then
+  RUN_PREFIX="publisher-handoff-canary"
+  CANARY_ARMS=(streaming)
+else
+  RUN_PREFIX="streaming-tts-canary"
+  CANARY_ARMS=(atomic streaming)
+fi
+RUN_ID="${RUN_PREFIX}-$(date -u +%Y%m%dT%H%M%SZ)-${SHORT_COMMIT}"
 RUN_DIR="${CANARY_OUTPUT_ROOT%/}/${RUN_ID}"
 PREFIX_WAV="$RUN_DIR/shared-prefix.wav"
 mkdir -- "$RUN_DIR" ||
@@ -249,6 +268,7 @@ PREFIX_SHA256="$(sha256sum "$PREFIX_WAV" | awk '{print $1}')"
   echo "run_id=$RUN_ID"
   echo "evidence_class=$EVIDENCE_CLASS"
   echo "git_commit=$(git rev-parse HEAD)"
+  echo "canary_mode=$CANARY_MODE"
   echo "duration_seconds=$CANARY_DURATION_SECONDS"
   echo "prefix_sha256=$PREFIX_SHA256"
   echo "incremental_frame_ms=$CANARY_INCREMENTAL_FRAME_MS"
@@ -309,7 +329,7 @@ curl_local() {
     "$@"
 }
 
-for arm in atomic streaming; do
+for arm in "${CANARY_ARMS[@]}"; do
   if [[ "$arm" == "atomic" ]]; then
     incremental=0
     expected_schema=1
@@ -322,7 +342,7 @@ for arm in atomic streaming; do
   mkdir -- "$ARM_DIR"
 
   echo
-  echo "=== Starting matched canary arm: $arm ==="
+  echo "=== Starting canary arm: $arm (mode=$CANARY_MODE) ==="
   S2S_PIPELINE_MODE=staged \
   STAGED_TTS_SUBSEGMENT_MAX_CHARS=0 \
   STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=1 \
@@ -376,6 +396,8 @@ if staged.get("ttsResponseChunkTelemetryEnabled") is not True:
     raise SystemExit("response-chunk telemetry is not enabled")
 if staged.get("ttsIncrementalPublishEnabled", False) is not expected_incremental:
     raise SystemExit("incremental-publication flag mismatch")
+if staged.get("ttsPublisherHandoffTelemetryEnabled", False) is not expected_incremental:
+    raise SystemExit("publisher-handoff telemetry capability mismatch")
 expected_metadata_versions = [1] if expected_incremental else []
 if config.get("audioMetadataProtocolVersions") != expected_metadata_versions:
     raise SystemExit("audio metadata protocol capability mismatch")
@@ -436,6 +458,14 @@ if actual != expected[:6]:
 
   if [[ "$arm" == "streaming" ]]; then
     PYTHONPATH=".python-packages:backend:." \
+      "$PYTHON_BIN" analyze_stage_burst_attribution.py \
+        "$ARM_DIR/shared-prefix_results.csv" \
+        --window-seconds 30 \
+        --top-window-count 5 \
+        --json-output "$ARM_DIR/stage_burst_attribution.json" \
+        --markdown-output "$ARM_DIR/stage_burst_attribution.md"
+
+    PYTHONPATH=".python-packages:backend:." \
       "$PYTHON_BIN" analyze_freshness_cap.py \
         --results-csv "$ARM_DIR/shared-prefix_results.csv" \
         --summary-json "$ARM_DIR/shared-prefix_summary.json" \
@@ -444,15 +474,17 @@ if actual != expected[:6]:
   fi
 
   stop_backend
-  echo "=== Completed matched canary arm: $arm ==="
+  echo "=== Completed canary arm: $arm (mode=$CANARY_MODE) ==="
 done
 
-PYTHONPATH=".python-packages:backend:." \
-  "$PYTHON_BIN" summarize_streaming_tts_canary.py \
-    --input-dir "$RUN_DIR" \
-    --json-output "$RUN_DIR/streaming_tts_canary_comparison.json" \
-    --markdown-output "$RUN_DIR/streaming_tts_canary_comparison.md"
+if [[ "$CANARY_MODE" == "matched" ]]; then
+  PYTHONPATH=".python-packages:backend:." \
+    "$PYTHON_BIN" summarize_streaming_tts_canary.py \
+      --input-dir "$RUN_DIR" \
+      --json-output "$RUN_DIR/streaming_tts_canary_comparison.json" \
+      --markdown-output "$RUN_DIR/streaming_tts_canary_comparison.md"
+fi
 
 trap - EXIT INT TERM
 echo
-echo "Matched incremental-publication canary complete: $RUN_DIR"
+echo "Incremental-publication canary complete (mode=$CANARY_MODE): $RUN_DIR"

@@ -1,4 +1,5 @@
 import json
+import math
 
 import pytest
 
@@ -742,6 +743,92 @@ def add_schema_v3_response_chunk_sidecar(path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def add_schema_v3_publisher_handoff_telemetry(path):
+    """Add deterministic, privacy-safe handoff timing to a schema-v3 fixture."""
+
+    add_schema_v3_response_chunk_sidecar(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    staged = payload["staged_pipeline"]
+    staged["tts_publisher_handoff_telemetry_enabled"] = True
+    response_ready_ms = {
+        (0, 0): 2_000.0,
+        (0, 1): 2_200.0,
+        (1, 0): 3_100.0,
+    }
+    completion_ms = {
+        event["sequence_id"]: float(event["monotonic_ms"])
+        for event in staged["events"]
+        if (event["stage"], event["event"]) == ("tts", "completed")
+    }
+    fallback_parents = {
+        item["parent_sequence_id"]
+        for item in staged["produced_parent_summaries"]
+        if item.get("atomic_fallback_applied", False)
+    }
+    timing = {}
+    for key, ready_ms in response_ready_ms.items():
+        parent, frame_id = key
+        if parent in fallback_parents:
+            ready_ms = completion_ms[parent]
+        capacity_wait_ms = 6.0 if key == (0, 1) else 2.0
+        requested_ms = ready_ms + 2.0
+        callback_ms = requested_ms + 2.0
+        capacity_ms = callback_ms + capacity_wait_ms
+        enqueued_ms = capacity_ms + 2.0
+        dequeued_ms = enqueued_ms + 2.0
+        send_started_ms = dequeued_ms + 2.0
+        sent_ms = send_started_ms + (4.0 if key == (0, 1) else 3.0)
+        timing[key] = {
+            "ready": ready_ms,
+            "requested": requested_ms,
+            "callback": callback_ms,
+            "capacity": capacity_ms,
+            "enqueued": enqueued_ms,
+            "dequeued": dequeued_ms,
+            "send_started": send_started_ms,
+            "sent": sent_ms,
+            "blocked": capacity_wait_ms,
+        }
+
+    for event in staged["events"]:
+        key = (
+            event.get("parent_sequence_id"),
+            event.get("audio_frame_id"),
+        )
+        if key not in timing:
+            continue
+        event_type = (event["stage"], event["event"])
+        values = timing[key]
+        if event_type == ("tts", "frame_received"):
+            event["monotonic_ms"] = values["ready"]
+        elif event_type == ("output", "frame_enqueued"):
+            event.update(
+                {
+                    "monotonic_ms": values["enqueued"],
+                    "publish_requested_monotonic_ms": values["requested"],
+                    "event_loop_callback_started_monotonic_ms": (
+                        values["callback"]
+                    ),
+                    "output_capacity_acquired_monotonic_ms": (
+                        values["capacity"]
+                    ),
+                    "blocked_put_ms": values["blocked"],
+                }
+            )
+        elif event_type == ("output", "frame_dequeued"):
+            event["monotonic_ms"] = values["dequeued"]
+
+    for event in staged["websocket_send_events"]:
+        key = (event["parent_sequence_id"], event["audio_frame_id"])
+        event.update(
+            {
+                "send_started_monotonic_ms": timing[key]["send_started"],
+                "sent_monotonic_ms": timing[key]["sent"],
+            }
+        )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def test_schema_v1_quantifies_boundaries_and_withheld_opportunity(tmp_path):
     path = tmp_path / "private-name_summary.json"
     write_summary(path)
@@ -1048,6 +1135,359 @@ def test_schema_v3_preserves_response_chunk_diagnostic(tmp_path):
     assert incremental[
         "first_publish_lead_over_tts_completion_seconds"
     ]["p50"] == 0.22
+
+
+def test_schema_v3_publisher_handoff_quantifies_each_boundary(tmp_path):
+    path = tmp_path / "publisher_handoff_summary.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+
+    sample = load_summary_latency(path, sample_index=1)
+    analysis = analyze_paths([path])
+    handoff = analysis["aggregate"]["tts_publisher_handoff"]
+
+    assert len(sample.publisher_handoffs) == 3
+    assert handoff["available"] is True
+    assert handoff["enabled_sample_count"] == 1
+    assert handoff["legacy_sample_count"] == 0
+    assert handoff["total_observed_frame_count"] == 3
+    assert handoff["direct_incremental_frame_count"] == 3
+    assert handoff["atomic_fallback_frame_count"] == 0
+    assert handoff[
+        "frame_ready_to_publish_request_seconds"
+    ]["p50"] == 0.002
+    assert handoff[
+        "publish_request_to_event_loop_callback_seconds"
+    ]["p50"] == 0.002
+    assert handoff[
+        "event_loop_callback_to_output_capacity_seconds"
+    ]["p50"] == 0.002
+    assert handoff[
+        "event_loop_callback_to_output_capacity_seconds"
+    ]["p95"] == 0.006
+    assert handoff["output_capacity_to_enqueue_seconds"]["p50"] == 0.002
+    assert handoff["enqueue_to_dequeue_seconds"]["p50"] == 0.002
+    assert handoff["frame_ready_to_enqueue_seconds"]["p50"] == 0.008
+    assert handoff["frame_ready_to_enqueue_over_100ms_count"] == 0
+    assert handoff["frame_ready_to_enqueue_over_1s_count"] == 0
+    assert handoff["prior_frame_serialization_wait_seconds"]["p50"] == 0
+    assert handoff[
+        "ready_or_prior_commit_to_publish_request_seconds"
+    ]["p50"] == 0.002
+    assert handoff["dequeue_to_send_start_seconds"]["p50"] == 0.002
+    assert handoff["send_start_to_completion_seconds"]["p50"] == 0.003
+    assert handoff["send_start_to_completion_seconds"]["p95"] == 0.004
+    assert handoff[
+        "frame_ready_to_send_completion_seconds"
+    ]["p50"] == 0.015
+    assert handoff[
+        "frame_ready_to_send_completion_seconds"
+    ]["p95"] == 0.020
+    assert analysis["aggregate"]["counts"]["publisher_handoff_frames"] == 3
+    assert analysis["samples"][0]["counts"]["publisher_handoff_frames"] == 3
+    assert "TTS publisher handoff (schema v3)" in render_markdown(analysis)
+
+
+def test_schema_v3_legacy_handoff_marker_omission_remains_valid(tmp_path):
+    path = tmp_path / "legacy_schema3_summary.json"
+    write_schema_v3_summary(path)
+
+    analysis = analyze_paths([path])
+
+    assert analysis["aggregate"]["tts_publisher_handoff"] == {
+        "available": False,
+        "sample_count": 1,
+        "enabled_sample_count": 0,
+        "legacy_sample_count": 1,
+    }
+    assert analysis["aggregate"]["counts"]["publisher_handoff_frames"] == 0
+
+
+def test_schema_v3_rejects_explicit_false_handoff_marker(tmp_path):
+    path = tmp_path / "false_publisher_handoff_marker.json"
+    write_schema_v3_summary(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["staged_pipeline"][
+        "tts_publisher_handoff_telemetry_enabled"
+    ] = False
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be true when present"):
+        analyze_paths([path])
+
+
+def test_schema_v3_publisher_handoff_requires_response_sidecar(tmp_path):
+    path = tmp_path / "publisher_handoff_missing_sidecar.json"
+    write_schema_v3_summary(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["staged_pipeline"][
+        "tts_publisher_handoff_telemetry_enabled"
+    ] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires the TTS response-chunk"):
+        analyze_paths([path])
+
+
+def test_schema_v3_publisher_handoff_rejects_missing_timing_field(tmp_path):
+    path = tmp_path / "publisher_handoff_missing_field.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    enqueued = next(
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if (event["stage"], event["event"]) == ("output", "frame_enqueued")
+    )
+    del enqueued["event_loop_callback_started_monotonic_ms"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="event_loop_callback_started_monotonic_ms must be finite",
+    ):
+        analyze_paths([path])
+
+
+def test_schema_v3_publisher_handoff_rejects_timestamp_inversion(tmp_path):
+    path = tmp_path / "publisher_handoff_inverted.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    enqueued = next(
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if (event["stage"], event["event"]) == ("output", "frame_enqueued")
+    )
+    enqueued["event_loop_callback_started_monotonic_ms"] = (
+        enqueued["publish_requested_monotonic_ms"] - 1
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="timestamps are not ordered"):
+        analyze_paths([path])
+
+
+def test_schema_v3_publisher_handoff_rejects_cross_frame_inversion(tmp_path):
+    path = tmp_path / "publisher_handoff_cross_frame_inversion.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    staged = payload["staged_pipeline"]
+    first_enqueued = next(
+        event
+        for event in staged["events"]
+        if (event["stage"], event["event"])
+        == ("output", "frame_enqueued")
+        and event["parent_sequence_id"] == 0
+        and event["audio_frame_id"] == 0
+    )
+    first_dequeued = next(
+        event
+        for event in staged["events"]
+        if (event["stage"], event["event"])
+        == ("output", "frame_dequeued")
+        and event["parent_sequence_id"] == 0
+        and event["audio_frame_id"] == 0
+    )
+    first_send, second_send = staged["websocket_send_events"][:2]
+    first_enqueued.update(
+        {
+            "output_capacity_acquired_monotonic_ms": 2_220.0,
+            "monotonic_ms": 2_222.0,
+            "blocked_put_ms": (
+                2_220.0
+                - first_enqueued[
+                    "event_loop_callback_started_monotonic_ms"
+                ]
+            ),
+        }
+    )
+    first_dequeued["monotonic_ms"] = 2_224.0
+    first_send.update(
+        {
+            "send_started_monotonic_ms": 2_225.0,
+            "sent_monotonic_ms": 2_226.0,
+        }
+    )
+    second_send.update(
+        {
+            "send_started_monotonic_ms": 2_227.0,
+            "sent_monotonic_ms": 2_231.0,
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="previous frame commit|not globally ordered",
+    ):
+        analyze_paths([path])
+
+
+def test_schema_v3_publisher_handoff_rejects_mixed_sample_coverage(tmp_path):
+    enabled = tmp_path / "enabled.json"
+    legacy = tmp_path / "legacy.json"
+    write_schema_v3_summary(enabled)
+    add_schema_v3_publisher_handoff_telemetry(enabled)
+    write_schema_v3_summary(legacy)
+
+    with pytest.raises(
+        ValueError,
+        match="cannot mix telemetry-enabled and legacy samples",
+    ):
+        analyze_paths([enabled, legacy])
+
+
+def test_schema_v3_publisher_handoff_separates_prior_frame_wait(tmp_path):
+    path = tmp_path / "publisher_handoff_serialized_burst.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    staged = payload["staged_pipeline"]
+
+    chunks = staged["tts_response_chunk_telemetry"]["chunks"]
+    first_parent = [chunk for chunk in chunks if chunk["parent_sequence_id"] == 0]
+    first_parent[0].update(
+        {
+            "response_count": 1,
+            "audio_bytes": 4_800,
+            "cumulative_audio_bytes": 4_800,
+            "audio_duration_ms": 150,
+            "cumulative_audio_duration_ms": 150,
+        }
+    )
+    chunks.remove(first_parent[1])
+    staged["tts_response_chunk_telemetry"]["response_chunk_count"] = len(chunks)
+
+    second_received = next(
+        event
+        for event in staged["events"]
+        if (event["stage"], event["event"]) == ("tts", "frame_received")
+        and event["parent_sequence_id"] == 0
+        and event["audio_frame_id"] == 1
+    )
+    second_enqueued = next(
+        event
+        for event in staged["events"]
+        if (event["stage"], event["event"]) == ("output", "frame_enqueued")
+        and event["parent_sequence_id"] == 0
+        and event["audio_frame_id"] == 1
+    )
+    second_dequeued = next(
+        event
+        for event in staged["events"]
+        if (event["stage"], event["event"]) == ("output", "frame_dequeued")
+        and event["parent_sequence_id"] == 0
+        and event["audio_frame_id"] == 1
+    )
+    second_send = staged["websocket_send_events"][1]
+    second_received["monotonic_ms"] = 2_000.0
+    second_enqueued.update(
+        {
+            "publish_requested_monotonic_ms": 2_012.0,
+            "event_loop_callback_started_monotonic_ms": 2_014.0,
+            "output_capacity_acquired_monotonic_ms": 2_014.0,
+            "monotonic_ms": 2_016.0,
+            "blocked_put_ms": 0.0,
+        }
+    )
+    second_dequeued["monotonic_ms"] = 2_018.0
+    second_send.update(
+        {
+            "send_started_monotonic_ms": 2_020.0,
+            "sent_monotonic_ms": 2_024.0,
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    handoff = analyze_paths([path])["aggregate"]["tts_publisher_handoff"]
+
+    assert handoff["prior_frame_serialization_wait_seconds"]["max"] == 0.008
+    assert handoff[
+        "ready_or_prior_commit_to_publish_request_seconds"
+    ]["p50"] == 0.002
+    assert handoff["frame_ready_to_publish_request_seconds"]["max"] == 0.012
+
+
+def test_schema_v3_publisher_handoff_rejects_blocked_wait_mismatch(tmp_path):
+    path = tmp_path / "publisher_handoff_blocked_mismatch.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    enqueued = next(
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if (event["stage"], event["event"]) == ("output", "frame_enqueued")
+    )
+    enqueued["blocked_put_ms"] += 11
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="blocked_put_ms does not reconcile"):
+        analyze_paths([path])
+
+
+def test_schema_v3_publisher_handoff_allows_unblocked_capacity_gap(tmp_path):
+    path = tmp_path / "publisher_handoff_unblocked_capacity_gap.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    enqueued = next(
+        event
+        for event in payload["staged_pipeline"]["events"]
+        if (event["stage"], event["event"]) == ("output", "frame_enqueued")
+    )
+    enqueued["blocked_put_ms"] = 0.0
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    handoff = analyze_paths([path])["aggregate"]["tts_publisher_handoff"]
+
+    assert handoff[
+        "event_loop_callback_to_output_capacity_seconds"
+    ]["max"] > 0
+
+
+def test_schema_v3_publisher_handoff_excludes_atomic_fallback_frames(tmp_path):
+    path = tmp_path / "publisher_handoff_mixed_fallback.json"
+    write_schema_v3_summary(path)
+    apply_schema_v3_fallback(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+
+    handoff = analyze_paths([path])["aggregate"]["tts_publisher_handoff"]
+
+    assert handoff["available"] is True
+    assert handoff["total_observed_frame_count"] == 3
+    assert handoff["direct_incremental_frame_count"] == 2
+    assert handoff["atomic_fallback_frame_count"] == 1
+    assert handoff["excluded_atomic_fallback_frame_count"] == 1
+    assert handoff[
+        "frame_ready_to_send_completion_seconds"
+    ]["observation_count"] == 2
+
+
+def test_schema_v3_publisher_handoff_output_is_private_and_numeric(tmp_path):
+    path = tmp_path / "private-publisher-handoff.json"
+    write_schema_v3_summary(path)
+    add_schema_v3_publisher_handoff_telemetry(path)
+
+    analysis = analyze_paths([path])
+    rendered = json.dumps(analysis)
+    handoff = analysis["aggregate"]["tts_publisher_handoff"]
+
+    assert PRIVATE_MARKER not in rendered
+    assert "private-publisher-handoff" not in rendered
+    assert "identity" not in handoff
+    for field, distribution in handoff.items():
+        if not field.endswith("_seconds") or distribution is None:
+            continue
+        assert distribution["observation_count"] > 0
+        assert all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for key, value in distribution.items()
+            if key != "observation_count"
+        )
 
 
 def test_schema_v3_rejects_frame_byte_layer_mismatch(tmp_path):

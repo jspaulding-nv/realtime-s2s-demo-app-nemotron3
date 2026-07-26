@@ -1236,6 +1236,9 @@ class PipelineEvent:
     audio_frame_id: Optional[int] = None
     audio_frame_count: Optional[int] = None
     atomic_fallback_applied: Optional[bool] = None
+    publish_requested_monotonic_ms: Optional[float] = None
+    event_loop_callback_started_monotonic_ms: Optional[float] = None
+    output_capacity_acquired_monotonic_ms: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -1309,6 +1312,50 @@ class PipelineEvent:
             and not isinstance(self.atomic_fallback_applied, bool)
         ):
             raise ValueError("atomic_fallback_applied must be a boolean")
+        handoff_timestamps = (
+            self.publish_requested_monotonic_ms,
+            self.event_loop_callback_started_monotonic_ms,
+            self.output_capacity_acquired_monotonic_ms,
+        )
+        if any(value is not None for value in handoff_timestamps):
+            if not all(value is not None for value in handoff_timestamps):
+                raise ValueError(
+                    "publisher handoff timestamps must be provided together"
+                )
+            if (
+                self.stage != "output"
+                or self.event != "frame_enqueued"
+                or self.audio_frame_id is None
+            ):
+                raise ValueError(
+                    "publisher handoff timestamps require an output "
+                    "frame_enqueued event"
+                )
+            for name, value in (
+                (
+                    "publish_requested_monotonic_ms",
+                    self.publish_requested_monotonic_ms,
+                ),
+                (
+                    "event_loop_callback_started_monotonic_ms",
+                    self.event_loop_callback_started_monotonic_ms,
+                ),
+                (
+                    "output_capacity_acquired_monotonic_ms",
+                    self.output_capacity_acquired_monotonic_ms,
+                ),
+            ):
+                _validate_nonnegative_finite(name, value)
+            if not (
+                self.publish_requested_monotonic_ms
+                <= self.event_loop_callback_started_monotonic_ms
+                <= self.output_capacity_acquired_monotonic_ms
+                <= self.monotonic_ms
+            ):
+                raise ValueError(
+                    "publisher handoff timestamps must be nondecreasing "
+                    "through frame enqueue"
+                )
         if self.parent_text_chars is not None and (
             not isinstance(self.parent_text_chars, int)
             or isinstance(self.parent_text_chars, bool)
@@ -1339,6 +1386,10 @@ class PipelineEvent:
             payload.pop("audio_frame_count")
         if self.atomic_fallback_applied is None:
             payload.pop("atomic_fallback_applied")
+        if self.publish_requested_monotonic_ms is None:
+            payload.pop("publish_requested_monotonic_ms")
+            payload.pop("event_loop_callback_started_monotonic_ms")
+            payload.pop("output_capacity_acquired_monotonic_ms")
         if self.emission_reason is not None:
             payload["emission_reason"] = self.emission_reason.value
         return payload
