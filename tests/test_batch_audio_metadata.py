@@ -5,9 +5,12 @@ import pytest
 
 from batch_latency_test import (
     AUDIO_METADATA_PROTOCOL_VERSION,
+    TestResult as BatchTestResult,
+    generate_summary,
     run_test,
     validate_audio_metadata_observation,
     validate_capture_result,
+    validate_synthesized_pcm_silence_capture,
 )
 
 
@@ -339,6 +342,304 @@ def test_validated_audio_frame_sink_failure_aborts_capture_safely(monkeypatch):
     assert "private details" not in result.server_error
 
 
+def test_synthesized_pcm_silence_measurement_is_complete_and_aggregate_only(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+
+    observation = result.synthesized_pcm_silence
+    assert result.translation_completed is True
+    assert observation is not None
+    assert observation["observation_type"] == "synthesized_pcm_silence"
+    assert observation["totals"]["parent_count"] == 1
+    assert observation["totals"]["frame_count"] == 1
+    assert observation["totals"]["audio_bytes"] == 3200
+    assert observation["totals"]["sample_count"] == 1600
+    assert observation["privacy"] == {
+        "contains_audio": False,
+        "contains_transcript_text": False,
+        "contains_translation_text": False,
+        "contains_input_paths_or_filenames": False,
+        "contains_endpoints": False,
+        "contains_session_ids": False,
+        "contains_source_timing": False,
+        "numeric_telemetry_only": True,
+    }
+    processing = result.synthesized_pcm_silence_processing
+    assert processing is not None
+    assert processing["frame_count"] == 1
+    assert processing["gate_passed"] is True
+    assert processing["privacy"] == {
+        "aggregate_only": True,
+        "contains_per_frame_timings": False,
+        "contains_wall_clock_timestamps": False,
+    }
+    serialized = json.dumps(observation)
+    assert "synthetic.wav" not in serialized
+    assert "http://backend" not in serialized
+    assert validate_synthesized_pcm_silence_capture(result) == []
+    assert validate_capture_result(result) == []
+
+
+def test_synthesized_pcm_silence_requires_protocol_v1(monkeypatch):
+    websocket = FakeWebSocket(legacy=True)
+    install_run_fakes(monkeypatch, websocket)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "synthesized PCM silence diagnostic requires audio metadata "
+            "protocol version 1"
+        ),
+    ):
+        asyncio.run(
+            run_test(
+                "synthetic.wav",
+                "http://backend",
+                measure_synthesized_pcm_silence=True,
+            )
+        )
+
+
+def test_invalid_binary_never_reaches_synthesized_pcm_silence_measurement(
+    monkeypatch,
+):
+    websocket = FakeWebSocket(wrong_binary_size=True)
+    install_run_fakes(monkeypatch, websocket)
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+
+    assert result.synthesized_pcm_silence is None
+    assert result.translation_completed is False
+    assert result.server_error.startswith(
+        "audio metadata protocol violation:"
+    )
+
+
+def test_synthesized_pcm_silence_failure_aborts_with_sanitized_type(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+
+    class FailingDiagnostic:
+        def accept_frame(self, _metadata, _pcm):
+            raise RuntimeError("do not expose private sample content")
+
+    monkeypatch.setattr(
+        "batch_latency_test.StreamingPcmSilenceDiagnostic",
+        FailingDiagnostic,
+    )
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+
+    assert result.translation_completed is False
+    assert result.server_error == (
+        "synthesized PCM silence diagnostic failed: RuntimeError"
+    )
+    assert "private sample content" not in result.server_error
+
+
+def test_synthesized_pcm_silence_reconciles_with_wire_and_result_totals(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+
+    result.synthesized_pcm_silence["totals"]["audio_bytes"] += 2
+    errors = validate_synthesized_pcm_silence_capture(result)
+    assert any(
+        "observation is invalid" in error
+        or "byte count does not match translated audio" in error
+        for error in errors
+    )
+
+    result.synthesized_pcm_silence["totals"]["audio_bytes"] -= 2
+    result.synthesized_pcm_silence["parent_threshold_rows"][0][
+        "frame_count"
+    ] += 1
+    errors = validate_synthesized_pcm_silence_capture(result)
+    assert any(
+        "observation is invalid" in error
+        or "does not reconcile with paired wire frames" in error
+        for error in errors
+    )
+
+
+def test_synthesized_pcm_silence_finalize_is_validated_before_assignment(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+
+    class InvalidFinalDiagnostic:
+        def accept_frame(self, _metadata, _pcm):
+            return None
+
+        def complete_parent(self, _completion):
+            return None
+
+        def finalize(self):
+            return {"private_pcm": "must never be serialized"}
+
+    monkeypatch.setattr(
+        "batch_latency_test.StreamingPcmSilenceDiagnostic",
+        InvalidFinalDiagnostic,
+    )
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+
+    assert result.synthesized_pcm_silence is None
+    assert result.translation_completed is False
+    assert result.server_error.startswith(
+        "synthesized PCM silence diagnostic failed:"
+    )
+    assert "private_pcm" not in result.server_error
+
+
+def test_generate_summary_rejects_incomplete_silence_request(tmp_path):
+    result = BatchTestResult(
+        audio_path="synthetic.wav",
+        duration_sec=1.0,
+        synthesized_pcm_silence_requested=True,
+    )
+    output = tmp_path / "summary.json"
+
+    with pytest.raises(
+        ValueError,
+        match="diagnostic request/result state is incomplete",
+    ):
+        generate_summary(result, str(output))
+
+    assert not output.exists()
+
+
+def test_synthesized_pcm_silence_processing_gate_is_capture_failing(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+    processing = result.synthesized_pcm_silence_processing
+    processing.update(
+        {
+            "total_ms": 26.0,
+            "mean_ms": 26.0,
+            "p50_ms": 26.0,
+            "p95_ms": 26.0,
+            "max_ms": 26.0,
+            "gate_passed": False,
+        }
+    )
+
+    errors = validate_synthesized_pcm_silence_capture(result)
+    assert (
+        "synthesized PCM silence processing overhead gate did not pass"
+        in errors
+    )
+
+
+def test_synthesized_pcm_silence_validator_rejects_malformed_wire_bytes(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+    pcm_event = next(
+        event
+        for event in result.websocket_receive_events
+        if event["frame_type"] == "pcm"
+    )
+    pcm_event["audio_bytes"] = "corrupt"
+
+    errors = validate_synthesized_pcm_silence_capture(result)
+
+    assert any(
+        "paired wire frame 0:0 has invalid audio bytes" in error
+        for error in errors
+    )
+
+
+def test_generate_summary_serializes_complete_silence_state(
+    monkeypatch,
+    tmp_path,
+):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            measure_synthesized_pcm_silence=True,
+        )
+    )
+    output = tmp_path / "summary.json"
+
+    generate_summary(result, str(output))
+    summary = json.loads(output.read_text(encoding="utf-8"))
+
+    assert summary["synthesized_pcm_silence_requested"] is True
+    assert summary["synthesized_pcm_silence"] == (
+        result.synthesized_pcm_silence
+    )
+    assert summary["synthesized_pcm_silence_processing"] == (
+        result.synthesized_pcm_silence_processing
+    )
+
+
 def test_capture_validation_requires_reconciled_headless_report(monkeypatch):
     websocket = FakeWebSocket()
     install_run_fakes(monkeypatch, websocket)
@@ -440,7 +741,11 @@ def test_protocol_v1_validation_rejects_missing_or_wrong_input_pacing(
         for event in result.client_events
         if event.stage == "chunk_sent"
     )
-    chunk_event.timestamp_ms -= 2.0
+    chunk_event.timestamp_ms = (
+        result.input_sample_zero_timestamp_ms
+        + result.input_pacing["chunk_duration_ms"]
+        - 1.0
+    )
     errors = validate_audio_metadata_observation(result)
     assert (
         "audio metadata input pacing event ledger contains an early "

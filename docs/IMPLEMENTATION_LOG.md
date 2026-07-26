@@ -1711,6 +1711,61 @@ landmark measurement.
 
 See [TTS publisher-handoff live result](PUBLISHER_HANDOFF_RESULT_2026-07-26.md).
 
+## 2026-07-26: synthesized low-energy PCM diagnostic
+
+Added a default-off, client-boundary diagnostic to determine whether
+synthesized leading or trailing low-energy PCM is a material contributor to
+listener queue growth. The diagnostic runs only with staged telemetry schema
+3, incremental publication, and audio metadata protocol v1. It consumes each
+binary message only after header/byte validation and after current-frame
+arrival and playback scheduling, then finalizes at the matching validated
+parent-completion marker.
+
+The implementation uses non-overlapping 20 ms RMS windows that cross 500 ms
+transport-frame boundaries but never cross synthesized-parent boundaries. It
+preregisters -50 dBFS as the primary threshold and reports -60 and -40 dBFS as
+sensitivity bounds. Each parent is partitioned exactly into active, leading,
+internal, and trailing low-energy sample counts. An all-low-energy parent is
+canonically assigned to the leading region so totals cannot be double-counted.
+
+Only scalar window state and numeric per-parent/per-threshold rows are retained.
+The strict schema rejects unknown fields, malformed numeric types, non-finite
+values, format or ordering changes, incomplete parents, byte/sample/window
+mismatches, partition errors, non-monotonic threshold totals, and invalid
+privacy declarations. It contains no PCM, per-window energy, transcript,
+translation, path, endpoint, session ID, or source timing.
+
+The batch capture reconciles diagnostic parents, frames, bytes, sample counts,
+stream generation, and completions with the independent protocol receive
+ledger and existing staged server evidence. Requested observation and inline
+processing evidence are all-or-none and are revalidated before summary
+serialization. Inline scan p95 must be no greater than 5 ms and maximum no
+greater than 25 ms; per-frame processing timings are discarded.
+
+Added a standalone analyzer that accepts only clean, completed, schema-3
+summaries. Its public JSON and Markdown contain neutral sample ordinals,
+aggregate low-energy duration/percentages, per-parent distributions,
+100/250/500 ms edge prevalence, and a duration-only edge-exclusion
+counterfactual. It removes parent IDs/rows, stream generation, paths,
+endpoints, hashes, sessions, source timing, and raw processing timings. The
+report explicitly does not claim inaudibility, absence of speech, safe
+removability, or listener-queue recovery.
+
+The streaming canary runner now has a one-arm `silence` mode that preserves the
+registered schema-3 500 ms publication profile and runs the existing playback,
+streaming, burst, and freshness checks before the new analyzer. A 60-second
+clean-commit gate precedes any five-minute promotion.
+
+Implementation validation passed 67 focused core/integration/analyzer tests.
+The full non-hardware Python suite passed with 1,250 tests and one
+environment-specific skip. Direct collection of the two manual microphone
+scripts remains unavailable on this headless host because PortAudio is not
+installed; those scripts are outside the automated `tests/` and
+`backend/tests/` gate.
+
+See
+[synthesized low-energy PCM diagnostic](SYNTHESIZED_PCM_SILENCE_DIAGNOSTIC.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1754,6 +1809,10 @@ See [TTS publisher-handoff live result](PUBLISHER_HANDOFF_RESULT_2026-07-26.md).
 - [x] Instrument and validate the TTS-worker-to-publisher handoff
 - [x] Run the unsplit one-minute publisher-handoff preflight and five-minute
   Sample 02 diagnostic
+- [x] Implement and unit-test aggregate-only synthesized low-energy PCM
+  telemetry
+- [ ] Pass the one-minute synthesized low-energy PCM live gate
+- [ ] Promote the synthesized low-energy PCM gate to five-minute Sample 02
 - [ ] Repeat publisher-handoff telemetry over complete long-form samples before
   claiming the historical late-sample anomaly is eliminated
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model

@@ -46,6 +46,11 @@ from headless_playback_scheduler import (
     HeadlessPlaybackScheduler,
     validate_headless_playback_report,
 )
+from synthesized_pcm_silence import (
+    StreamingPcmSilenceDiagnostic,
+    SynthesizedPcmSilenceError,
+    validate_synthesized_pcm_silence_observation,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -74,6 +79,33 @@ INPUT_PACING_FIELDS = frozenset(
         "observed_chunk_count",
         "min_emission_minus_deadline_ms",
         "max_emission_minus_deadline_ms",
+    }
+)
+SYNTHESIZED_PCM_SCAN_P95_LIMIT_MS = 5.0
+SYNTHESIZED_PCM_SCAN_MAX_LIMIT_MS = 25.0
+SYNTHESIZED_PCM_SCAN_MEASUREMENT_POSITION = (
+    "after_arrival_and_playback_scheduling_before_next_receive"
+)
+SYNTHESIZED_PCM_SCAN_CLOCK = "client_monotonic_duration"
+SYNTHESIZED_PCM_SCAN_PRIVACY = {
+    "aggregate_only": True,
+    "contains_per_frame_timings": False,
+    "contains_wall_clock_timestamps": False,
+}
+SYNTHESIZED_PCM_SCAN_FIELDS = frozenset(
+    {
+        "measurement_position",
+        "clock",
+        "frame_count",
+        "total_ms",
+        "mean_ms",
+        "p50_ms",
+        "p95_ms",
+        "max_ms",
+        "p95_limit_ms",
+        "max_limit_ms",
+        "gate_passed",
+        "privacy",
     }
 )
 
@@ -165,6 +197,9 @@ class TestResult:
     source_end_to_receipt_max_ms: float | None = None
     source_end_to_receipt_availability: str = "protocol_not_negotiated"
     headless_playback_report: dict[str, Any] | None = None
+    synthesized_pcm_silence_requested: bool = False
+    synthesized_pcm_silence: dict[str, Any] | None = None
+    synthesized_pcm_silence_processing: dict[str, Any] | None = None
     chunks_sent: int = 0
     audio_responses: int = 0
     total_received_bytes: int = 0
@@ -3993,6 +4028,231 @@ def validate_audio_metadata_observation(
     return errors
 
 
+def validate_synthesized_pcm_silence_capture(
+    result: TestResult,
+) -> list[str]:
+    """Reconcile an optional low-energy PCM diagnostic with wire evidence."""
+
+    observation = result.synthesized_pcm_silence
+    processing = result.synthesized_pcm_silence_processing
+    if observation is None:
+        errors = []
+        if result.synthesized_pcm_silence_requested:
+            errors.append(
+                "requested synthesized PCM silence diagnostic is missing"
+            )
+        if processing is not None:
+            errors.append(
+                "synthesized PCM silence processing evidence is present "
+                "without an observation"
+            )
+        return errors
+
+    errors: list[str] = []
+    if not result.synthesized_pcm_silence_requested:
+        errors.append(
+            "synthesized PCM silence observation was present without being "
+            "requested"
+        )
+    if (
+        result.audio_metadata_protocol_version
+        != AUDIO_METADATA_PROTOCOL_VERSION
+    ):
+        errors.append(
+            "synthesized PCM silence diagnostic requires audio metadata "
+            "protocol version 1"
+        )
+    staged_config = result.backend_config.get("stagedConfig")
+    if (
+        result.pipeline_mode != "staged"
+        or not isinstance(staged_config, dict)
+        or staged_config.get("telemetrySchemaVersion") != 3
+        or staged_config.get("ttsIncrementalPublishEnabled") is not True
+    ):
+        errors.append(
+            "synthesized PCM silence diagnostic requires the staged "
+            "schema-3 incremental-publication path"
+        )
+
+    try:
+        normalized = validate_synthesized_pcm_silence_observation(
+            observation
+        )
+    except (SynthesizedPcmSilenceError, TypeError, ValueError) as exc:
+        errors.append(
+            "synthesized PCM silence observation is invalid: "
+            f"{exc}"
+        )
+        return errors
+
+    totals = normalized["totals"]
+    if processing is None:
+        errors.append(
+            "synthesized PCM silence processing evidence is missing"
+        )
+    else:
+        try:
+            validated_processing = (
+                validate_synthesized_pcm_silence_processing(
+                    processing,
+                    expected_frame_count=totals["frame_count"],
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            errors.append(
+                "synthesized PCM silence processing evidence is invalid: "
+                f"{exc}"
+            )
+        else:
+            if validated_processing["gate_passed"] is not True:
+                errors.append(
+                    "synthesized PCM silence processing overhead gate did "
+                    "not pass"
+                )
+    parent_rows = normalized["parent_threshold_rows"]
+    thresholds = normalized["method"]["thresholds_dbfs"]
+    primary_threshold = normalized["method"]["primary_threshold_dbfs"]
+    primary_rows = [
+        row
+        for row in parent_rows
+        if row["threshold_dbfs"] == primary_threshold
+    ]
+
+    if totals["parent_count"] != result.audio_metadata_completed_parents:
+        errors.append(
+            "synthesized PCM silence parent count does not match protocol "
+            "completion evidence"
+        )
+    if totals["frame_count"] != result.audio_metadata_paired_frames:
+        errors.append(
+            "synthesized PCM silence frame count does not match paired "
+            "protocol frames"
+        )
+    if totals["frame_count"] != result.audio_responses:
+        errors.append(
+            "synthesized PCM silence frame count does not match translated "
+            "responses"
+        )
+    if totals["audio_bytes"] != result.total_received_bytes:
+        errors.append(
+            "synthesized PCM silence byte count does not match translated "
+            "audio"
+        )
+    expected_stream_generation = result.audio_metadata_stream_generation
+    if totals["stream_generation"] != expected_stream_generation:
+        errors.append(
+            "synthesized PCM silence stream generation does not match "
+            "protocol evidence"
+        )
+
+    frame_rows: dict[int, list[dict[str, Any]]] = {}
+    completion_rows: list[dict[str, Any]] = []
+    for event in result.websocket_receive_events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("frame_type") == "pcm":
+            parent_id = event.get("parentSequenceId")
+            if isinstance(parent_id, int) and not isinstance(parent_id, bool):
+                frame_rows.setdefault(parent_id, []).append(event)
+        elif event.get("message_type") == "audio_parent_complete":
+            completion_rows.append(event)
+
+    expected_parent_ids = list(range(len(primary_rows)))
+    if [row["parent_sequence_id"] for row in primary_rows] != (
+        expected_parent_ids
+    ):
+        errors.append(
+            "synthesized PCM silence parent IDs are not contiguous from zero"
+        )
+    if len(completion_rows) != len(primary_rows):
+        errors.append(
+            "synthesized PCM silence parents do not match wire completion "
+            "count"
+        )
+
+    for parent_index, parent in enumerate(primary_rows):
+        parent_id = parent["parent_sequence_id"]
+        observed_frames = frame_rows.get(parent_id, [])
+        observed_audio_bytes = 0
+        frame_bytes_valid = True
+        for frame_index, event in enumerate(observed_frames):
+            audio_bytes = event.get("audio_bytes")
+            if (
+                not isinstance(audio_bytes, int)
+                or isinstance(audio_bytes, bool)
+                or audio_bytes <= 0
+            ):
+                errors.append(
+                    "synthesized PCM silence paired wire frame "
+                    f"{parent_id}:{frame_index} has invalid audio bytes"
+                )
+                frame_bytes_valid = False
+            else:
+                observed_audio_bytes += audio_bytes
+        if (
+            parent["frame_count"] != len(observed_frames)
+            or (
+                frame_bytes_valid
+                and parent["audio_bytes"] != observed_audio_bytes
+            )
+        ):
+            errors.append(
+                f"synthesized PCM silence parent {parent_id} does not "
+                "reconcile with paired wire frames"
+            )
+        if parent_index < len(completion_rows):
+            completion = completion_rows[parent_index]
+            if (
+                completion.get("parentSequenceId") != parent_id
+                or completion.get("audioFrameCount")
+                != parent["frame_count"]
+                or completion.get("audioBytes") != parent["audio_bytes"]
+            ):
+                errors.append(
+                    f"synthesized PCM silence parent {parent_id} does not "
+                    "reconcile with its wire completion"
+                )
+
+    # Every threshold must carry the exact same parent identity and transport
+    # totals. The core validator checks this internally; this explicit replay
+    # also ties each sensitivity row to the independent wire ledger.
+    for threshold in thresholds:
+        threshold_rows = [
+            row
+            for row in parent_rows
+            if row["threshold_dbfs"] == threshold
+        ]
+        if len(threshold_rows) != len(primary_rows):
+            errors.append(
+                "synthesized PCM silence threshold rows do not cover every "
+                "completed parent"
+            )
+            continue
+        for primary, candidate in zip(
+            primary_rows,
+            threshold_rows,
+            strict=True,
+        ):
+            for field_name in (
+                "stream_generation",
+                "parent_sequence_id",
+                "frame_count",
+                "audio_bytes",
+                "sample_count",
+                "duration_ms",
+                "full_window_count",
+                "partial_window_count",
+            ):
+                if candidate[field_name] != primary[field_name]:
+                    errors.append(
+                        "synthesized PCM silence threshold rows disagree on "
+                        f"parent transport field {field_name}"
+                    )
+                    break
+
+    return errors
+
+
 def validate_capture_result(
     result: TestResult,
     *,
@@ -4132,6 +4392,7 @@ def validate_capture_result(
             }.items()
         ):
             errors.append("headless playback privacy declaration is invalid")
+    errors.extend(validate_synthesized_pcm_silence_capture(result))
     errors.extend(result.staged_integrity_errors)
     return errors
 
@@ -4242,6 +4503,168 @@ def nearest_rank(values: list[float], quantile: float) -> float | None:
     return ordered[index]
 
 
+def build_synthesized_pcm_silence_processing(
+    durations_ms: list[float],
+) -> dict[str, Any]:
+    """Build aggregate-only evidence for inline diagnostic scan overhead."""
+
+    if not durations_ms or any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        for value in durations_ms
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing durations must be finite "
+            "non-negative numbers"
+        )
+    numeric = [float(value) for value in durations_ms]
+    frame_count = len(numeric)
+    total_ms = round(sum(numeric), 6)
+    p50_ms = round(float(nearest_rank(numeric, 0.50)), 6)
+    p95_ms = round(float(nearest_rank(numeric, 0.95)), 6)
+    max_ms = round(max(numeric), 6)
+    mean_ms = round(total_ms / frame_count, 6)
+    gate_passed = (
+        p95_ms <= SYNTHESIZED_PCM_SCAN_P95_LIMIT_MS
+        and max_ms <= SYNTHESIZED_PCM_SCAN_MAX_LIMIT_MS
+    )
+    return {
+        "measurement_position": (
+            SYNTHESIZED_PCM_SCAN_MEASUREMENT_POSITION
+        ),
+        "clock": SYNTHESIZED_PCM_SCAN_CLOCK,
+        "frame_count": frame_count,
+        "total_ms": total_ms,
+        "mean_ms": mean_ms,
+        "p50_ms": p50_ms,
+        "p95_ms": p95_ms,
+        "max_ms": max_ms,
+        "p95_limit_ms": SYNTHESIZED_PCM_SCAN_P95_LIMIT_MS,
+        "max_limit_ms": SYNTHESIZED_PCM_SCAN_MAX_LIMIT_MS,
+        "gate_passed": gate_passed,
+        "privacy": dict(SYNTHESIZED_PCM_SCAN_PRIVACY),
+    }
+
+
+def validate_synthesized_pcm_silence_processing(
+    value: Any,
+    *,
+    expected_frame_count: int | None = None,
+) -> dict[str, Any]:
+    """Validate aggregate inline-scan timing without accepting extra fields."""
+
+    if not isinstance(value, dict) or set(value) != (
+        SYNTHESIZED_PCM_SCAN_FIELDS
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing fields are invalid"
+        )
+    if (
+        value.get("measurement_position")
+        != SYNTHESIZED_PCM_SCAN_MEASUREMENT_POSITION
+        or value.get("clock") != SYNTHESIZED_PCM_SCAN_CLOCK
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing measurement provenance is "
+            "invalid"
+        )
+    frame_count = value.get("frame_count")
+    if (
+        not isinstance(frame_count, int)
+        or isinstance(frame_count, bool)
+        or frame_count <= 0
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing frame_count is invalid"
+        )
+    if (
+        expected_frame_count is not None
+        and frame_count != expected_frame_count
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing frame_count does not "
+            "reconcile"
+        )
+
+    numeric_fields = (
+        "total_ms",
+        "mean_ms",
+        "p50_ms",
+        "p95_ms",
+        "max_ms",
+        "p95_limit_ms",
+        "max_limit_ms",
+    )
+    numeric: dict[str, float] = {}
+    for field_name in numeric_fields:
+        field_value = value.get(field_name)
+        if (
+            not isinstance(field_value, (int, float))
+            or isinstance(field_value, bool)
+            or not math.isfinite(field_value)
+            or field_value < 0
+        ):
+            raise ValueError(
+                "synthesized PCM silence processing "
+                f"{field_name} is invalid"
+            )
+        numeric[field_name] = float(field_value)
+    if (
+        numeric["p95_limit_ms"] != SYNTHESIZED_PCM_SCAN_P95_LIMIT_MS
+        or numeric["max_limit_ms"] != SYNTHESIZED_PCM_SCAN_MAX_LIMIT_MS
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing limits are invalid"
+        )
+    if not (
+        numeric["p50_ms"]
+        <= numeric["p95_ms"]
+        <= numeric["max_ms"]
+        <= numeric["total_ms"] + 1e-6
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing distributions are invalid"
+        )
+    if not math.isclose(
+        numeric["mean_ms"],
+        numeric["total_ms"] / frame_count,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing mean does not reconcile"
+        )
+    expected_gate = (
+        numeric["p95_ms"] <= SYNTHESIZED_PCM_SCAN_P95_LIMIT_MS
+        and numeric["max_ms"] <= SYNTHESIZED_PCM_SCAN_MAX_LIMIT_MS
+    )
+    if (
+        not isinstance(value.get("gate_passed"), bool)
+        or value["gate_passed"] is not expected_gate
+    ):
+        raise ValueError(
+            "synthesized PCM silence processing gate is invalid"
+        )
+    if value.get("privacy") != SYNTHESIZED_PCM_SCAN_PRIVACY:
+        raise ValueError(
+            "synthesized PCM silence processing privacy declaration is "
+            "invalid"
+        )
+
+    return {
+        "measurement_position": (
+            SYNTHESIZED_PCM_SCAN_MEASUREMENT_POSITION
+        ),
+        "clock": SYNTHESIZED_PCM_SCAN_CLOCK,
+        "frame_count": frame_count,
+        **numeric,
+        "gate_passed": expected_gate,
+        "privacy": dict(SYNTHESIZED_PCM_SCAN_PRIVACY),
+    }
+
+
 async def _wait_until_or_abort(
     deadline: float,
     stream_abort: asyncio.Event,
@@ -4338,6 +4761,7 @@ async def run_test(
     *,
     audio_metadata_protocol_version: int | None = None,
     audio_frame_sink: ValidatedAudioFrameSink | None = None,
+    measure_synthesized_pcm_silence: bool = False,
 ) -> TestResult:
     """Run a single latency test against one audio file.
 
@@ -4345,6 +4769,10 @@ async def run_test(
     after protocol-v1 header/binary validation. It executes inline so receipt
     timestamps remain causally ordered; blocking work would perturb later
     arrival measurements and must be queued by the callback instead.
+
+    ``measure_synthesized_pcm_silence`` enables a first-party, aggregate-only
+    low-energy PCM diagnostic. Raw samples are inspected only after protocol
+    validation and are never exposed through ``audio_frame_sink`` or retained.
     """
 
     if (
@@ -4365,6 +4793,18 @@ async def run_test(
     ):
         raise ValueError(
             "audio_frame_sink requires audio metadata protocol version 1"
+        )
+    if not isinstance(measure_synthesized_pcm_silence, bool):
+        raise TypeError(
+            "measure_synthesized_pcm_silence must be a boolean"
+        )
+    if (
+        measure_synthesized_pcm_silence
+        and audio_metadata_protocol_version is None
+    ):
+        raise ValueError(
+            "synthesized PCM silence diagnostic requires audio metadata "
+            "protocol version 1"
         )
     headless_scheduler = (
         HeadlessPlaybackScheduler()
@@ -4387,6 +4827,9 @@ async def run_test(
         backend_url=backend_url.rstrip("/"),
         target_language=TARGET_LANGUAGE,
         audio_metadata_protocol_version=audio_metadata_protocol_version,
+        synthesized_pcm_silence_requested=(
+            measure_synthesized_pcm_silence
+        ),
     )
     (
         result.backend_config,
@@ -4423,6 +4866,24 @@ async def run_test(
                 "/api/config does not advertise audio metadata "
                 f"protocol version {audio_metadata_protocol_version}"
             )
+    if measure_synthesized_pcm_silence:
+        staged_config = result.backend_config.get("stagedConfig")
+        if (
+            result.pipeline_mode != "staged"
+            or not isinstance(staged_config, dict)
+            or staged_config.get("telemetrySchemaVersion") != 3
+            or staged_config.get("ttsIncrementalPublishEnabled") is not True
+        ):
+            raise RuntimeError(
+                "synthesized PCM silence diagnostic requires the staged "
+                "schema-3 incremental-publication path"
+            )
+    silence_diagnostic = (
+        StreamingPcmSilenceDiagnostic()
+        if measure_synthesized_pcm_silence
+        else None
+    )
+    silence_processing_durations_ms: list[float] = []
     pcm_bytes = pcm.tobytes()
     total_chunks = (len(pcm_bytes) + CHUNK_BYTES - 1) // CHUNK_BYTES
 
@@ -4831,6 +5292,28 @@ async def run_test(
                                 stream_abort.set()
                                 terminal_received.set()
                                 return
+                            if silence_diagnostic is not None:
+                                scan_started_ns = time.perf_counter_ns()
+                                try:
+                                    silence_diagnostic.accept_frame(
+                                        paired_metadata,
+                                        raw,
+                                    )
+                                    silence_processing_durations_ms.append(
+                                        (
+                                            time.perf_counter_ns()
+                                            - scan_started_ns
+                                        )
+                                        / 1_000_000
+                                    )
+                                except Exception as exc:
+                                    server_error = (
+                                        "synthesized PCM silence diagnostic "
+                                        f"failed: {type(exc).__name__}"
+                                    )
+                                    stream_abort.set()
+                                    terminal_received.set()
+                                    return
                         recv_idx += 1
                     elif isinstance(raw, str):
                         try:
@@ -4880,6 +5363,19 @@ async def run_test(
                             and normalized_metadata["type"]
                             == "audio_parent_complete"
                         ):
+                            if silence_diagnostic is not None:
+                                try:
+                                    silence_diagnostic.complete_parent(
+                                        normalized_metadata
+                                    )
+                                except Exception as exc:
+                                    server_error = (
+                                        "synthesized PCM silence diagnostic "
+                                        f"failed: {type(exc).__name__}"
+                                    )
+                                    stream_abort.set()
+                                    terminal_received.set()
+                                    return
                             result.audio_metadata_completed_parents = len(
                                 metadata_tracker.completed_parents
                             )
@@ -4889,10 +5385,48 @@ async def run_test(
                         ):
                             try:
                                 metadata_tracker.assert_terminal_ready()
+                                if silence_diagnostic is not None:
+                                    finalized_silence = (
+                                        silence_diagnostic.finalize()
+                                    )
+                                    validated_silence = (
+                                        validate_synthesized_pcm_silence_observation(
+                                            finalized_silence
+                                        )
+                                    )
+                                    processing = (
+                                        build_synthesized_pcm_silence_processing(
+                                            silence_processing_durations_ms
+                                        )
+                                    )
+                                    validated_processing = (
+                                        validate_synthesized_pcm_silence_processing(
+                                            processing,
+                                            expected_frame_count=(
+                                                validated_silence["totals"][
+                                                    "frame_count"
+                                                ]
+                                            ),
+                                        )
+                                    )
+                                    result.synthesized_pcm_silence = (
+                                        validated_silence
+                                    )
+                                    result.synthesized_pcm_silence_processing = (
+                                        validated_processing
+                                    )
                             except AudioMetadataProtocolError as exc:
                                 server_error = (
                                     "audio metadata protocol violation: "
                                     f"{exc}"
+                                )
+                                stream_abort.set()
+                                terminal_received.set()
+                                return
+                            except Exception as exc:
+                                server_error = (
+                                    "synthesized PCM silence diagnostic "
+                                    f"failed: {type(exc).__name__}"
                                 )
                                 stream_abort.set()
                                 terminal_received.set()
@@ -5306,6 +5840,33 @@ def generate_csv(result: TestResult, output_path: str):
 
 def generate_summary(result: TestResult, output_path: str):
     """Write metrics, provenance, and staged evidence for one audio file."""
+    synthesized_pcm_silence = result.synthesized_pcm_silence
+    synthesized_pcm_silence_processing = (
+        result.synthesized_pcm_silence_processing
+    )
+    if result.synthesized_pcm_silence_requested != (
+        synthesized_pcm_silence is not None
+    ) or result.synthesized_pcm_silence_requested != (
+        synthesized_pcm_silence_processing is not None
+    ):
+        raise ValueError(
+            "synthesized PCM silence diagnostic request/result state is "
+            "incomplete"
+        )
+    if synthesized_pcm_silence is not None:
+        synthesized_pcm_silence = (
+            validate_synthesized_pcm_silence_observation(
+                synthesized_pcm_silence
+            )
+        )
+        synthesized_pcm_silence_processing = (
+            validate_synthesized_pcm_silence_processing(
+                synthesized_pcm_silence_processing,
+                expected_frame_count=(
+                    synthesized_pcm_silence["totals"]["frame_count"]
+                ),
+            )
+        )
     summary = {
         "audio_path": result.audio_path,
         "backend_url": result.backend_url,
@@ -5357,6 +5918,16 @@ def generate_summary(result: TestResult, output_path: str):
             "contains_transcript_or_translation_text": False,
         },
         "headless_playback": result.headless_playback_report,
+        # Optional aggregate-only measurement of windowed low-energy PCM.
+        # Raw samples, per-window energies, text, paths, and wall clocks are
+        # never retained by the diagnostic.
+        "synthesized_pcm_silence_requested": (
+            result.synthesized_pcm_silence_requested
+        ),
+        "synthesized_pcm_silence": synthesized_pcm_silence,
+        "synthesized_pcm_silence_processing": (
+            synthesized_pcm_silence_processing
+        ),
         "input_duration_sec": result.duration_sec,
         "chunks_sent": result.chunks_sent,
         "audio_responses": result.audio_responses,
@@ -5411,6 +5982,7 @@ async def run_preflight(
     backend_url: str,
     *,
     audio_metadata_protocol_version: int | None = None,
+    measure_synthesized_pcm_silence: bool = False,
 ) -> bool:
     """Run pre-flight validation with the local neutral fixture."""
     print("\n=== Pre-flight Validation ===")
@@ -5419,7 +5991,10 @@ async def run_preflight(
         return False
 
     try:
-        if audio_metadata_protocol_version is None:
+        if (
+            audio_metadata_protocol_version is None
+            and not measure_synthesized_pcm_silence
+        ):
             result = await run_test(PREFLIGHT_FILE, backend_url)
         else:
             result = await run_test(
@@ -5427,6 +6002,9 @@ async def run_preflight(
                 backend_url,
                 audio_metadata_protocol_version=(
                     audio_metadata_protocol_version
+                ),
+                measure_synthesized_pcm_silence=(
+                    measure_synthesized_pcm_silence
                 ),
             )
     except Exception as e:
@@ -5472,6 +6050,7 @@ async def run_batch(
     output_dir: str,
     *,
     audio_metadata_protocol_version: int | None = None,
+    measure_synthesized_pcm_silence: bool = False,
 ) -> bool:
     """Run tests on a list of audio files sequentially."""
     total = len(files)
@@ -5486,7 +6065,10 @@ async def run_batch(
             continue
 
         try:
-            if audio_metadata_protocol_version is None:
+            if (
+                audio_metadata_protocol_version is None
+                and not measure_synthesized_pcm_silence
+            ):
                 result = await run_test(fpath, backend_url)
             else:
                 result = await run_test(
@@ -5494,6 +6076,9 @@ async def run_batch(
                     backend_url,
                     audio_metadata_protocol_version=(
                         audio_metadata_protocol_version
+                    ),
+                    measure_synthesized_pcm_silence=(
+                        measure_synthesized_pcm_silence
                     ),
                 )
         except Exception as e:
@@ -5569,7 +6154,23 @@ def main():
             "does not change or drop translated audio"
         ),
     )
+    parser.add_argument(
+        "--measure-synthesized-pcm-silence",
+        action="store_true",
+        help=(
+            "measure aggregate-only 20 ms low-energy PCM at -60/-50/-40 "
+            "dBFS; requires --audio-metadata-protocol-v1 and staged schema 3"
+        ),
+    )
     args = parser.parse_args()
+    if (
+        args.measure_synthesized_pcm_silence
+        and not args.audio_metadata_protocol_v1
+    ):
+        parser.error(
+            "--measure-synthesized-pcm-silence requires "
+            "--audio-metadata-protocol-v1"
+        )
     metadata_version = (
         AUDIO_METADATA_PROTOCOL_VERSION
         if args.audio_metadata_protocol_v1
@@ -5584,6 +6185,9 @@ def main():
             run_preflight(
                 args.backend,
                 audio_metadata_protocol_version=metadata_version,
+                measure_synthesized_pcm_silence=(
+                    args.measure_synthesized_pcm_silence
+                ),
             )
         )
         sys.exit(0 if ok else 1)
@@ -5595,7 +6199,10 @@ def main():
                 args.backend,
                 args.output_dir,
                 audio_metadata_protocol_version=metadata_version,
-            )
+                measure_synthesized_pcm_silence=(
+                    args.measure_synthesized_pcm_silence
+                ),
+            ),
         )
     else:
         ok = asyncio.run(
@@ -5604,7 +6211,10 @@ def main():
                 args.backend,
                 args.output_dir,
                 audio_metadata_protocol_version=metadata_version,
-            )
+                measure_synthesized_pcm_silence=(
+                    args.measure_synthesized_pcm_silence
+                ),
+            ),
         )
     sys.exit(0 if ok else 1)
 

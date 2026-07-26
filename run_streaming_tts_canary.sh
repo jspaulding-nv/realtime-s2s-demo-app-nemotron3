@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Run one shared source prefix through either matched atomic/schema-1 and
-# incremental/schema-3 arms, or one schema-3 publisher-handoff diagnostic arm.
+# incremental/schema-3 arms, one schema-3 publisher-handoff diagnostic arm,
+# or one aggregate-only synthesized low-energy PCM diagnostic arm.
 # This script owns only its FastAPI child processes; it never starts, stops, or
 # mutates the Riva NIM containers.
 
@@ -21,7 +22,7 @@ CANARY_SOURCE="${CANARY_SOURCE:-test_audio/long-form-01.mp3}"
 CANARY_DURATION_SECONDS="${CANARY_DURATION_SECONDS:-60}"
 CANARY_MODE="${CANARY_MODE:-matched}"
 if [[ -z "${CANARY_INCREMENTAL_FRAME_MS:-}" ]]; then
-  if [[ "$CANARY_MODE" == "handoff" ]]; then
+  if [[ "$CANARY_MODE" == "handoff" || "$CANARY_MODE" == "silence" ]]; then
     # Match the registered 500 ms profile used by the retained three-sample
     # publisher-gap baseline. Callers may override this for sensitivity runs.
     CANARY_INCREMENTAL_FRAME_MS=500
@@ -71,8 +72,10 @@ for setting in \
 done
 [[ "$ALLOW_DIRTY_CANARY" == "0" || "$ALLOW_DIRTY_CANARY" == "1" ]] ||
   fail_usage "ALLOW_DIRTY_CANARY must be 0 or 1"
-[[ "$CANARY_MODE" == "matched" || "$CANARY_MODE" == "handoff" ]] ||
-  fail_usage "CANARY_MODE must be matched or handoff"
+[[ "$CANARY_MODE" == "matched" ||
+  "$CANARY_MODE" == "handoff" ||
+  "$CANARY_MODE" == "silence" ]] ||
+  fail_usage "CANARY_MODE must be matched, handoff, or silence"
 [[ "$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS" =~ ^[0-9]+$ ]] ||
   fail_usage \
     "CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS must be a non-negative integer"
@@ -242,9 +245,14 @@ fi
   fail_usage "ffmpeg is required to create the shared source prefix"
 
 SHORT_COMMIT="$(git rev-parse --short HEAD)"
+SYNTHESIZED_PCM_SILENCE_ENABLED=0
 if [[ "$CANARY_MODE" == "handoff" ]]; then
   RUN_PREFIX="publisher-handoff-canary"
   CANARY_ARMS=(streaming)
+elif [[ "$CANARY_MODE" == "silence" ]]; then
+  RUN_PREFIX="synthesized-pcm-silence-canary"
+  CANARY_ARMS=(streaming)
+  SYNTHESIZED_PCM_SILENCE_ENABLED=1
 else
   RUN_PREFIX="streaming-tts-canary"
   CANARY_ARMS=(atomic streaming)
@@ -274,6 +282,7 @@ PREFIX_SHA256="$(sha256sum "$PREFIX_WAV" | awk '{print $1}')"
   echo "incremental_frame_ms=$CANARY_INCREMENTAL_FRAME_MS"
   echo "incremental_atomic_fallback_max_chars=$CANARY_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS"
   echo "streaming_audio_metadata_protocol_version=1"
+  echo "synthesized_pcm_silence_enabled=$SYNTHESIZED_PCM_SILENCE_ENABLED"
   echo "asr_image=$ASR_IMAGE"
   echo "asr_image_digest=$ASR_IMAGE_DIGEST"
   echo "nmt_image=$NMT_IMAGE"
@@ -427,6 +436,9 @@ if actual != expected[:6]:
   if [[ "$arm" == "streaming" ]]; then
     metadata_args+=(--audio-metadata-protocol-v1)
   fi
+  if [[ "$CANARY_MODE" == "silence" ]]; then
+    metadata_args+=(--measure-synthesized-pcm-silence)
+  fi
   PYTHONPATH=".python-packages:backend:." \
     "$PYTHON_BIN" batch_latency_test.py \
       --file "$PREFIX_WAV" \
@@ -473,6 +485,14 @@ if actual != expected[:6]:
         --markdown-output "$ARM_DIR/schema3_freshness_cap_analysis.md"
   fi
 
+  if [[ "$CANARY_MODE" == "silence" ]]; then
+    PYTHONPATH=".python-packages:backend:." \
+      "$PYTHON_BIN" analyze_synthesized_silence.py \
+        "$ARM_DIR/shared-prefix_summary.json" \
+        --json-output "$ARM_DIR/synthesized_pcm_silence_analysis.json" \
+        --markdown-output "$ARM_DIR/synthesized_pcm_silence_analysis.md"
+  fi
+
   stop_backend
   echo "=== Completed canary arm: $arm (mode=$CANARY_MODE) ==="
 done
@@ -487,4 +507,4 @@ fi
 
 trap - EXIT INT TERM
 echo
-echo "Incremental-publication canary complete (mode=$CANARY_MODE): $RUN_DIR"
+echo "Streaming TTS canary complete (mode=$CANARY_MODE): $RUN_DIR"

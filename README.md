@@ -191,11 +191,13 @@ realtime-s2s-demo-app/
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
 ├── analyze_stage_burst_attribution.py # Stage timing and listener-burst attribution
+├── synthesized_pcm_silence.py # Streaming aggregate-only low-energy PCM telemetry
+├── analyze_synthesized_silence.py # Privacy-safe low-energy aggregate report
 ├── analyze_freshness_cap.py # Parent-aware lossy queue counterfactual
 ├── analyze_semantic_event_latency.py # Source-event parent-envelope gate
 ├── freshness_trace.py      # Fail-closed schema-v3 evidence join
 ├── playback_simulation.py  # No-drop and whole-parent queue simulators
-├── run_streaming_tts_canary.sh # Matched or publisher-handoff live canary
+├── run_streaming_tts_canary.sh # Matched, handoff, or low-energy live canary
 ├── summarize_streaming_tts_canary.py # Privacy-safe matched comparison
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
@@ -845,6 +847,20 @@ CANARY_MODE=handoff CANARY_DURATION_SECONDS=60 \
 See the
 [TTS publisher-handoff diagnostic](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md).
 
+The next default-off gate measures synthesized leading, trailing, and internal
+low-energy PCM without retaining generated audio. Run the one-minute,
+schema-3 diagnostic from a clean commit:
+
+```bash
+CANARY_MODE=silence CANARY_DURATION_SECONDS=60 \
+  CANARY_INCREMENTAL_FRAME_MS=500 \
+  ./run_streaming_tts_canary.sh
+```
+
+This is an observation-only sensitivity sweep at -60, -50, and -40 dBFS; it
+does not trim audio or label low-energy speech as safely removable. See the
+[synthesized low-energy PCM diagnostic](docs/SYNTHESIZED_PCM_SILENCE_DIAGNOSTIC.md).
+
 Detailed guides:
 
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
@@ -874,6 +890,7 @@ Detailed guides:
 - [Incremental TTS publication five-minute matched canary](docs/STREAMING_TTS_5MIN_CANARY_2026-07-24.md)
 - [TTS publisher-handoff diagnostic and promotion gate](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md)
 - [TTS publisher-handoff one-minute and five-minute live result](docs/PUBLISHER_HANDOFF_RESULT_2026-07-26.md)
+- [Synthesized low-energy PCM diagnostic and promotion gate](docs/SYNTHESIZED_PCM_SILENCE_DIAGNOSTIC.md)
 - [Schema-3 whole-parent freshness-cap simulation](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
