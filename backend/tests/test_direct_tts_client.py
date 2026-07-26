@@ -148,12 +148,16 @@ class BlockingService:
 
 def configured_client(service, *, ticks=(100, 125, 200)):
     clock = MagicMock(side_effect=ticks)
-    client = DirectTTSClient(clock_ms=clock)
+    client = DirectTTSClient(incremental_frame_ms=100, clock_ms=clock)
     channel = MagicMock()
     client._connected = True
     client._auth = SimpleNamespace(channel=channel)
     client._service = service
     return client, channel
+
+
+def test_incremental_frame_duration_defaults_to_500_ms():
+    assert DirectTTSClient().incremental_frame_ms == 500
 
 
 def test_synthesis_collects_complete_pcm_atomically_and_preserves_provenance():
@@ -248,6 +252,7 @@ def test_incremental_reframes_variable_responses_and_preserves_exact_pcm():
     clock = MagicMock(side_effect=(100, 110, 120, 130, 140))
     client = DirectTTSClient(
         capture_response_chunk_metrics=True,
+        incremental_frame_ms=100,
         clock_ms=clock,
     )
     client._connected = True
@@ -300,6 +305,7 @@ def test_incremental_short_target_retries_privately_then_frames_only_success():
     client = DirectTTSClient(
         max_retries=1,
         capture_response_chunk_metrics=True,
+        incremental_frame_ms=100,
         incremental_atomic_fallback_max_chars=4,
         clock_ms=MagicMock(
             side_effect=(100, 110, 120, 130, 140)
@@ -374,6 +380,7 @@ def test_incremental_target_above_atomic_fallback_limit_remains_live():
     )
     client = DirectTTSClient(
         max_retries=1,
+        incremental_frame_ms=100,
         incremental_atomic_fallback_max_chars=4,
         clock_ms=MagicMock(side_effect=(100, 110)),
     )
@@ -401,6 +408,7 @@ def test_zero_atomic_fallback_limit_leaves_short_target_incremental():
     )
     client = DirectTTSClient(
         max_retries=1,
+        incremental_frame_ms=100,
         incremental_atomic_fallback_max_chars=0,
         clock_ms=MagicMock(side_effect=(100, 110)),
     )
@@ -427,6 +435,7 @@ def test_atomic_fallback_publisher_failure_after_ack_never_retries_or_replays():
     )
     client = DirectTTSClient(
         max_retries=1,
+        incremental_frame_ms=100,
         incremental_atomic_fallback_max_chars=4,
         clock_ms=MagicMock(side_effect=(100, 110, 120)),
     )
@@ -514,6 +523,7 @@ def test_incremental_unknown_after_commit_never_retries_or_replays_prefix():
     )
     client = DirectTTSClient(
         max_retries=1,
+        incremental_frame_ms=100,
         clock_ms=MagicMock(side_effect=(100, 110)),
     )
     client._connected = True
@@ -575,6 +585,7 @@ def test_incremental_limit_failure_after_commit_reports_exact_prefix():
     client = DirectTTSClient(
         max_audio_duration_s=0.1,
         max_retries=1,
+        incremental_frame_ms=100,
         clock_ms=MagicMock(side_effect=(100, 110)),
     )
     client._connected = True

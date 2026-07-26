@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { TestDashboard } from '../components/TestDashboard';
 import type { PlaybackMetrics } from '../hooks/useAudioPlayback';
+import type {
+  RenderedDigitalRecorderFatalDiagnostic,
+} from '../hooks/useRenderedDigitalCapture';
 import type { SessionStatus } from '../types/messages';
 
 // --- Mocks ---
@@ -24,6 +27,9 @@ const mockCaptureCurrentContextFrame = vi.fn(() => 16000);
 const mockArmSourceClock = vi.fn();
 const mockRenderedCaptureStop = vi.fn();
 const mockRenderedCaptureAbort = vi.fn(async () => {});
+let mockRenderedCaptureFatalError: Error | null = null;
+let mockRenderedCaptureFatalDiagnostic:
+RenderedDigitalRecorderFatalDiagnostic | null = null;
 const mockTrackerStartTest = vi.fn();
 const mockLogChunkSent = vi.fn();
 const mockLogAudioReceived = vi.fn();
@@ -81,6 +87,8 @@ vi.mock('../hooks/useAudioPlayback', () => ({
 vi.mock('../hooks/useRenderedDigitalCapture', () => ({
   useRenderedDigitalCapture: vi.fn(() => ({
     isCapturing: false,
+    fatalError: mockRenderedCaptureFatalError,
+    fatalDiagnostic: mockRenderedCaptureFatalDiagnostic,
     start: mockRenderedCaptureStart,
     createPlaybackRouting: mockCreatePlaybackRouting,
     getCurrentContextFrame: mockCaptureCurrentContextFrame,
@@ -174,6 +182,8 @@ describe('TestDashboard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFetch.mockImplementation(defaultFetch);
+    mockRenderedCaptureFatalError = null;
+    mockRenderedCaptureFatalDiagnostic = null;
     playbackInstances = [];
     playbackOptions = [];
   });
@@ -792,6 +802,141 @@ describe('TestDashboard', () => {
     );
     expect(screen.getByText('Export CSV')).toBeInTheDocument();
     expect(screen.getByText('New Test')).toBeInTheDocument();
+  });
+
+  it('fails immediately and exposes safe diagnostics on recorder fatal', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    const { useWebSocket } = await import('../hooks/useWebSocket');
+    let emitChunk: Parameters<typeof useFileAudioSource>[0]['onChunk']
+      | undefined;
+    const stopStreaming = vi.fn();
+    const disconnect = vi.fn();
+
+    vi.mocked(useFileAudioSource).mockImplementation((options) => {
+      emitChunk = options.onChunk;
+      return {
+        isLoaded: true,
+        isStreaming: false,
+        duration: 60,
+        position: 0,
+        loadFile: vi.fn(),
+        startStreaming: vi.fn(),
+        stopStreaming,
+      };
+    });
+    vi.mocked(useWebSocket).mockReturnValue({
+      isConnected: false,
+      status: 'connected',
+      sendMessage: vi.fn(() => true),
+      sendAudio: vi.fn(() => true),
+      connect: vi.fn(),
+      disconnect,
+    });
+
+    const { container, rerender } = render(<TestDashboard />);
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /rendered-digital common-clock preflight/i,
+    }));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    await act(async () => {
+      emitChunk?.(new ArrayBuffer(4), {
+        chunkIndex: 0,
+        sampleRateHz: 16000,
+        sourceSampleStart: 0,
+        sourceSampleEndExclusive: 2,
+        inputPcmSha256: 'a'.repeat(64),
+        inputPcmSampleCount: 2,
+        emittedAtMs: 300,
+        inputSampleZeroClientMs: 0,
+        inputSourceBoundaryContextFrame: 14400,
+        inputSourceBoundaryDeliveredAfterContextFrame: 14464,
+        inputSourceBoundaryReceivedContextFrameBefore: 14480,
+        inputSourceBoundaryReceivedContextFrameAfter: 14480,
+        inputSourceBoundaryReceivedClientMs: 1200,
+        inputChunkEmittedContextFrame: 14500,
+      });
+    });
+
+    const fatalError = new Error(
+      'Recorder rejected the capture (noncontiguous_render_quantum).',
+    );
+    mockRenderedCaptureFatalError = fatalError;
+    mockRenderedCaptureFatalDiagnostic = {
+      code: 'noncontiguous_render_quantum',
+      expectedContextFrame: 16128,
+      observedContextFrame: 16384,
+      deltaFrames: 256,
+    };
+    mockRenderedCaptureStop.mockRejectedValueOnce(fatalError);
+    await act(async () => {
+      rerender(<TestDashboard />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const root = container.querySelector('[data-s2s-phase]');
+    expect(stopStreaming).toHaveBeenCalledTimes(1);
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(mockRenderedCaptureStop).toHaveBeenCalledTimes(1);
+    expect(mockRenderedCaptureAbort).toHaveBeenCalledTimes(1);
+    expect(root).toHaveAttribute('data-s2s-phase', 'failed');
+    expect(root).toHaveAttribute('data-s2s-source-chunks-sent', '1');
+    expect(root).toHaveAttribute('data-s2s-server-terminal-state', 'error');
+    expect(root).toHaveAttribute(
+      'data-s2s-recorder-fatal-code',
+      'noncontiguous_render_quantum',
+    );
+    expect(root).toHaveAttribute(
+      'data-s2s-recorder-gap-expected-context-frame',
+      '16128',
+    );
+    expect(root).toHaveAttribute(
+      'data-s2s-recorder-gap-observed-context-frame',
+      '16384',
+    );
+    expect(root).toHaveAttribute(
+      'data-s2s-recorder-gap-delta-frames',
+      '256',
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Test failed: Recorder rejected the capture '
+      + '(noncontiguous_render_quantum).',
+    );
+
+    fireEvent.click(screen.getByText('New Test'));
+    expect(root).toHaveAttribute('data-s2s-phase', 'idle');
+    expect(root).toHaveAttribute('data-s2s-source-chunks-sent', '0');
+    expect(root).toHaveAttribute(
+      'data-s2s-server-terminal-state',
+      'pending',
+    );
+    expect(root).not.toHaveAttribute('data-s2s-recorder-fatal-code');
+    expect(root).not.toHaveAttribute(
+      'data-s2s-recorder-gap-expected-context-frame',
+    );
+    expect(root).not.toHaveAttribute(
+      'data-s2s-recorder-gap-observed-context-frame',
+    );
+    expect(root).not.toHaveAttribute(
+      'data-s2s-recorder-gap-delta-frames',
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /rendered-digital common-clock preflight/i,
+    }));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    expect(root).toHaveAttribute('data-s2s-phase', 'running');
+    expect(root).toHaveAttribute('data-s2s-source-chunks-sent', '0');
+    expect(root).toHaveAttribute(
+      'data-s2s-server-terminal-state',
+      'pending',
+    );
+    expect(root).not.toHaveAttribute('data-s2s-recorder-fatal-code');
+    expect(mockRenderedCaptureStart).toHaveBeenCalledTimes(1);
   });
 
   it('does not advance the timing ledger when an audio send is rejected', async () => {

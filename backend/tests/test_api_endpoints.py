@@ -236,6 +236,7 @@ async def test_config_advertises_audio_metadata_v1_for_schema_v3_staged(
     assert response.status_code == 200
     assert response.json()["audioMetadataProtocolVersions"] == [1]
     assert response.json()["stagedConfig"]["telemetrySchemaVersion"] == 3
+    assert response.json()["stagedConfig"]["ttsIncrementalFrameMs"] == 500
 
 
 @pytest.mark.asyncio

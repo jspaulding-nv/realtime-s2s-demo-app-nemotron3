@@ -187,10 +187,67 @@ runtime:
 | TTS image digest | `sha256:6eacebdc45b35199bf2782c1f0c27d102aef5361ae3ea874e27bf3b8f6d5333d` |
 | TTS profile/voice | `magpie-tts-multilingual_batch8`, `Magpie-Multilingual.ES-US.Isabela` |
 | TTS publication | Incremental |
-| TTS frame duration | 100 ms |
+| TTS frame duration | 500 ms |
 | Post-NMT TTS splitting | Disabled |
 | Application provenance | Frontend and backend processes started clean from the same commit |
 | Recorder worklet SHA-256 | `8baf6193f097acc3c2663ca91299a19f68b1e7c17deaa586db339a073a7d0a5d` |
+
+The 500 ms TTS frame is a conservative graph-load reduction trial for this
+formal profile, not a change to the queue gate or source clock. An exploratory
+synthetic 30-second burst reproduced `noncontiguous_render_quantum`, with the
+observed `currentFrame` 128 frames behind the expected frame. That exploratory
+sweep was not provenance-bound and is superseded by the hardened run below.
+
+On 2026-07-26, the hash-bound probe used Chrome `149.0.7827.155`, browser
+binary SHA-256
+`6aede5b4c357aade7e980470017119f004ceb2cb8f7f8b9d029f85e0f3a60dca`,
+and the registered worklet SHA-256 above. Five six-second repeats per duration
+produced 0/5 failures at 100 ms, 1/5 at 250 ms, 2/5 at 300 ms, and 1/5 at
+500 ms. The mixed result does not establish a monotonic relationship between
+publication duration and the Chrome frame rewind. A separate 65-second
+500 ms run scheduled all 60 expected translated sources, emitted all 200
+source ticks, recorded zero capture errors, and measured a clock rate of
+1.000351. These transcript-free probes diagnose graph scheduling behavior;
+they neither prove the 500 ms change fixes the rewind nor provide accepted
+audience-latency evidence. The formal live run remains the decision gate.
+
+Historical Magpie response-cadence telemetry measured a 139 ms median response
+duration and a 19 ms median interval between responses. The 500 ms publisher
+may hold several responses before publication, but its actual incremental
+latency has not yet been measured. The formal run must measure the mechanical
+queue outcome, and later semantic review must measure listener-relevant phrase
+delay.
+
+Reproduce the transcript-free graph-load comparison without starting or
+contacting Riva:
+
+```bash
+python3 probe_rendered_digital_graph_load.py \
+  --frame-ms 100 250 300 500 \
+  --repeats 5
+```
+
+The comparison exits nonzero when any repeat fails; that is expected when it
+successfully reproduces a discontinuity. Interpret the final fixed-schema
+summary instead of treating a nonzero exit as an execution failure.
+
+Confirm the selected profile across the full 60-second source clock:
+
+```bash
+python3 probe_rendered_digital_graph_load.py \
+  --frame-ms 500 \
+  --repeats 1 \
+  --probe-seconds 65 \
+  --burst-at-seconds 6
+```
+
+The utility verifies the registered worklet hash before launch, serves only
+those bytes on localhost, generates its own PCM, and prints a fixed schema of
+numeric counters, clock rates, allowlisted recorder codes, the sanitized
+Chrome version, and the browser-binary/worklet hashes. It validates the
+16 kHz AudioContext, expected translated-node count, source ticks, captured
+PCM blocks, and recorder lifecycle. It does not inspect audio content, connect
+to the Riva services, or mutate Docker.
 
 The image release tags in this repository are Nemotron ASR Streaming `1.2.0`,
 Riva Translate 1.6B `1.5.2`, and Magpie multilingual TTS `1.7.0`. The
@@ -229,7 +286,7 @@ STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
 STAGED_TTS_MAX_RETRIES=1
 STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=0
 STAGED_TTS_INCREMENTAL_PUBLISH=1
-STAGED_TTS_INCREMENTAL_FRAME_MS=100
+STAGED_TTS_INCREMENTAL_FRAME_MS=500
 STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS=4
 STAGED_TTS_SUBSEGMENT_MAX_CHARS=0
 STAGED_TTS_SUBSEGMENT_MIN_CHARS=12
@@ -365,7 +422,7 @@ Before recording, confirm that the response reports:
 - `stagedConfig.ttsIncrementalAtomicFallbackMaxChars` equal to `4`;
 - `stagedConfig.closeTimeoutSeconds` equal to `10`;
 - `stagedConfig.ttsIncrementalPublishEnabled` equal to `true`;
-- `stagedConfig.ttsIncrementalFrameMs` equal to `100`;
+- `stagedConfig.ttsIncrementalFrameMs` equal to `500`;
 - ASR EOU equal to `800` with word times enabled; and
 - all three required image digests.
 

@@ -507,7 +507,7 @@ def make_bundle(directory):
             "profile_id": "magpie-tts-multilingual_batch8",
             "voice_id": "Magpie-Multilingual.ES-US.Isabela",
             "incremental_publish_enabled": True,
-            "incremental_frame_ms": 100,
+            "incremental_frame_ms": 500,
         },
     }
     runtime_hash = sha256(canonical_json(runtime))

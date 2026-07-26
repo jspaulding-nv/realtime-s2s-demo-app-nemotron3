@@ -1474,6 +1474,39 @@ Pending:
 See
 [Rendered-digital common-clock 60-second preflight](RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md).
 
+## 2026-07-26: 500 ms registered TTS publication frame
+
+The rendered-digital formal profile now requires 500 ms incremental TTS
+publication frames. This supersedes the profile's original 100 ms setting
+without rewriting the earlier 100 ms canary results. Queue capacities, queue
+pass/fail bounds, RPC and drain timeouts, input audio, and recorder continuity
+rules are unchanged.
+
+The change follows a transcript-free synthetic Chrome graph-load diagnostic.
+A 30-second translated burst reproduced `noncontiguous_render_quantum`: the
+observed `currentFrame` rewound by one 128-frame render quantum relative to
+the expected frame. The initial exploratory sweep was not provenance-bound
+and is superseded by the hardened comparison below.
+
+The 2026-07-26 rerun verified the registered worklet SHA-256, recorded the
+sanitized Chrome version and browser-binary SHA-256, awaited all translated
+node scheduling, validated the exact node count, 16 kHz AudioContext, source
+ticks, captured PCM blocks, lifecycle messages, and clock rate, and failed
+closed on any incomplete repeat. On Chrome `149.0.7827.155`, five repeats at
+each candidate duration produced 0/5 failures at 100 ms, 1/5 at 250 ms, 2/5
+at 300 ms, and 1/5 at 500 ms. This mixed result does not prove that larger
+publication frames prevent the rewind. A separate 65-second 500 ms run
+scheduled all 60 expected translated sources, emitted all 200 source ticks,
+recorded zero capture errors, and measured an AudioContext/wall-clock rate of
+1.000351.
+
+Historical Magpie cadence telemetry measured a 139 ms median response duration
+and a 19 ms median inter-response interval. The 500 ms publisher may hold
+several responses before publication, but neither its browser-stability
+benefit nor its incremental latency is established by the synthetic sweep.
+The formal live run must decide the mechanical queue outcome, and later
+semantic review must measure listener-relevant phrase delay.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch

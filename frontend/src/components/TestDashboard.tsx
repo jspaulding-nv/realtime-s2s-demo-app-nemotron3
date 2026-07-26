@@ -58,6 +58,11 @@ const DRAIN_MAX_SEC = 300;
 export function TestDashboard() {
   const [phase, setPhase] = useState<TestPhase>('idle');
   const [failureMessage, setFailureMessage] = useState('');
+  const [sourceChunksSent, setSourceChunksSent] = useState(0);
+  const [
+    serverTerminalState,
+    setServerTerminalState,
+  ] = useState<ServerTerminalState>('pending');
   const [adaptivePlaybackEnabled, setAdaptivePlaybackEnabled] = useState(true);
   const [
     renderedDigitalCaptureEnabled,
@@ -187,12 +192,14 @@ export function TestDashboard() {
       ) {
         trackerRef.current.logServerTerminal('completed');
         serverTerminalStateRef.current = 'completed';
+        setServerTerminalState('completed');
       } else if (
         status === 'error'
         && serverTerminalStateRef.current === 'pending'
       ) {
         trackerRef.current.logServerTerminal('error');
         serverTerminalStateRef.current = 'error';
+        setServerTerminalState('error');
         if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
           fileSourceRef.current?.stopStreaming();
           void finishTestRef.current?.(
@@ -206,6 +213,7 @@ export function TestDashboard() {
       if (serverTerminalStateRef.current !== 'pending') return;
       trackerRef.current.logServerTerminal('error');
       serverTerminalStateRef.current = 'error';
+      setServerTerminalState('error');
       if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
         fileSourceRef.current?.stopStreaming();
         void finishTestRef.current?.('failed', message);
@@ -223,6 +231,7 @@ export function TestDashboard() {
             'Rendered-digital capture received PCM without frame metadata.'
           );
           serverTerminalStateRef.current = 'error';
+          setServerTerminalState('error');
           fileSourceRef.current?.stopStreaming();
           void finishTestRef.current?.('failed', message);
           return;
@@ -256,6 +265,7 @@ export function TestDashboard() {
             'Rendered-digital capture could not schedule received PCM.'
           );
           serverTerminalStateRef.current = 'error';
+          setServerTerminalState('error');
           fileSourceRef.current?.stopStreaming();
           void finishTestRef.current?.('failed', message);
           return;
@@ -287,6 +297,7 @@ export function TestDashboard() {
         if (serverTerminalStateRef.current === 'pending') {
           const message = 'Audio capture stopped because a chunk could not be sent.';
           serverTerminalStateRef.current = 'error';
+          setServerTerminalState('error');
           fileSourceRef.current?.stopStreaming();
           if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
             void finishTestRef.current?.('failed', message);
@@ -306,6 +317,7 @@ export function TestDashboard() {
           'The post-WebSocket AudioContext send frame was unavailable.'
         );
         serverTerminalStateRef.current = 'error';
+        setServerTerminalState('error');
         fileSourceRef.current?.stopStreaming();
         if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
           void finishTestRef.current?.('failed', message);
@@ -330,6 +342,7 @@ export function TestDashboard() {
         chunk.byteLength,
         completedObservation,
       );
+      setSourceChunksSent((count) => count + 1);
       // Formal rendered-digital mode schedules the exact padded source once
       // and uses its AudioWorklet boundaries to pace these sends. The normal
       // dashboard retains its historical per-chunk monitor path.
@@ -345,6 +358,7 @@ export function TestDashboard() {
         if (!wsRef.current.sendMessage({ type: 'end_input' })) {
           const message = 'The end-of-input control message could not be sent.';
           serverTerminalStateRef.current = 'error';
+          setServerTerminalState('error');
           void finishTestRef.current?.('failed', message);
           return;
         }
@@ -357,6 +371,7 @@ export function TestDashboard() {
     onError: (message) => {
       if (serverTerminalStateRef.current === 'pending') {
         serverTerminalStateRef.current = 'error';
+        setServerTerminalState('error');
       }
       if (phaseRef.current === 'running' || phaseRef.current === 'draining') {
         void finishTestRef.current?.('failed', message);
@@ -448,8 +463,10 @@ export function TestDashboard() {
     testStartTimeRef.current = performance.now();
     lastReceiveChangeRef.current = performance.now();
     chunkLogCountRef.current = 0;
+    setSourceChunksSent(0);
     audioLogCountRef.current = 0;
     serverTerminalStateRef.current = 'pending';
+    setServerTerminalState('pending');
     finishStartedRef.current = false;
     setFailureMessage('');
     setDrainCountdown(DRAIN_IDLE_SEC);
@@ -625,6 +642,7 @@ export function TestDashboard() {
             ? error.message
             : 'Common-clock source setup failed.';
           serverTerminalStateRef.current = 'error';
+          setServerTerminalState('error');
           void finishTestRef.current?.('failed', message);
         });
       }, 500);
@@ -724,6 +742,23 @@ export function TestDashboard() {
   useEffect(() => {
     finishTestRef.current = finishTest;
   }, [finishTest]);
+
+  useEffect(() => {
+    const fatalError = renderedDigitalCapture.fatalError;
+    if (
+      fatalError === null
+      || !renderedDigitalCaptureEnabledRef.current
+      || (phase !== 'running' && phase !== 'draining')
+    ) {
+      return;
+    }
+    fileSourceRef.current?.stopStreaming();
+    if (serverTerminalStateRef.current === 'pending') {
+      serverTerminalStateRef.current = 'error';
+      setServerTerminalState('error');
+    }
+    void finishTestRef.current?.('failed', fatalError.message);
+  }, [phase, renderedDigitalCapture.fatalError]);
 
   // -- Draining: require the server terminal event, network quiet, and an empty queue --
   useEffect(() => {
@@ -895,6 +930,9 @@ export function TestDashboard() {
       received: [],
       scheduled: [],
     };
+    setSourceChunksSent(0);
+    serverTerminalStateRef.current = 'pending';
+    setServerTerminalState('pending');
     setFailureMessage('');
     setPhase('idle');
   }, []);
@@ -902,12 +940,36 @@ export function TestDashboard() {
   const progressPct = fileSource.duration > 0
     ? (fileSource.position / fileSource.duration) * 100
     : 0;
+  const renderedDigitalFatalDiagnostic = (
+    renderedDigitalCaptureEnabled
+    && (
+      phase === 'running'
+      || phase === 'draining'
+      || phase === 'failed'
+    )
+  ) ? renderedDigitalCapture.fatalDiagnostic : null;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 p-6">
       <div
         className="max-w-4xl mx-auto space-y-6"
         data-s2s-phase={phase}
+        data-s2s-source-chunks-sent={sourceChunksSent}
+        data-s2s-server-terminal-state={serverTerminalState}
+        data-s2s-recorder-fatal-code={
+          renderedDigitalFatalDiagnostic?.code
+        }
+        data-s2s-recorder-gap-expected-context-frame={
+          renderedDigitalFatalDiagnostic?.expectedContextFrame
+            ?? undefined
+        }
+        data-s2s-recorder-gap-observed-context-frame={
+          renderedDigitalFatalDiagnostic?.observedContextFrame
+            ?? undefined
+        }
+        data-s2s-recorder-gap-delta-frames={
+          renderedDigitalFatalDiagnostic?.deltaFrames ?? undefined
+        }
       >
         {/* Header */}
         <div className="bg-white rounded-2xl shadow-xl p-6">
