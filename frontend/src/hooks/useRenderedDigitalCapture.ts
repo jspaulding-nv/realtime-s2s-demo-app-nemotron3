@@ -48,8 +48,10 @@ interface ActiveCaptureSession {
   contextStateViolationCount: number;
   visibilityViolationCount: number;
   fatalError: Error | null;
-  startedResolve: (() => void) | null;
-  startedReject: ((error: Error) => void) | null;
+  readyResolve: (() => void) | null;
+  readyReject: ((error: Error) => void) | null;
+  captureStartedResolve: (() => void) | null;
+  captureStartedReject: ((error: Error) => void) | null;
   stoppedResolve: (() => void) | null;
   stoppedReject: ((error: Error) => void) | null;
   sourceClockResolve: (() => void) | null;
@@ -147,7 +149,8 @@ UseRenderedDigitalCaptureReturn {
     error: Error,
   ) => {
     if (session.fatalError === null) session.fatalError = error;
-    session.startedReject?.(error);
+    session.readyReject?.(error);
+    session.captureStartedReject?.(error);
     session.sourceClockReject?.(error);
     session.stoppedReject?.(error);
   }, []);
@@ -222,7 +225,7 @@ UseRenderedDigitalCaptureReturn {
         throw new Error('Rendered-digital capture was cancelled.');
       }
 
-      const started = deferred();
+      const ready = deferred();
       const recorderNode = new AudioWorkletNode(context, WORKLET_NAME, {
         numberOfInputs: RENDERED_DIGITAL_CHANNEL_COUNT,
         numberOfOutputs: 1,
@@ -239,7 +242,10 @@ UseRenderedDigitalCaptureReturn {
         },
       });
       const sinkGain = context.createGain();
-      sinkGain.gain.value = 0;
+      // The worklet emits explicit zeros. Keep its output on an active path
+      // so headless Chrome continues pulling the capture graph without
+      // exposing either monitored channel at the destination.
+      sinkGain.gain.value = 1;
 
       const session = {} as ActiveCaptureSession;
       const onStateChange = () => {
@@ -277,8 +283,10 @@ UseRenderedDigitalCaptureReturn {
           document.visibilityState === 'visible' ? 0 : 1
         ),
         fatalError: null,
-        startedResolve: () => started.resolve(undefined),
-        startedReject: started.reject,
+        readyResolve: () => ready.resolve(undefined),
+        readyReject: ready.reject,
+        captureStartedResolve: null,
+        captureStartedReject: null,
         stoppedResolve: null,
         stoppedReject: null,
         sourceClockResolve: null,
@@ -301,7 +309,32 @@ UseRenderedDigitalCaptureReturn {
           );
           return;
         }
+        if (message.type === 'ready') {
+          if (!isSafeInteger(message.readyContextFrame)) {
+            failSession(
+              session,
+              new Error('Recorder emitted an invalid readiness frame.'),
+            );
+            return;
+          }
+          session.readyResolve?.();
+          session.readyResolve = null;
+          session.readyReject = null;
+          return;
+        }
         if (message.type === 'started') {
+          if (
+            session.captureStartedResolve === null
+            || session.captureStartContextFrame !== null
+          ) {
+            failSession(
+              session,
+              new Error(
+                'Recorder emitted a capture start outside the armed epoch.',
+              ),
+            );
+            return;
+          }
           if (!isSafeInteger(message.captureStartContextFrame)) {
             failSession(
               session,
@@ -312,9 +345,9 @@ UseRenderedDigitalCaptureReturn {
           session.captureStartContextFrame = (
             message.captureStartContextFrame
           );
-          session.startedResolve?.();
-          session.startedResolve = null;
-          session.startedReject = null;
+          session.captureStartedResolve?.();
+          session.captureStartedResolve = null;
+          session.captureStartedReject = null;
           return;
         }
         if (message.type === 'pcm_block') {
@@ -435,7 +468,7 @@ UseRenderedDigitalCaptureReturn {
       pendingContextRef.current = null;
       recorderNode.connect(sinkGain);
       sinkGain.connect(context.destination);
-      await withTimeout(started.promise, 'Recorder startup');
+      await withTimeout(ready.promise, 'Recorder readiness');
       if (
         !mountedRef.current
         || activeSessionRef.current !== session
@@ -525,13 +558,37 @@ UseRenderedDigitalCaptureReturn {
       session.sourceClockResolve = resolve;
       session.sourceClockReject = reject;
     });
+    const captureStartedPromise = new Promise<void>((resolve, reject) => {
+      session.captureStartedResolve = resolve;
+      session.captureStartedReject = reject;
+    });
     session.recorderNode.port.postMessage({
       type: 'arm_source_clock',
       sourceStartContextFrame,
       sourceFrameCount: parameters.sourceFrameCount,
       sourceChunkFrames: parameters.sourceChunkFrames,
     });
-    await withTimeout(armPromise, 'Source-clock arm');
+    try {
+      await withTimeout(
+        Promise.all([armPromise, captureStartedPromise]),
+        'Source-clock capture arm',
+      );
+    } finally {
+      session.sourceClockResolve = null;
+      session.sourceClockReject = null;
+      session.captureStartedResolve = null;
+      session.captureStartedReject = null;
+    }
+    if (
+      session.captureStartContextFrame === null
+      || session.captureStartContextFrame > sourceStartContextFrame
+    ) {
+      const error = new Error(
+        'The recorder capture epoch began after source playback.',
+      );
+      failSession(session, error);
+      throw error;
+    }
 
     return {
       sampleRateHz: session.context.sampleRate,
@@ -548,7 +605,7 @@ UseRenderedDigitalCaptureReturn {
         return () => session.sourceTickListeners.delete(listener);
       },
     };
-  }, []);
+  }, [failSession]);
 
   const stop = useCallback(async (): Promise<
   RenderedDigitalCaptureResult

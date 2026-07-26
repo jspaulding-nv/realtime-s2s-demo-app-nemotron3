@@ -478,8 +478,8 @@ def make_bundle(directory):
             "frontend_repository_commit": "a" * 40,
             "frontend_repository_dirty": False,
             "worklet_module_sha256": (
-                "0a0206154739d0731f200629d8b2ae341"
-                "e9c3176336936ef33fbfd40dc52d189"
+                "8baf6193f097acc3c2663ca91299a19f"
+                "68b1e7c17deaa586db339a073a7d0a5d"
             ),
         },
         "asr": {
@@ -676,6 +676,16 @@ def test_happy_path_is_mechanical_pass_with_narrow_claims(bundle):
         "maximum_worklet_delivery_lag_ms": 4.0,
         "worklet_delivery_limit_frames_exclusive": 128,
     }
+    assert report["input_common_clock_rate"] == {
+        "expected_boundary_span_ms": 59_700.0,
+        "interior_rate_tolerance": 0.01,
+        "maximum_elapsed_drift_ms": 0.0,
+        "maximum_ratio_inclusive": 1.01,
+        "minimum_ratio_inclusive": 0.99,
+        "observed_boundary_span_ms": 59_700.0,
+        "receipt_lag_allowance_ms": 100.0,
+        "wall_to_source_ratio": 1.0,
+    }
     assert report["claim_boundary"] == {
         "acoustic_audibility_proven": False,
         "audience_reaction_alignment_proven": False,
@@ -693,8 +703,8 @@ def test_approved_worklet_digest_matches_checked_in_module():
         / "rendered-digital-recorder.worklet.js"
     )
     assert sha256(worklet.read_bytes()) == (
-        "0a0206154739d0731f200629d8b2ae341"
-        "e9c3176336936ef33fbfd40dc52d189"
+        "8baf6193f097acc3c2663ca91299a19f"
+        "68b1e7c17deaa586db339a073a7d0a5d"
     )
 
 
@@ -996,6 +1006,132 @@ def test_approximate_sample_zero_anchor_is_not_a_common_clock_gate(bundle):
 
     assert exit_code == 0
     assert report["status"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected_exit"),
+    [(0.98, 2), (0.99, 0), (1.01, 0), (1.02, 2)],
+)
+def test_input_boundary_wall_clock_pacing_gate(
+    bundle,
+    ratio,
+    expected_exit,
+):
+    manifest = json.loads(bundle["manifest"].read_text())
+    _, rows = parse_rows(bundle["timing"].read_bytes())
+    chunks = [row for row in rows if row["stage"] == "chunk_sent"]
+    first_boundary = int(chunks[0]["input_source_boundary_context_frame"])
+    first_received_ms = float(
+        chunks[0]["input_source_boundary_received_client_ms"]
+    )
+    first_timestamp_ms = float(chunks[0]["timestamp_ms"])
+    for row in chunks:
+        boundary = int(row["input_source_boundary_context_frame"])
+        source_elapsed_ms = (
+            (boundary - first_boundary) / SAMPLE_RATE * 1000.0
+        )
+        received_ms = first_received_ms + source_elapsed_ms * ratio
+        row["input_source_boundary_received_client_ms"] = (
+            f"{received_ms:.3f}"
+        )
+        row["input_chunk_emitted_client_ms"] = f"{received_ms:.3f}"
+        row["timestamp_ms"] = (
+            f"{first_timestamp_ms + source_elapsed_ms * ratio:.2f}"
+        )
+    bind_timing(bundle, manifest, rows)
+    write_manifest(bundle["manifest"], manifest)
+
+    exit_code, report = invoke(bundle)
+
+    assert exit_code == expected_exit
+    if expected_exit == 0:
+        assert report["status"] == "PASS"
+        assert report["input_common_clock_rate"][
+            "wall_to_source_ratio"
+        ] == pytest.approx(ratio)
+    else:
+        assert report["status"] == "INVALID"
+        assert report["errors"][0]["code"] == "input_pacing"
+
+
+def test_input_boundary_pacing_uses_elapsed_not_absolute_client_time(bundle):
+    manifest = json.loads(bundle["manifest"].read_text())
+    _, rows = parse_rows(bundle["timing"].read_bytes())
+    for row in rows:
+        if row["stage"] != "chunk_sent":
+            continue
+        for column in (
+            "input_source_boundary_received_client_ms",
+            "input_chunk_emitted_client_ms",
+        ):
+            row[column] = f"{float(row[column]) + 1_000_000:.3f}"
+    bind_timing(bundle, manifest, rows)
+    write_manifest(bundle["manifest"], manifest)
+
+    exit_code, report = invoke(bundle)
+
+    assert exit_code == 0
+    assert report["status"] == "PASS"
+    assert report["input_common_clock_rate"][
+        "observed_boundary_span_ms"
+    ] == 59_700.0
+
+
+def test_input_boundary_pacing_rejects_nonuniform_interior_clock(bundle):
+    manifest = json.loads(bundle["manifest"].read_text())
+    _, rows = parse_rows(bundle["timing"].read_bytes())
+    chunks = [row for row in rows if row["stage"] == "chunk_sent"]
+    first_boundary = int(chunks[0]["input_source_boundary_context_frame"])
+    first_received_ms = float(
+        chunks[0]["input_source_boundary_received_client_ms"]
+    )
+    first_timestamp_ms = float(chunks[0]["timestamp_ms"])
+    total_elapsed_ms = 59_700.0
+    for row in chunks:
+        boundary = int(row["input_source_boundary_context_frame"])
+        source_elapsed_ms = (
+            (boundary - first_boundary) / SAMPLE_RATE * 1000.0
+        )
+        distorted_elapsed_ms = (
+            source_elapsed_ms
+            + 5_000.0 * math.sin(
+                math.pi * source_elapsed_ms / total_elapsed_ms
+            )
+        )
+        received_ms = first_received_ms + distorted_elapsed_ms
+        row["input_source_boundary_received_client_ms"] = (
+            f"{received_ms:.3f}"
+        )
+        row["input_chunk_emitted_client_ms"] = f"{received_ms:.3f}"
+        row["timestamp_ms"] = (
+            f"{first_timestamp_ms + distorted_elapsed_ms:.2f}"
+        )
+    bind_timing(bundle, manifest, rows)
+    write_manifest(bundle["manifest"], manifest)
+
+    exit_code, report = invoke(bundle)
+
+    assert exit_code == 2
+    assert report["status"] == "INVALID"
+    assert report["errors"][0]["code"] == "input_pacing"
+
+
+def test_input_ledger_rejects_client_clock_origin_contradiction(bundle):
+    manifest = json.loads(bundle["manifest"].read_text())
+    _, rows = parse_rows(bundle["timing"].read_bytes())
+    chunks = [row for row in rows if row["stage"] == "chunk_sent"]
+    row = chunks[len(chunks) // 2]
+    row["input_chunk_emitted_client_ms"] = (
+        f"{float(row['input_chunk_emitted_client_ms']) + 1.0:.3f}"
+    )
+    bind_timing(bundle, manifest, rows)
+    write_manifest(bundle["manifest"], manifest)
+
+    exit_code, report = invoke(bundle)
+
+    assert exit_code == 2
+    assert report["status"] == "INVALID"
+    assert report["errors"][0]["code"] == "input_ledger"
 
 
 @pytest.mark.parametrize(

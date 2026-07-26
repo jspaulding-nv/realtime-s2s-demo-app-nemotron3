@@ -1303,7 +1303,8 @@ in
 
 ## 2026-07-25: rendered-digital common-clock preflight
 
-Implemented in the working branch, but **not yet live-run or accepted**:
+Implemented and exercised by fail-closed live attempts, but **not yet
+accepted**:
 
 - Added a default-off Test Dashboard mode that owns one 16 kHz
   `AudioContext` for the exact source reference, translated playback, worklet
@@ -1366,7 +1367,7 @@ Implemented in the working branch, but **not yet live-run or accepted**:
   loaded into the `AudioContext`, and bound that digest for comparison with
   the worklet tracked by the registered commit. The registered module SHA-256
   is
-  `0a0206154739d0731f200629d8b2ae341e9c3176336936ef33fbfd40dc52d189`.
+  `8baf6193f097acc3c2663ca91299a19f68b1e7c17deaa586db339a073a7d0a5d`.
 - Added a fail-closed offline validator that reconciles the source, worklet
   block, protocol frame/parent, terminal, artifact-hash, runtime, and captured
   playback-schedule evidence.
@@ -1399,6 +1400,63 @@ Implemented in the working branch, but **not yet live-run or accepted**:
   strings, non-finite values, or numeric drift. Regression tests cover the
   actual API shape; no browser/model capture occurred during the failed attempt.
 
+## 2026-07-26: arm-scoped recorder epoch and wall-clock pacing
+
+The first runner invocation to reach live browser capture failed closed before
+the first source chunk. The Riva WebSocket reached `listening`, then the
+dashboard performed an orderly stop. A privacy-safe diagnostic classified the
+browser failure as the recorder code `noncontiguous_render_quantum`; no
+dashboard text, transcript, or audio content was written to automation logs.
+
+An isolated headless-Chrome AudioWorklet probe reproduced one deterministic
+startup-only discontinuity: the first 128-frame render quantum was followed
+by a 256-frame jump, after which the clock remained contiguous. The same jump
+occurred with the default output, the host ALSA null sink, disabled audio
+output, and a non-muted silent pull path. This established that the rejected
+frames belonged to Chrome worklet warm-up before source scheduling, not to
+ASR, NMT, TTS, WebSocket transport, or live evidence.
+
+The recorder lifecycle now separates processor readiness from evidence
+capture:
+
+- pre-arm worklet quanta emit no PCM and carry no continuity claim;
+- `arm_source_clock` starts the formal epoch on the next render quantum;
+- that first captured quantum must be at or before the scheduled source start;
+- all post-arm render quanta must remain exactly contiguous;
+- the worklet emits explicit zeros through an active destination path while
+  recording its two inputs internally; and
+- a post-arm gap, late capture start, invalid arm, or frame-limit breach stops
+  the processor and fails the run.
+
+The offline validator adds an independent clock-rate defense. The first and
+last source boundary receipts cover exactly 955,200 frames (59.7 seconds).
+Their monotonic client-time span must be within the inclusive 0.99x–1.01x
+envelope. Out-of-envelope evidence is `INVALID`, not a queue `FAIL`, because
+it cannot support real-time latency conclusions. Every intermediate boundary
+must also remain within 100 ms plus 1% of elapsed source time, and each
+chunk's relative timestamp and absolute `performance.now()` handoff must
+preserve one client-clock origin. This prevents a sink from running fast for
+part of the test and slow later merely to recover the correct final span.
+
+Focused validation completed:
+
+- the direct worklet harness excludes distinctive pre-arm PCM, accepts the
+  first safe post-arm quantum, and rejects post-arm gaps and late capture
+  starts;
+- the React hook resolves on readiness, waits for the arm-scoped capture
+  start, and independently rejects an epoch after source playback;
+- validator fixtures accept 0.99x and 1.01x, reject 0.98x and 1.02x, and
+  remain invariant to absolute `performance.now()` origin; and
+- a browser-native probe using the actual edited worklet completed with zero
+  recorder errors, ten source ticks, capture start before source start, and a
+  measured AudioContext/wall-time rate of approximately 1.0046x.
+
+Repository-wide validation also passed: frontend lint and production build,
+all 208 frontend tests, the `python -m pytest -q tests` suite (570 passed,
+one environment-specific skip), Python bytecode compilation,
+`git diff --check`, and the sanitized-text scan. The only scan matches were
+the Docker GPU resource key and deliberately fake `.invalid` test addresses.
+
 The claim boundary remains intentionally narrow. This gate measures
 rendered-digital graph output on one sample clock; it does not prove physical
 DAC output, acoustic audibility, translation quality, semantic phrase delay,
@@ -1406,8 +1464,8 @@ or audience-reaction alignment.
 
 Pending:
 
-- Commit the reviewed branch and restart the application from that clean
-  commit.
+- Merge the reviewed recorder/pacing fix and restart the application from that
+  clean commit.
 - Run the exact 60-second browser preflight in a secure localhost context.
 - Preserve the private four-file bundle, run
   `analyze_rendered_digital_preflight.py`, and review the first real

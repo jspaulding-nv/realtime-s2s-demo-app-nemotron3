@@ -5,9 +5,18 @@ import { useRenderedDigitalCapture } from '../hooks/useRenderedDigitalCapture';
 class MockPort {
   onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
   close = vi.fn();
-  postMessage = vi.fn((message: { type?: string }) => {
+  postMessage = vi.fn((message: {
+    type?: string;
+    sourceStartContextFrame?: number;
+  }) => {
     if (message.type === 'arm_source_clock') {
-      queueMicrotask(() => this.emit({ type: 'source_clock_armed' }));
+      queueMicrotask(() => {
+        this.emit({ type: 'source_clock_armed' });
+        this.emit({
+          type: 'started',
+          captureStartContextFrame: armCaptureStartContextFrame,
+        });
+      });
     } else if (message.type === 'stop') {
       queueMicrotask(() => emitStopFixture(this));
     }
@@ -24,6 +33,7 @@ let stopBlocks: Array<{
   frameCount: number;
   interleavedPcm16: Int16Array;
 }>;
+let armCaptureStartContextFrame: number;
 
 function emitStopFixture(port: MockPort) {
   for (const block of stopBlocks) {
@@ -41,8 +51,8 @@ class MockRecorderNode {
   port = new MockPort();
   connect = vi.fn(() => {
     queueMicrotask(() => this.port.emit({
-      type: 'started',
-      captureStartContextFrame: 64,
+      type: 'ready',
+      readyContextFrame: 0,
     }));
   });
   disconnect = vi.fn();
@@ -79,6 +89,7 @@ describe('useRenderedDigitalCapture', () => {
   let recorder: MockRecorderNode;
 
   beforeEach(() => {
+    armCaptureStartContextFrame = 64;
     stopBlocks = [{
       sequence: 0,
       startContextFrame: 64,
@@ -196,6 +207,63 @@ describe('useRenderedDigitalCapture', () => {
     expect(context.close).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects a capture epoch that begins after scheduled source playback', async () => {
+    armCaptureStartContextFrame = 8001;
+    const { result } = renderHook(() => useRenderedDigitalCapture());
+
+    await act(async () => {
+      await result.current.start();
+    });
+    await expect(act(async () => {
+      await result.current.armSourceClock({
+        sourceStartContextFrame: 8000,
+        sourceFrameCount: 960000,
+        sourceChunkFrames: 4800,
+      });
+    })).rejects.toThrow(/began after source playback/);
+  });
+
+  it('rejects a recorder capture start before the source clock is armed', async () => {
+    const { result } = renderHook(() => useRenderedDigitalCapture());
+
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => {
+      recorder.port.emit({
+        type: 'started',
+        captureStartContextFrame: 64,
+      });
+    });
+
+    expect(() => result.current.createPlaybackRouting(0)).toThrow(
+      /not ready for playback/,
+    );
+  });
+
+  it('propagates a post-arm render-quantum discontinuity', async () => {
+    const { result } = renderHook(() => useRenderedDigitalCapture());
+
+    await act(async () => {
+      await result.current.start();
+      await result.current.armSourceClock({
+        sourceStartContextFrame: 8000,
+        sourceFrameCount: 960000,
+        sourceChunkFrames: 4800,
+      });
+    });
+    act(() => {
+      recorder.port.emit({
+        type: 'capture_error',
+        code: 'noncontiguous_render_quantum',
+      });
+    });
+
+    await expect(act(async () => {
+      await result.current.stop();
+    })).rejects.toThrow(/noncontiguous_render_quantum/);
+  });
+
   it('rejects a gap in the worklet block ledger', async () => {
     stopBlocks = [
       {
@@ -214,6 +282,13 @@ describe('useRenderedDigitalCapture', () => {
     const { result } = renderHook(() => useRenderedDigitalCapture());
     await act(async () => {
       await result.current.start();
+    });
+    await act(async () => {
+      await result.current.armSourceClock({
+        sourceStartContextFrame: 8000,
+        sourceFrameCount: 960000,
+        sourceChunkFrames: 4800,
+      });
     });
 
     await expect(act(async () => {

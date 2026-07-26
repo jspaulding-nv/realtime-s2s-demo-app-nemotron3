@@ -30,6 +30,8 @@ class RenderedDigitalRecorderProcessor extends AudioWorkletProcessor {
     this.captureStartContextFrame = null;
     this.nextContextFrame = null;
     this.sourceClock = null;
+    this.readyReported = false;
+    this.captureArmed = false;
     this.recording = true;
 
     this.port.onmessage = (event) => {
@@ -55,12 +57,14 @@ class RenderedDigitalRecorderProcessor extends AudioWorkletProcessor {
     } = message;
     const invalid = (
       this.sourceClock !== null
+      || !this.readyReported
       || !requireSafeInteger(sourceStartContextFrame)
       || !requireSafeInteger(sourceFrameCount, 1)
       || !requireSafeInteger(sourceChunkFrames, 1)
       || sourceFrameCount % sourceChunkFrames !== 0
     );
     if (invalid) {
+      this.recording = false;
       this.port.postMessage({
         type: 'capture_error',
         code: 'invalid_source_clock',
@@ -74,6 +78,16 @@ class RenderedDigitalRecorderProcessor extends AudioWorkletProcessor {
       sourceChunkFrames,
       nextChunkIndex: 0,
     };
+    // Chrome may jump its AudioContext frame axis during the processor's
+    // silent startup. That warm-up is outside the evidence epoch. The first
+    // quantum after this arm establishes captureStartContextFrame; every
+    // subsequent quantum must remain exactly contiguous.
+    this.captureArmed = true;
+    this.captureStartContextFrame = null;
+    this.nextContextFrame = null;
+    this.pendingFrames = 0;
+    this.pendingStartContextFrame = null;
+    this.sequence = 0;
     this.port.postMessage({
       type: 'source_clock_armed',
       sourceStartContextFrame,
@@ -150,7 +164,35 @@ class RenderedDigitalRecorderProcessor extends AudioWorkletProcessor {
     const blockStartContextFrame = currentFrame;
     const blockEndContextFrame = blockStartContextFrame + frameCount;
 
+    // Keep a non-muted destination path alive, but never expose the monitored
+    // source or translated channels through this recorder output.
+    outputLeft?.fill(0);
+    outputRight?.fill(0);
+    if (!this.readyReported) {
+      this.readyReported = true;
+      this.port.postMessage({
+        type: 'ready',
+        readyContextFrame: blockStartContextFrame,
+      });
+    }
+    if (!this.captureArmed) return true;
+
     if (this.captureStartContextFrame === null) {
+      if (
+        blockStartContextFrame
+        > this.sourceClock.sourceStartContextFrame
+      ) {
+        this.recording = false;
+        this.port.postMessage({
+          type: 'capture_error',
+          code: 'capture_started_after_source',
+          sourceStartContextFrame: (
+            this.sourceClock.sourceStartContextFrame
+          ),
+          observedContextFrame: blockStartContextFrame,
+        });
+        return false;
+      }
       this.captureStartContextFrame = blockStartContextFrame;
       this.nextContextFrame = blockStartContextFrame;
       this.port.postMessage({
@@ -159,12 +201,15 @@ class RenderedDigitalRecorderProcessor extends AudioWorkletProcessor {
       });
     }
     if (this.nextContextFrame !== blockStartContextFrame) {
+      this.recording = false;
+      this.pendingFrames = 0;
       this.port.postMessage({
         type: 'capture_error',
         code: 'noncontiguous_render_quantum',
         expectedContextFrame: this.nextContextFrame,
         observedContextFrame: blockStartContextFrame,
       });
+      return false;
     }
     this.emitSourceBoundaries(blockStartContextFrame);
 
@@ -186,8 +231,6 @@ class RenderedDigitalRecorderProcessor extends AudioWorkletProcessor {
         );
         this.pending[pendingIndex] = quantizePcm16(sourceSample);
         this.pending[pendingIndex + 1] = quantizePcm16(translatedSample);
-        if (outputLeft) outputLeft[frameIndex] = sourceSample;
-        if (outputRight) outputRight[frameIndex] = translatedSample;
       }
       this.pendingFrames += take;
       offset += take;
