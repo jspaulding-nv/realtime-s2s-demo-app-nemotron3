@@ -1,11 +1,14 @@
 import asyncio
+import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import run_long_form_experiment as experiment
+from headless_playback_scheduler import HeadlessPlaybackScheduler
 
 
 def model_config():
@@ -125,6 +128,26 @@ def valid_audio_metadata_summary_fields():
         },
         "modelConfig": model_config(),
     }
+    scheduler = HeadlessPlaybackScheduler()
+    scheduler.accept(
+        SimpleNamespace(
+            arrival_seconds=1.5,
+            audio_bytes=3_200,
+            protocol_version=1,
+            stream_generation=1,
+            parent_sequence_id=0,
+            audio_frame_id=0,
+            sample_rate_hz=16_000,
+            channels=1,
+            bytes_per_sample=2,
+            source_start_ms=None,
+            source_end_ms=1_000.0,
+        )
+    )
+    headless_report = scheduler.finalize(
+        input_end_seconds=3.0,
+        input_sample_zero_seconds=0.0,
+    )
     return {
         "audio_path": "test_audio/long-form-01.mp3",
         "backend_url": "http://localhost:8000",
@@ -220,6 +243,7 @@ def valid_audio_metadata_summary_fields():
             "playback_behavior_changed": False,
             "contains_transcript_or_translation_text": False,
         },
+        "headless_playback": headless_report,
     }
 
 
@@ -234,6 +258,82 @@ def write_valid_csv(path: Path, *, sent=10, received_bytes=(32_000, 32_000)):
         for index, audio_bytes in enumerate(received_bytes)
     )
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def write_valid_protocol_v1_csv(path: Path):
+    header = [
+        "source",
+        "stage",
+        "timestamp_ms",
+        "chunk_index",
+        "source_position_sec",
+        "audio_bytes",
+        "protocol_version",
+        "stream_generation",
+        "parent_sequence_id",
+        "audio_frame_id",
+        "source_start_ms",
+        "source_end_ms",
+        "source_end_to_receipt_ms",
+    ]
+    rows = [
+        [
+            "client",
+            "chunk_sent",
+            str((index + 1) * 300),
+            str(index),
+            f"{index * 0.3:.3f}",
+            "9600",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+        for index in range(10)
+    ]
+    rows.append(
+        [
+            "client",
+            "audio_received",
+            "1500.00",
+            "0",
+            "0.100",
+            "3200",
+            "1",
+            "1",
+            "0",
+            "0",
+            "",
+            "1000.000",
+            "500.000",
+        ]
+    )
+    path.write_text(
+        "\n".join(
+            ",".join(row)
+            for row in ([header] + rows)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def mutate_protocol_receive_row(path: Path, **updates):
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    receive = next(
+        row for row in rows if row["stage"] == "audio_received"
+    )
+    receive.update({key: str(value) for key, value in updates.items()})
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def test_build_manifest_orders_three_samples_per_repeat(tmp_path):
@@ -592,7 +692,7 @@ def test_v1_artifact_resume_replays_pacing_evidence_against_csv(tmp_path):
     csv_path = tmp_path / "capture_results.csv"
     summary_path = tmp_path / "capture_summary.json"
     plot_path = tmp_path / "capture_latency.png"
-    write_valid_csv(csv_path, received_bytes=(3_200,))
+    write_valid_protocol_v1_csv(csv_path)
     write_valid_summary(
         summary_path,
         **valid_audio_metadata_summary_fields(),
@@ -618,7 +718,7 @@ def test_v1_artifact_resume_replays_pacing_evidence_against_csv(tmp_path):
     assert valid is False
     assert "early chunk emission" in reason
 
-    write_valid_csv(csv_path, received_bytes=(3_200,))
+    write_valid_protocol_v1_csv(csv_path)
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     payload["input_pacing"]["max_emission_minus_deadline_ms"] = 1.0
     summary_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -630,6 +730,153 @@ def test_v1_artifact_resume_replays_pacing_evidence_against_csv(tmp_path):
     )
     assert valid is False
     assert "do not match the client event ledger" in reason
+
+
+def test_v1_artifact_replays_saved_headless_report_against_csv(tmp_path):
+    csv_path = tmp_path / "capture_results.csv"
+    summary_path = tmp_path / "capture_summary.json"
+    plot_path = tmp_path / "capture_latency.png"
+    write_valid_protocol_v1_csv(csv_path)
+    write_valid_summary(
+        summary_path,
+        **valid_audio_metadata_summary_fields(),
+    )
+    plot_path.write_bytes(b"plot")
+
+    # This remains a well-formed report and a self-consistent CSV row, but the
+    # saved report can no longer have been derived from the promoted CSV.
+    mutate_protocol_receive_row(
+        csv_path,
+        timestamp_ms="1600.00",
+        source_end_to_receipt_ms="600.000",
+    )
+    valid, reason = experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert "headless playback replay value mismatch" in reason
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "reason_fragment"),
+    [
+        (
+            "stream_generation",
+            "2",
+            "headless playback replay value mismatch",
+        ),
+        (
+            "parent_sequence_id",
+            "1",
+            "parent_sequence_id must be contiguous",
+        ),
+        (
+            "audio_frame_id",
+            "1",
+            "each parent must start",
+        ),
+    ],
+)
+def test_v1_artifact_replay_requires_generation_parent_and_frame_order(
+    tmp_path,
+    field_name,
+    value,
+    reason_fragment,
+):
+    csv_path = tmp_path / "capture_results.csv"
+    summary_path = tmp_path / "capture_summary.json"
+    plot_path = tmp_path / "capture_latency.png"
+    write_valid_protocol_v1_csv(csv_path)
+    write_valid_summary(
+        summary_path,
+        **valid_audio_metadata_summary_fields(),
+    )
+    plot_path.write_bytes(b"plot")
+    mutate_protocol_receive_row(csv_path, **{field_name: value})
+
+    valid, reason = experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert reason_fragment in reason
+
+
+def test_v1_artifact_replay_rejects_source_start_without_end(tmp_path):
+    csv_path = tmp_path / "capture_results.csv"
+    summary_path = tmp_path / "capture_summary.json"
+    plot_path = tmp_path / "capture_latency.png"
+    write_valid_protocol_v1_csv(csv_path)
+    write_valid_summary(
+        summary_path,
+        **valid_audio_metadata_summary_fields(),
+    )
+    plot_path.write_bytes(b"plot")
+    mutate_protocol_receive_row(
+        csv_path,
+        source_start_ms="1.000",
+        source_end_ms="",
+        source_end_to_receipt_ms="",
+    )
+
+    valid, reason = experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert "source_start_ms requires source_end_ms" in reason
+
+
+def test_v1_artifact_replay_rejects_timestamp_mutation(tmp_path):
+    csv_path = tmp_path / "capture_results.csv"
+    summary_path = tmp_path / "capture_summary.json"
+    plot_path = tmp_path / "capture_latency.png"
+    write_valid_protocol_v1_csv(csv_path)
+    write_valid_summary(
+        summary_path,
+        **valid_audio_metadata_summary_fields(),
+    )
+    plot_path.write_bytes(b"plot")
+    mutate_protocol_receive_row(
+        csv_path,
+        timestamp_ms="1500.005",
+        source_end_to_receipt_ms="500.005",
+    )
+
+    valid, reason = experiment.validate_artifact_set(
+        csv_path,
+        summary_path,
+        plot_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert "headless playback replay value mismatch" in reason
+
+
+def test_v1_summary_rejects_unknown_headless_report_payload_field(tmp_path):
+    summary_path = tmp_path / "capture_summary.json"
+    fields = valid_audio_metadata_summary_fields()
+    fields["headless_playback"]["transcript"] = "must not be accepted"
+    write_valid_summary(summary_path, **fields)
+
+    valid, reason = experiment.validate_summary(
+        summary_path,
+        expected_audio_metadata_protocol_version=1,
+    )
+
+    assert valid is False
+    assert "unknown transcript" in reason
 
 
 def test_capture_one_propagates_v1_to_batch_runner(monkeypatch, tmp_path):
@@ -744,12 +991,13 @@ def test_candidate_sla_miss_is_reported_without_operational_failure():
     analysis = {
         "traces": [
             {
-                "adaptive": {
-                    "arrival_queue_p95_seconds": 12.0,
-                    "time_weighted_queue_p95_seconds": 12.0,
-                    "percent_playback_window_above_limit": 4.0,
-                    "chunks_dropped": 0,
-                }
+                    "adaptive": {
+                        "arrival_queue_p95_seconds": 12.0,
+                        "time_weighted_queue_p95_seconds": 12.0,
+                        "peak_queue_depth_seconds": 14.0,
+                        "percent_playback_window_above_limit": 4.0,
+                        "chunks_dropped": 0,
+                    }
             }
         ]
     }

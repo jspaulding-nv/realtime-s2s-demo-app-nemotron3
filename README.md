@@ -1,8 +1,16 @@
 # Real-Time Speech-to-Speech Translation with Nemotron 3
 
-A web-based real-time speech translation application using NVIDIA Riva services. Captures English audio from your microphone, translates it, and plays back synthesized speech in the target language.
+A real-time speech translation application and browser-independent evaluation
+harness using NVIDIA Riva services. It accepts English audio, translates it,
+and returns synthesized speech in the target language; the React browser UI is
+an optional demonstration client.
 
-This repository preserves [@jgough-essextec's original demo](https://github.com/jgough-essextec/realtime-s2s-demo-app) and adds the Riva evaluation configuration for English-to-Spanish long-form speech. It uses Nemotron 3 streaming ASR in place of Parakeet CTC, pins all three NIM releases, measures listener backlog for sample-length tests, and includes an experimental adaptive playback controller that preserves every translated audio chunk while trying to keep the browser queue near 5-10 seconds.
+This repository preserves [@jgough-essextec's original demo](https://github.com/jgough-essextec/realtime-s2s-demo-app) and adds the Riva evaluation configuration for English-to-Spanish long-form speech. It uses Nemotron 3 streaming ASR in place of Parakeet CTC, pins all three NIM releases, measures listener backlog for sample-length tests, and includes an experimental adaptive playback controller that preserves every translated audio chunk while trying to keep the listener queue near 5-10 seconds.
+
+For deployment qualification, use the
+[browser-independent real-time S2S gate](docs/HEADLESS_REALTIME_GATE.md).
+Chrome, Vite, and Web Audio are optional demonstration or rendered-digital
+diagnostic components, not requirements for the primary service gate.
 
 GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains the sanitized upstream history as a standalone repository and records that project as the upstream source.
 
@@ -51,8 +59,9 @@ See the [sanitization policy](docs/SANITIZATION.md) and
   clock, then validates continuity and a 5-second-p95/10-second-peak queue gate
 - Pinned, single-GPU Docker Compose deployment for ASR, NMT, and TTS
 
-The safe default browser path still uses the monolithic Riva S2S operation.
-Set `S2S_PIPELINE_MODE=staged` and restart FastAPI to route the same WebSocket
+The interactive browser path defaults to the monolithic Riva S2S operation.
+The browser-independent evaluation gate explicitly sets
+`S2S_PIPELINE_MODE=staged` and restarts FastAPI to route the same WebSocket
 protocol through the direct bounded pipeline. The staged path has completed a
 clean, preflight-gated real-time matrix over all three long-form samples:
 2,027/2,027 ordered segments, three recovered NMT retries, no TTS retries, no
@@ -92,6 +101,10 @@ measurements remain later evidence tiers.
 
 ## Architecture
 
+The WebSocket/FastAPI/Riva path is the deployment boundary exercised by the
+headless Python gate. The React client below is one optional consumer of that
+interface.
+
 ```
 ┌─────────────────────┐     WebSocket      ┌─────────────────────┐     gRPC      ┌─────────────────┐
 │   React Frontend    │◄──────────────────►│   FastAPI Backend   │◄────────────►│   NVIDIA Riva   │
@@ -120,6 +133,7 @@ realtime-s2s-demo-app/
 ├── NEMOTRON_TEST_RESULTS.md
 ├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
+│   ├── HEADLESS_REALTIME_GATE.md
 │   ├── RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md
 │   └── SANITIZATION.md     # Public-data and evidence policy
 ├── backend/
@@ -278,7 +292,7 @@ See [the staged WebSocket integration guide](docs/STAGED_WEBSOCKET_INTEGRATION.m
 for the terminal-aware one-minute gate, retained telemetry, rollback, and
 full-sample promotion order.
 
-### 3. Start the web application
+### 3. Optional: start the web demonstration
 
 ```bash
 ./start.sh
@@ -294,11 +308,11 @@ This will:
 development server is not valid provenance for the formal rendered-digital
 preflight below.
 
-### 4. Open the Web UI
+### 4. Optional: open the Web UI
 
 Navigate to http://localhost:5173 in your browser.
 
-### 5. Use the Application
+### 5. Optional: use the Web UI
 
 1. Click the microphone button to start
 2. Speak English into your microphone
@@ -549,6 +563,12 @@ use the schema-3 incremental backend and add:
 python run_long_form_experiment.py --audio-metadata-protocol-v1
 ```
 
+This Python WebSocket path is the primary browser-independent real-time gate.
+It does not start or require Chrome, Vite, Web Audio, a microphone, or an
+output sound device. See the
+[headless gate runbook](docs/HEADLESS_REALTIME_GATE.md) for the staged
+protocol-v1 environment, readiness checks, metrics, and claim boundaries.
+
 The harness performs its health checks and one-minute preflight, then streams
 Sample 01, Sample 02, and Sample 03 sequentially at real-time pace. Use a dry run to
 validate the plan without calling the backend, request repeated live traces, or
@@ -676,11 +696,13 @@ Each live translated-audio arrival trace is replayed through both the fixed
 1.00x and adaptive 1.00x/1.05x/1.10x policies. This is a matched comparison:
 both policies see identical audio bytes and arrival timing, so playback policy
 is the only difference and a second Riva inference run is unnecessary. The
-result is still a deterministic Python simulation of browser scheduling. It is
-not an actual browser/Web Audio run, a native-Spanish-listener quality result,
+result is a deterministic Python simulation of the registered listener
+schedule. It is not executed DAC/acoustic playback, a native-Spanish-listener
+quality result,
 or a measurement of semantic delay from an English joke to its Spanish
-punchline. Those validations remain separate manual or browser-instrumented
-experiments.
+punchline. Those validations remain separate listening, marker-alignment, or
+common-clock rendering experiments; none requires Chrome as the deployed
+client.
 
 Candidate queue p95 is the exact time-weighted p95 over the simulated playback
 window, not a percentile sampled only at chunk arrivals. The reports also show
@@ -695,7 +717,7 @@ source fixtures are the explicit exception described in
 
 For a live audience, the remaining listener-visible delay matters more than server flush time. Spanish synthesized audio was still longer than the source in these runs, so this implementation experiments with a 5-second catch-up target, an 8-second urgent threshold, and a 10-second soft ceiling. It schedules output at 1.00x, 1.05x, or 1.10x and never drops speech.
 
-The 10-second value is an audience-experience objective, not a guaranteed hard cap. If translated audio is generated faster than 1.10x playback can consume it, the queue can still exceed that value. Browser queue depth also excludes the upstream time spent waiting for ASR finalization, translation, and the first TTS audio; therefore it does not by itself equal the delay between an English joke and its Spanish rendering.
+The 10-second value is an audience-experience objective, not a guaranteed hard cap. If translated audio is generated faster than 1.10x playback can consume it, the queue can still exceed that value. Playback-queue depth also excludes the upstream time spent waiting for ASR finalization, translation, and the first TTS audio; therefore it does not by itself equal the delay between an English joke and its Spanish rendering.
 
 A deterministic replay of the three saved Nemotron arrival traces reduced the combined fixed-rate listener tail by 82.3%, from 471.803 seconds to 83.654 seconds. It did not satisfy the queue objective: simulated peaks remained 23.8-53.1 seconds. These are offline policy projections, not new live Riva/browser runs or listening-quality results. Reproduce them when the ignored raw CSVs are present:
 

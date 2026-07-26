@@ -24,8 +24,10 @@ source. A later standalone Sample 02 canary from recovery commit `55b59bd`
 also passed with 805 ordered segments and three validated NMT recoveries, but
 its fixed listener tail was 239.156 seconds. The later clean staged matrix
 completed all three samples with 2,027/2,027 ordered segments, but adaptive
-queue p95 remained 23-61 seconds. Browser Web Audio validation,
-marked-phrase/punchline timing, and native-listener quality remain open.
+queue p95 remained 23-61 seconds. Browser-independent scheduled-digital
+validation, marked-phrase/punchline timing, and native-listener quality remain
+open. Browser Web Audio is an optional renderer-specific cross-check, not a
+deployment requirement.
 
 The monolithic endpoint still connects to remote ASR and TTS services without
 application-owned stage boundaries. Staged mode makes punctuation,
@@ -46,7 +48,7 @@ arrival patterns.
 - Overlap NMT and TTS work through bounded queues.
 - Preserve source order and every utterance.
 - Expose per-stage queue and processing latency.
-- Feed ordered PCM to the adaptive browser queue.
+- Feed ordered PCM to an adaptive listener queue.
 - Treat a 10-second listener queue as a soft/SLA ceiling, never as permission
   to drop speech.
 
@@ -373,9 +375,10 @@ offset measurement.
 10. **Completed:** after the VM restart, relaunch FastAPI, pass a fresh
     preflight, and run a clean three-sample comparison matrix with identical
     models, input, EOU, and playback policy.
-11. Cross-check scheduling in browser Web Audio and measure marked-phrase or
-    punchline delay; the matrix's 228.357-second fixed Sample 02 tail and
-    38.158-second adaptive queue p95 leave this audience gate open.
+11. Run the browser-independent scheduled-digital gate and measure
+    marked-phrase or punchline delay; optionally cross-check the selected
+    renderer on a common clock. The matrix's 228.357-second fixed Sample 02
+    tail and 38.158-second adaptive queue p95 leave this audience gate open.
 12. Increase workers only if stage telemetry justifies it.
 
 ## Validation gates
@@ -386,11 +389,11 @@ offset measurement.
   record.
 - Every successful NMT recovery retains its original identity/provenance,
   reports one retry, and passes target validation before TTS.
-- End-of-input drains every stage and the browser without a fixed arbitrary
-  sleep.
+- End-of-input drains every stage and the listener schedule without a fixed
+  arbitrary sleep.
 - Queue bounds hold under injected slow-NMT and slow-TTS tests.
 - The application exposes overload instead of dropping speech.
-- Stage timing explains the difference between semantic delay and browser
+- Stage timing explains the difference between semantic delay and listener
   queue depth.
 - The first full staged operational canary completes with consecutive output
   IDs and one natural terminal. Sample 03 attempt 3 passed this gate.

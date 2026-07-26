@@ -233,8 +233,136 @@ def test_run_test_negotiates_and_captures_observation_metadata(monkeypatch):
         - result.input_sample_zero_timestamp_ms
         - pcm_event["sourceEndMs"]
     )
+    assert result.headless_playback_report["capture"][
+        "canonical_replay_verified"
+    ] is True
+    assert result.headless_playback_report["capture"][
+        "frames_scheduled"
+    ] == 1
+    assert result.headless_playback_report["queue_gate"][
+        "all_frames_preserved_once_in_order"
+    ] is True
     assert validate_audio_metadata_observation(result) == []
     assert validate_capture_result(result) == []
+
+
+def test_validated_audio_frame_sink_receives_only_paired_metadata(monkeypatch):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    observed = []
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            audio_frame_sink=observed.append,
+        )
+    )
+
+    assert result.translation_completed is True
+    assert len(observed) == 1
+    frame = observed[0]
+    assert frame.audio_bytes == 3200
+    assert frame.protocol_version == 1
+    assert frame.stream_generation == 1
+    assert frame.parent_sequence_id == 0
+    assert frame.audio_frame_id == 0
+    assert frame.sample_rate_hz == 16000
+    assert frame.channels == 1
+    assert frame.bytes_per_sample == 2
+    assert frame.source_start_ms is None
+    assert frame.source_end_ms == 10.0
+    assert frame.arrival_seconds >= 0
+    assert not hasattr(frame, "pcm")
+    assert not hasattr(frame, "text")
+
+
+def test_validated_audio_frame_sink_requires_protocol_v1(monkeypatch):
+    websocket = FakeWebSocket(legacy=True)
+    install_run_fakes(monkeypatch, websocket)
+
+    with pytest.raises(
+        ValueError,
+        match="audio_frame_sink requires audio metadata protocol version 1",
+    ):
+        asyncio.run(
+            run_test(
+                "synthetic.wav",
+                "http://backend",
+                audio_frame_sink=lambda _frame: None,
+            )
+        )
+
+
+def test_invalid_binary_never_reaches_validated_audio_frame_sink(monkeypatch):
+    websocket = FakeWebSocket(wrong_binary_size=True)
+    install_run_fakes(monkeypatch, websocket)
+    observed = []
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            audio_frame_sink=observed.append,
+        )
+    )
+
+    assert observed == []
+    assert result.translation_completed is False
+    assert result.server_error.startswith(
+        "audio metadata protocol violation:"
+    )
+
+
+def test_validated_audio_frame_sink_failure_aborts_capture_safely(monkeypatch):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+
+    def fail_sink(_frame):
+        raise RuntimeError("private details must not be copied")
+
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+            audio_frame_sink=fail_sink,
+        )
+    )
+
+    assert result.translation_completed is False
+    assert result.server_error == (
+        "validated audio frame sink failed: RuntimeError"
+    )
+    assert "private details" not in result.server_error
+
+
+def test_capture_validation_requires_reconciled_headless_report(monkeypatch):
+    websocket = FakeWebSocket()
+    install_run_fakes(monkeypatch, websocket)
+    result = asyncio.run(
+        run_test(
+            "synthetic.wav",
+            "http://backend",
+            audio_metadata_protocol_version=1,
+        )
+    )
+
+    valid_report = result.headless_playback_report
+    result.headless_playback_report = None
+    assert (
+        "audio metadata capture requires a headless playback report"
+        in validate_capture_result(result)
+    )
+
+    result.headless_playback_report = valid_report
+    result.headless_playback_report["capture"]["frames_scheduled"] = 2
+    assert (
+        "headless playback scheduled-frame count does not match "
+        "translated responses"
+    ) in validate_capture_result(result)
 
 
 def test_protocol_v1_validation_rejects_missing_or_wrong_input_pacing(

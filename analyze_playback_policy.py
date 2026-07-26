@@ -10,13 +10,16 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any, Sequence
 
 from playback_simulation import (
     DEFAULT_PLAYBACK_POLICY,
     AudioChunk,
     PlaybackPolicy,
+    PlaybackSimulation,
     PlaybackSummary,
+    ScheduledChunk,
     simulate_playback,
 )
 
@@ -25,6 +28,11 @@ SAMPLE_RATE = 16_000
 BYTES_PER_SAMPLE = 2
 CAPACITY_LIMIT_SECONDS = 10.0
 BURST_WINDOWS_SECONDS = (30, 60, 300)
+# Retained legacy captures formatted arrival timestamps to 0.01 ms and
+# source/receipt offsets to 0.001 ms. Their independent half-unit rounding
+# errors can sum to 0.006 ms; new captures use exact round-trip floats, while
+# this analyzer tolerance preserves validation of those older trace artifacts.
+CSV_TIMING_SERIALIZATION_EPSILON_MS = 0.006001
 REQUIRED_COLUMNS = {
     "source",
     "stage",
@@ -35,6 +43,19 @@ REQUIRED_COLUMNS = {
 
 
 @dataclass(frozen=True)
+class AudioFrameAttribution:
+    """Protocol-v1 source attribution for one translated-audio frame."""
+
+    protocol_version: int | None
+    stream_generation: int | None
+    parent_sequence_id: int | None
+    audio_frame_id: int | None
+    source_start_ms: float | None
+    source_end_ms: float | None
+    source_end_to_receipt_ms: float | None
+
+
+@dataclass(frozen=True)
 class PlaybackTrace:
     path: Path
     input_end_seconds: float
@@ -42,6 +63,254 @@ class PlaybackTrace:
     legacy_last_chunk_start_seconds: float | None
     chunks: tuple[AudioChunk, ...]
     sha256: str
+    frame_attributions: tuple[AudioFrameAttribution, ...] = ()
+    audio_metadata_protocol_version: int | None = None
+    audio_metadata_stream_generation: int | None = None
+
+
+def _optional_csv_int(
+    row: dict[str, str],
+    field_name: str,
+    *,
+    path: Path,
+    row_number: int,
+) -> int | None:
+    raw_value = row.get(field_name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{path}:{row_number}: {field_name} must be an integer"
+        ) from exc
+    if value < 0:
+        raise ValueError(
+            f"{path}:{row_number}: {field_name} must be non-negative"
+        )
+    return value
+
+
+def _optional_csv_float(
+    row: dict[str, str],
+    field_name: str,
+    *,
+    path: Path,
+    row_number: int,
+    non_negative: bool,
+) -> float | None:
+    raw_value = row.get(field_name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{path}:{row_number}: {field_name} must be a number"
+        ) from exc
+    if not math.isfinite(value) or (non_negative and value < 0):
+        qualifier = "finite and non-negative" if non_negative else "finite"
+        raise ValueError(
+            f"{path}:{row_number}: {field_name} must be {qualifier}"
+        )
+    return value
+
+
+def _load_audio_frame_attribution(
+    row: dict[str, str],
+    *,
+    path: Path,
+    row_number: int,
+) -> AudioFrameAttribution:
+    protocol_version = _optional_csv_int(
+        row,
+        "protocol_version",
+        path=path,
+        row_number=row_number,
+    )
+    stream_generation = _optional_csv_int(
+        row,
+        "stream_generation",
+        path=path,
+        row_number=row_number,
+    )
+    parent_sequence_id = _optional_csv_int(
+        row,
+        "parent_sequence_id",
+        path=path,
+        row_number=row_number,
+    )
+    audio_frame_id = _optional_csv_int(
+        row,
+        "audio_frame_id",
+        path=path,
+        row_number=row_number,
+    )
+    address_values = (
+        protocol_version,
+        stream_generation,
+        parent_sequence_id,
+        audio_frame_id,
+    )
+    if any(value is None for value in address_values) and any(
+        value is not None for value in address_values
+    ):
+        raise ValueError(
+            f"{path}:{row_number}: protocol_version, stream_generation, "
+            "parent_sequence_id, and audio_frame_id must either all be "
+            "present or all be absent"
+        )
+    source_start_ms = _optional_csv_float(
+        row,
+        "source_start_ms",
+        path=path,
+        row_number=row_number,
+        non_negative=True,
+    )
+    source_end_ms = _optional_csv_float(
+        row,
+        "source_end_ms",
+        path=path,
+        row_number=row_number,
+        non_negative=True,
+    )
+    if (
+        source_start_ms is not None
+        and source_end_ms is not None
+        and source_end_ms < source_start_ms
+    ):
+        raise ValueError(
+            f"{path}:{row_number}: source_end_ms cannot precede "
+            "source_start_ms"
+        )
+    source_end_to_receipt_ms = _optional_csv_float(
+        row,
+        "source_end_to_receipt_ms",
+        path=path,
+        row_number=row_number,
+        non_negative=False,
+    )
+    if protocol_version is None and any(
+        value is not None
+        for value in (
+            source_start_ms,
+            source_end_ms,
+            source_end_to_receipt_ms,
+        )
+    ):
+        raise ValueError(
+            f"{path}:{row_number}: source timing metadata requires complete "
+            "protocol-v1 frame metadata"
+        )
+    if source_start_ms is not None and source_end_ms is None:
+        raise ValueError(
+            f"{path}:{row_number}: source_start_ms requires source_end_ms"
+        )
+    if (source_end_ms is None) != (source_end_to_receipt_ms is None):
+        raise ValueError(
+            f"{path}:{row_number}: source_end_ms and "
+            "source_end_to_receipt_ms must either both be present or both "
+            "be absent"
+        )
+    return AudioFrameAttribution(
+        protocol_version=protocol_version,
+        stream_generation=stream_generation,
+        parent_sequence_id=parent_sequence_id,
+        audio_frame_id=audio_frame_id,
+        source_start_ms=source_start_ms,
+        source_end_ms=source_end_ms,
+        source_end_to_receipt_ms=source_end_to_receipt_ms,
+    )
+
+
+def _validate_audio_frame_attributions(
+    attributions: Sequence[AudioFrameAttribution],
+    *,
+    path: Path,
+) -> tuple[int | None, int | None]:
+    """Validate one ordered CSV receive stream as legacy or protocol-v1."""
+
+    attributed = [
+        attribution.protocol_version is not None
+        for attribution in attributions
+    ]
+    if any(attributed) and not all(attributed):
+        raise ValueError(
+            f"{path}: every client audio_received row must either carry "
+            "complete protocol-v1 metadata or every row must omit it"
+        )
+    if not any(attributed):
+        return None, None
+
+    protocol_version = attributions[0].protocol_version
+    stream_generation = attributions[0].stream_generation
+    if protocol_version != 1:
+        raise ValueError(f"{path}: protocol_version must equal 1")
+    if stream_generation is None or stream_generation <= 0:
+        raise ValueError(
+            f"{path}: stream_generation must be a positive integer"
+        )
+
+    active_parent = -1
+    expected_frame = 0
+    active_source_range: tuple[float | None, float | None] | None = None
+    for attribution in attributions:
+        if attribution.protocol_version != protocol_version:
+            raise ValueError(
+                f"{path}: protocol_version changed within one trace"
+            )
+        if attribution.stream_generation != stream_generation:
+            raise ValueError(
+                f"{path}: stream_generation changed within one trace"
+            )
+        parent_sequence_id = attribution.parent_sequence_id
+        audio_frame_id = attribution.audio_frame_id
+        if parent_sequence_id is None or audio_frame_id is None:
+            raise RuntimeError(
+                "complete protocol-v1 attribution unexpectedly became absent"
+            )
+
+        if parent_sequence_id == active_parent:
+            if audio_frame_id != expected_frame:
+                raise ValueError(
+                    f"{path}: parent {parent_sequence_id} audio_frame_id "
+                    f"must be contiguous from 0; expected {expected_frame}, "
+                    f"received {audio_frame_id}"
+                )
+        elif parent_sequence_id == active_parent + 1:
+            if audio_frame_id != 0:
+                raise ValueError(
+                    f"{path}: parent {parent_sequence_id} audio_frame_id "
+                    "must start at 0"
+                )
+            active_parent = parent_sequence_id
+            expected_frame = 0
+            active_source_range = None
+        elif parent_sequence_id <= active_parent:
+            raise ValueError(
+                f"{path}: parent {parent_sequence_id} re-entered after a "
+                "later parent began"
+            )
+        else:
+            raise ValueError(
+                f"{path}: parent_sequence_id must be contiguous from 0; "
+                f"expected {active_parent + 1}, received {parent_sequence_id}"
+            )
+
+        source_range = (
+            attribution.source_start_ms,
+            attribution.source_end_ms,
+        )
+        if active_source_range is None:
+            active_source_range = source_range
+        elif source_range != active_source_range:
+            raise ValueError(
+                f"{path}: parent {parent_sequence_id} has inconsistent "
+                "source ranges"
+            )
+        expected_frame = audio_frame_id + 1
+
+    return protocol_version, stream_generation
 
 
 def load_event_trace(
@@ -60,7 +329,9 @@ def load_event_trace(
         for block in iter(lambda: binary_handle.read(1024 * 1024), b""):
             hasher.update(block)
     digest = hasher.hexdigest()
-    received: list[tuple[float, int, AudioChunk]] = []
+    received: list[
+        tuple[float, int, AudioChunk, AudioFrameAttribution]
+    ] = []
     last_chunk_sent_seconds: float | None = None
     last_chunk_end_seconds: float | None = None
     explicit_input_end_seconds: float | None = None
@@ -125,6 +396,11 @@ def load_event_trace(
                             audio_bytes=audio_bytes,
                             source_index=chunk_index,
                         ),
+                        _load_audio_frame_attribution(
+                            row,
+                            path=path,
+                            row_number=row_number,
+                        ),
                     )
                 )
 
@@ -142,13 +418,26 @@ def load_event_trace(
         raise ValueError(f"{path}: no client audio_received events found")
 
     received.sort(key=lambda item: (item[0], item[1]))
+    frame_attributions = tuple(item[3] for item in received)
+    (
+        audio_metadata_protocol_version,
+        audio_metadata_stream_generation,
+    ) = _validate_audio_frame_attributions(
+        frame_attributions,
+        path=path,
+    )
     return PlaybackTrace(
         path=path,
         input_end_seconds=input_end_seconds,
         input_boundary_source=input_boundary_source,
         legacy_last_chunk_start_seconds=legacy_last_chunk_start_seconds,
         chunks=tuple(item[2] for item in received),
+        frame_attributions=frame_attributions,
         sha256=digest,
+        audio_metadata_protocol_version=(
+            audio_metadata_protocol_version
+        ),
+        audio_metadata_stream_generation=audio_metadata_stream_generation,
     )
 
 
@@ -164,6 +453,319 @@ def _round_floats(value: Any, digits: int = 6) -> Any:
 
 def _compact_summary(summary: PlaybackSummary) -> dict[str, Any]:
     return _round_floats(asdict(summary))
+
+
+def _distribution(values: Sequence[float]) -> dict[str, Any]:
+    """Return a compact nearest-rank distribution without inventing zeros."""
+
+    if not values:
+        return {
+            "count": 0,
+            "p50": None,
+            "p95": None,
+            "max": None,
+        }
+    return {
+        "count": len(values),
+        "p50": _nearest_rank(values, 0.50),
+        "p95": _nearest_rank(values, 0.95),
+        "max": max(values),
+    }
+
+
+def _quartile_drift(
+    ordered_values: Sequence[float],
+) -> dict[str, Any]:
+    """Compare final- and first-quartile medians in source-frontier order."""
+
+    sample_count = len(ordered_values)
+    sufficient = sample_count >= 4
+    if not sufficient:
+        return {
+            "count": sample_count,
+            "minimum_count_required": 4,
+            "sufficient_sample_count": False,
+            "quartile_count": 0,
+            "first_quartile_median_seconds": None,
+            "final_quartile_median_seconds": None,
+            "final_minus_first_seconds": None,
+        }
+    quartile_count = math.ceil(sample_count / 4)
+    first_median = median(ordered_values[:quartile_count])
+    final_median = median(ordered_values[-quartile_count:])
+    return {
+        "count": sample_count,
+        "minimum_count_required": 4,
+        "sufficient_sample_count": True,
+        "quartile_count": quartile_count,
+        "first_quartile_median_seconds": first_median,
+        "final_quartile_median_seconds": final_median,
+        "final_minus_first_seconds": final_median - first_median,
+    }
+
+
+def _source_frontier_metrics(
+    trace: PlaybackTrace,
+    simulation: PlaybackSimulation,
+) -> dict[str, Any]:
+    """Project parent source ends onto deterministic scheduled playback.
+
+    For each protocol-v1 parent, the first frame supplies the scheduled-start
+    projection and the last frame supplies the scheduled-end projection.
+    ``source_end_to_receipt_ms`` and all scheduling offsets share the capture
+    client's monotonic clock domain.
+    """
+
+    frame_attributions = trace.frame_attributions
+    if not frame_attributions:
+        frame_attributions = tuple(
+            AudioFrameAttribution(
+                protocol_version=None,
+                stream_generation=None,
+                parent_sequence_id=None,
+                audio_frame_id=None,
+                source_start_ms=None,
+                source_end_ms=None,
+                source_end_to_receipt_ms=None,
+            )
+            for _ in trace.chunks
+        )
+    if len(frame_attributions) != len(trace.chunks):
+        raise ValueError(
+            f"{trace.path}: audio attribution count does not match chunk count"
+        )
+    if len(simulation.schedule) != len(trace.chunks):
+        raise ValueError(
+            f"{trace.path}: scheduled chunk count does not match trace"
+        )
+
+    parent_frames: dict[
+        int,
+        list[
+            tuple[
+                AudioFrameAttribution,
+                AudioChunk,
+                ScheduledChunk,
+            ]
+        ],
+    ] = {}
+    attributed_frame_count = 0
+    for attribution, chunk, scheduled in zip(
+        frame_attributions,
+        trace.chunks,
+        simulation.schedule,
+        strict=True,
+    ):
+        if attribution.parent_sequence_id is None:
+            continue
+        attributed_frame_count += 1
+        parent_frames.setdefault(
+            attribution.parent_sequence_id, []
+        ).append((attribution, chunk, scheduled))
+
+    start_records: list[tuple[float, int, float]] = []
+    end_records: list[tuple[float, int, float]] = []
+    bounded_start_records: list[tuple[float, int, float]] = []
+    bounded_end_records: list[tuple[float, int, float]] = []
+    semantic_proxy_eligible_parent_count = 0
+    frame_addressable_parent_count = 0
+
+    for parent_sequence_id, frames in parent_frames.items():
+        frame_ids = [
+            attribution.audio_frame_id
+            for attribution, _, _ in frames
+        ]
+        if any(frame_id is None for frame_id in frame_ids):
+            continue
+        concrete_frame_ids = [
+            int(frame_id) for frame_id in frame_ids if frame_id is not None
+        ]
+        if len(set(concrete_frame_ids)) != len(concrete_frame_ids):
+            raise ValueError(
+                f"{trace.path}: parent {parent_sequence_id} has duplicate "
+                "audio_frame_id values"
+            )
+        frame_addressable_parent_count += 1
+        ordered_frames = [
+            frame
+            for _, frame in sorted(
+                zip(concrete_frame_ids, frames, strict=True),
+                key=lambda item: item[0],
+            )
+        ]
+        first_attribution, first_chunk, first_scheduled = ordered_frames[0]
+        last_attribution, last_chunk, last_scheduled = ordered_frames[-1]
+
+        source_ranges = {
+            (attribution.source_start_ms, attribution.source_end_ms)
+            for attribution, _, _ in ordered_frames
+        }
+        if len(source_ranges) > 1:
+            raise ValueError(
+                f"{trace.path}: parent {parent_sequence_id} has inconsistent "
+                "source ranges"
+            )
+        has_bounded_source_range = all(
+            attribution.source_start_ms is not None
+            and attribution.source_end_ms is not None
+            for attribution, _, _ in ordered_frames
+        )
+
+        start_delay_seconds: float | None = None
+        if (
+            first_attribution.source_end_ms is not None
+            and first_attribution.source_end_to_receipt_ms is not None
+        ):
+            start_delay_seconds = (
+                first_attribution.source_end_to_receipt_ms / 1000.0
+                + first_scheduled.start_seconds
+                - first_chunk.arrival_seconds
+            )
+            start_records.append(
+                (
+                    first_attribution.source_end_ms,
+                    parent_sequence_id,
+                    start_delay_seconds,
+                )
+            )
+
+        end_delay_seconds: float | None = None
+        if (
+            last_attribution.source_end_ms is not None
+            and last_attribution.source_end_to_receipt_ms is not None
+        ):
+            end_delay_seconds = (
+                last_attribution.source_end_to_receipt_ms / 1000.0
+                + last_scheduled.end_seconds
+                - last_chunk.arrival_seconds
+            )
+            end_records.append(
+                (
+                    last_attribution.source_end_ms,
+                    parent_sequence_id,
+                    end_delay_seconds,
+                )
+            )
+
+        if (
+            has_bounded_source_range
+            and start_delay_seconds is not None
+            and end_delay_seconds is not None
+        ):
+            semantic_proxy_eligible_parent_count += 1
+            bounded_start_records.append(start_records[-1])
+            bounded_end_records.append(end_records[-1])
+
+    start_delays = [record[2] for record in start_records]
+    end_delays = [record[2] for record in end_records]
+    ordered_start_delays = [
+        record[2] for record in sorted(bounded_start_records)
+    ]
+    ordered_end_delays = [
+        record[2] for record in sorted(bounded_end_records)
+    ]
+    measured_parent_envelope_count = len(
+        {
+            (source_end_ms, parent_sequence_id)
+            for source_end_ms, parent_sequence_id, _ in start_records
+        }.intersection(
+            {
+                (source_end_ms, parent_sequence_id)
+                for source_end_ms, parent_sequence_id, _ in end_records
+            }
+        )
+    )
+    if measured_parent_envelope_count == 0:
+        semantic_status = "unavailable"
+    elif (
+        semantic_proxy_eligible_parent_count
+        == measured_parent_envelope_count
+    ):
+        semantic_status = "eligible_parent_range_proxy"
+    elif semantic_proxy_eligible_parent_count:
+        semantic_status = "partially_eligible_parent_range_proxy"
+    else:
+        semantic_status = "ineligible_missing_bounded_source_ranges"
+
+    return _round_floats(
+        {
+            "availability": (
+                "available"
+                if start_records or end_records
+                else "unavailable"
+            ),
+            "attributed_frame_count": attributed_frame_count,
+            "attributed_parent_count": len(parent_frames),
+            "frame_addressable_parent_count": (
+                frame_addressable_parent_count
+            ),
+            "measured_parent_envelope_count": (
+                measured_parent_envelope_count
+            ),
+            "completion_proven_by_trace_csv": False,
+            "completion_evidence_note": (
+                "The event CSV contains frame addresses but no validated "
+                "parent-completion markers; completion must be bound from "
+                "the adjacent summary audio_metadata_observation."
+            ),
+            "parent_envelope_selection": {
+                "start": (
+                    "scheduled start of the minimum audio_frame_id in each "
+                    "parent"
+                ),
+                "end": (
+                    "scheduled end of the maximum audio_frame_id in each "
+                    "parent"
+                ),
+            },
+            "source_end_to_first_frame_scheduled_start_seconds": (
+                _distribution(start_delays)
+            ),
+            "source_end_to_last_frame_scheduled_end_seconds": (
+                _distribution(end_delays)
+            ),
+            "accumulated_drift": {
+                "definition": (
+                    "final-quartile median minus first-quartile median, "
+                    "ordered by source_end_ms then parent_sequence_id; only "
+                    "parents with both source bounds are eligible and at "
+                    "least four eligible parents are required"
+                ),
+                "first_frame_scheduled_start_seconds": (
+                    _quartile_drift(ordered_start_delays)
+                ),
+                "last_frame_scheduled_end_seconds": (
+                    _quartile_drift(ordered_end_delays)
+                ),
+            },
+            "semantic_proxy_eligibility": {
+                "status": semantic_status,
+                "eligible_parent_count": (
+                    semantic_proxy_eligible_parent_count
+                ),
+                "ineligible_measured_parent_count": (
+                    measured_parent_envelope_count
+                    - semantic_proxy_eligible_parent_count
+                ),
+                "criterion": (
+                    "both source_start_ms and source_end_ms exist on every "
+                    "frame in the measured parent"
+                ),
+            },
+            "claim_scope": {
+                "scheduled_digital_playback_projection": True,
+                "dac_or_acoustic_audibility_measured": False,
+                "exact_semantic_landmark_measured": False,
+                "exact_joke_or_punchline_delay_measured": False,
+                "caveat": (
+                    "Even an eligible bounded parent is only a coarse "
+                    "source-range envelope; exact semantic delay requires a "
+                    "reviewed source marker and matching target-language "
+                    "landmark on a common output clock."
+                ),
+            },
+        }
+    )
 
 
 def _dedupe_positive_floats(
@@ -412,16 +1014,232 @@ def build_capacity_sweep(
     }
 
 
-def _load_recorded_tail(csv_path: Path) -> float | None:
-    summary_path = csv_path.with_name(
+def _summary_path_for_trace(csv_path: Path) -> Path:
+    return csv_path.with_name(
         csv_path.name.removesuffix("_results.csv") + "_summary.json"
     )
+
+
+def _load_adjacent_summary(csv_path: Path) -> dict[str, Any] | None:
+    summary_path = _summary_path_for_trace(csv_path)
     if not summary_path.exists():
         return None
     with summary_path.open(encoding="utf-8") as handle:
         summary = json.load(handle)
+    if not isinstance(summary, dict):
+        raise ValueError(f"{summary_path}: summary must be a JSON object")
+    return summary
+
+
+def _load_recorded_tail(
+    csv_path: Path,
+    *,
+    summary: dict[str, Any] | None = None,
+) -> float | None:
+    if summary is None:
+        summary = _load_adjacent_summary(csv_path)
+    if summary is None:
+        return None
     value = summary.get("playback_tail_sec")
     return float(value) if value is not None else None
+
+
+def _require_summary_integer(
+    observation: dict[str, Any],
+    field_name: str,
+    *,
+    summary_path: Path,
+    minimum: int,
+) -> int:
+    value = observation.get(field_name)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+    ):
+        qualifier = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(
+            f"{summary_path}: audio_metadata_observation.{field_name} "
+            f"must be a {qualifier} integer"
+        )
+    return value
+
+
+def _require_summary_finite_nonnegative(
+    observation: dict[str, Any],
+    field_name: str,
+    *,
+    summary_path: Path,
+) -> float:
+    value = observation.get(field_name)
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(
+            f"{summary_path}: audio_metadata_observation.{field_name} "
+            "must be a finite non-negative number"
+        )
+    return float(value)
+
+
+def _bind_audio_metadata_summary(
+    trace: PlaybackTrace,
+    summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind attributed CSV frames to tracker-reconciled summary evidence."""
+
+    if trace.audio_metadata_protocol_version is None:
+        return {
+            "required": False,
+            "status": "not_applicable_legacy_trace",
+            "passed": None,
+            "completion_proven_by_trace_csv": False,
+            "completion_evidence": None,
+        }
+
+    summary_path = _summary_path_for_trace(trace.path)
+    if summary is None:
+        raise ValueError(
+            f"{trace.path}: protocol-v1 attribution requires adjacent "
+            f"{summary_path.name} audio_metadata_observation"
+        )
+    observation = summary.get("audio_metadata_observation")
+    if not isinstance(observation, dict):
+        raise ValueError(
+            f"{summary_path}: protocol-v1 attribution requires an "
+            "audio_metadata_observation object"
+        )
+
+    input_sample_zero_timestamp_ms = _require_summary_finite_nonnegative(
+        observation,
+        "input_sample_zero_timestamp_ms",
+        summary_path=summary_path,
+    )
+    observed_protocol = _require_summary_integer(
+        observation,
+        "protocol_version",
+        summary_path=summary_path,
+        minimum=1,
+    )
+    observed_generation = _require_summary_integer(
+        observation,
+        "stream_generation",
+        summary_path=summary_path,
+        minimum=1,
+    )
+    observed_frames = _require_summary_integer(
+        observation,
+        "paired_frames",
+        summary_path=summary_path,
+        minimum=0,
+    )
+    observed_completed_parents = _require_summary_integer(
+        observation,
+        "completed_parents",
+        summary_path=summary_path,
+        minimum=0,
+    )
+    expected_frames = len(trace.frame_attributions)
+    expected_parents = len(
+        {
+            attribution.parent_sequence_id
+            for attribution in trace.frame_attributions
+        }
+    )
+    expected = {
+        "protocol_version": trace.audio_metadata_protocol_version,
+        "stream_generation": trace.audio_metadata_stream_generation,
+        "paired_frames": expected_frames,
+        "completed_parents": expected_parents,
+    }
+    observed = {
+        "protocol_version": observed_protocol,
+        "stream_generation": observed_generation,
+        "paired_frames": observed_frames,
+        "completed_parents": observed_completed_parents,
+    }
+    if observed != expected:
+        mismatches = ", ".join(
+            f"{key}: expected {expected[key]}, observed {observed[key]}"
+            for key in expected
+            if expected[key] != observed[key]
+        )
+        raise ValueError(
+            f"{summary_path}: audio metadata summary does not bind to "
+            f"{trace.path.name} ({mismatches})"
+        )
+
+    if len(trace.frame_attributions) != len(trace.chunks):
+        raise ValueError(
+            f"{trace.path}: audio attribution count does not match chunk count"
+        )
+    receipt_delay_validated_frame_count = 0
+    for attribution, chunk in zip(
+        trace.frame_attributions,
+        trace.chunks,
+        strict=True,
+    ):
+        if attribution.source_end_ms is None:
+            continue
+        observed_receipt_delay_ms = (
+            attribution.source_end_to_receipt_ms
+        )
+        if observed_receipt_delay_ms is None:
+            raise ValueError(
+                f"{trace.path}: parent "
+                f"{attribution.parent_sequence_id} frame "
+                f"{attribution.audio_frame_id} has source_end_ms without "
+                "source_end_to_receipt_ms"
+            )
+        expected_receipt_delay_ms = (
+            chunk.arrival_seconds * 1000.0
+            - input_sample_zero_timestamp_ms
+            - attribution.source_end_ms
+        )
+        if not math.isclose(
+            observed_receipt_delay_ms,
+            expected_receipt_delay_ms,
+            rel_tol=0.0,
+            abs_tol=CSV_TIMING_SERIALIZATION_EPSILON_MS,
+        ):
+            raise ValueError(
+                f"{trace.path}: parent "
+                f"{attribution.parent_sequence_id} frame "
+                f"{attribution.audio_frame_id} source_end_to_receipt_ms "
+                "does not bind to the adjacent summary input sample-zero "
+                "clock"
+            )
+        receipt_delay_validated_frame_count += 1
+    return {
+        "required": True,
+        "status": "bound",
+        "passed": True,
+        "summary_json": summary_path.name,
+        "protocol_version": observed_protocol,
+        "stream_generation": observed_generation,
+        "paired_frame_count": observed_frames,
+        "completed_parent_count": observed_completed_parents,
+        "input_sample_zero_timestamp_ms": (
+            input_sample_zero_timestamp_ms
+        ),
+        "receipt_delay_validation": {
+            "performed": True,
+            "passed": True,
+            "validated_frame_count": (
+                receipt_delay_validated_frame_count
+            ),
+            "absolute_tolerance_ms": (
+                CSV_TIMING_SERIALIZATION_EPSILON_MS
+            ),
+        },
+        "completion_proven_by_trace_csv": False,
+        "completion_evidence": (
+            "adjacent_summary.audio_metadata_observation"
+        ),
+    }
 
 
 def analyze_trace(
@@ -430,18 +1248,20 @@ def analyze_trace(
     policy: PlaybackPolicy = DEFAULT_PLAYBACK_POLICY,
     recorded_fixed_tail_seconds: float | None = None,
 ) -> dict[str, Any]:
-    fixed = simulate_playback(
+    fixed_simulation = simulate_playback(
         trace.chunks,
         input_end_seconds=trace.input_end_seconds,
         adaptive=False,
         policy=policy,
-    ).summary
-    adaptive = simulate_playback(
+    )
+    adaptive_simulation = simulate_playback(
         trace.chunks,
         input_end_seconds=trace.input_end_seconds,
         adaptive=True,
         policy=policy,
-    ).summary
+    )
+    fixed = fixed_simulation.summary
+    adaptive = adaptive_simulation.summary
     reduction = fixed.listener_tail_seconds - adaptive.listener_tail_seconds
     reduction_percent = (
         reduction / fixed.listener_tail_seconds * 100.0
@@ -468,6 +1288,15 @@ def analyze_trace(
             else None
         )
 
+    fixed_output = _compact_summary(fixed)
+    fixed_output["source_frontier_to_scheduled_playback"] = (
+        _source_frontier_metrics(trace, fixed_simulation)
+    )
+    adaptive_output = _compact_summary(adaptive)
+    adaptive_output["source_frontier_to_scheduled_playback"] = (
+        _source_frontier_metrics(trace, adaptive_simulation)
+    )
+
     return _round_floats(
         {
             "trace_csv": trace.path.name,
@@ -482,8 +1311,8 @@ def analyze_trace(
             "reproduced_fixed_tail_delta_seconds": fixed_delta,
             "legacy_start_boundary_fixed_tail_seconds": legacy_fixed_tail,
             "legacy_start_boundary_recorded_delta_seconds": legacy_fixed_delta,
-            "fixed_1x": _compact_summary(fixed),
-            "adaptive": _compact_summary(adaptive),
+            "fixed_1x": fixed_output,
+            "adaptive": adaptive_output,
             "comparison": {
                 "listener_tail_reduction_seconds": reduction,
                 "listener_tail_reduction_percent": reduction_percent,
@@ -515,11 +1344,15 @@ def build_analysis(
         trace = load_event_trace(path)
         if rates:
             loaded_traces.append(trace)
-        recorded_tail = _load_recorded_tail(path)
+        summary = _load_adjacent_summary(path)
+        recorded_tail = _load_recorded_tail(path, summary=summary)
         result = analyze_trace(
             trace,
             policy=policy,
             recorded_fixed_tail_seconds=recorded_tail,
+        )
+        result["audio_metadata_summary_binding"] = (
+            _bind_audio_metadata_summary(trace, summary)
         )
         delta = result["reproduced_fixed_tail_delta_seconds"]
         legacy_delta = result[
@@ -577,7 +1410,7 @@ def build_analysis(
     reduction_total = fixed_total - adaptive_total
 
     analysis = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_format": "batch_latency_test client event CSV",
         "audio_format": {
             "sample_rate_hz": SAMPLE_RATE,
@@ -593,6 +1426,20 @@ def build_analysis(
             "input_end_prefers_explicit_event": True,
             "legacy_missing_end_event_uses_last_chunk_end": True,
             "historical_last_chunk_start_validation_is_annotated_compatibility": True,
+            "source_frontier_uses_client_monotonic_clock_only": True,
+            "source_frontier_is_scheduled_digital_playback_not_audibility": True,
+            "source_frontier_percentiles_use_nearest_rank": True,
+            "source_frontier_quartile_size_is_ceiling_n_over_four": True,
+            "source_frontier_drift_minimum_eligible_parents": 4,
+            "semantic_proxy_requires_both_source_range_bounds": True,
+            "trace_csv_does_not_prove_parent_completion": True,
+            "attributed_trace_requires_bound_audio_metadata_summary": True,
+            "source_receipt_delay_recomputed_from_bound_sample_zero": True,
+            "source_receipt_csv_serialization_epsilon_ms": (
+                CSV_TIMING_SERIALIZATION_EPSILON_MS
+            ),
+            "bounded_parent_range_is_not_an_exact_semantic_landmark": True,
+            "exact_joke_or_punchline_delay_requires_common_clock_review": True,
         },
         "traces": traces,
         "aggregate": _round_floats(
@@ -630,6 +1477,10 @@ def _display_name(filename: str) -> str:
     if path.parent.name.startswith("repeat-"):
         return f"{display} ({path.parent.name})"
     return display
+
+
+def _format_optional_seconds(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}s"
 
 
 def render_markdown(analysis: dict[str, Any]) -> str:
@@ -704,6 +1555,82 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             "",
         ]
     )
+    lines.extend(
+        [
+            "## Source-frontier scheduling projection",
+            "",
+            (
+                "When protocol-v1 attribution is present, this browser-independent "
+                "projection measures each parent from its source end to the "
+                "deterministic scheduled digital playback start of its first "
+                "frame and end of its last frame."
+            ),
+            "",
+            (
+                "The trace CSV proves ordered frame envelopes, not parent "
+                "completion. For attributed traces, this report requires the "
+                "adjacent summary and binds its reconciled protocol version, "
+                "stream generation, paired-frame count, and completed-parent "
+                "count before reporting the projection. It also recomputes "
+                "every available source-end receipt delay from the bound "
+                "input sample-zero clock within CSV serialization tolerance."
+            ),
+            "",
+            (
+                "These values do not measure DAC output or acoustic audibility. "
+                "A parent is eligible only as a coarse semantic-range proxy when "
+                "both `source_start_ms` and `source_end_ms` exist on every frame. "
+                "Even then, it is not an exact joke or punchline measurement; "
+                "that requires reviewed source and target-language landmarks on "
+                "a common output clock."
+            ),
+            "",
+            (
+                "| Trace | Policy | Measured parents | Semantic-range eligible | "
+                "Start p50 | Start p95 | Start max | End p50 | End p95 | "
+                "End max | Start drift |"
+            ),
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for trace in analysis["traces"]:
+        for policy_name, policy_key in (
+            ("Fixed 1.00x", "fixed_1x"),
+            ("Adaptive", "adaptive"),
+        ):
+            frontier = trace[policy_key][
+                "source_frontier_to_scheduled_playback"
+            ]
+            start = frontier[
+                "source_end_to_first_frame_scheduled_start_seconds"
+            ]
+            end = frontier[
+                "source_end_to_last_frame_scheduled_end_seconds"
+            ]
+            eligibility = frontier["semantic_proxy_eligibility"]
+            start_drift = frontier["accumulated_drift"][
+                "first_frame_scheduled_start_seconds"
+            ]["final_minus_first_seconds"]
+            lines.append(
+                "| {name} | {policy_name} | {measured:,} | "
+                "{eligible:,} | {start_p50} | {start_p95} | "
+                "{start_max} | {end_p50} | {end_p95} | {end_max} | "
+                "{drift} |".format(
+                    name=_display_name(trace["trace_csv"]),
+                    policy_name=policy_name,
+                    measured=frontier["measured_parent_envelope_count"],
+                    eligible=eligibility["eligible_parent_count"],
+                    start_p50=_format_optional_seconds(start["p50"]),
+                    start_p95=_format_optional_seconds(start["p95"]),
+                    start_max=_format_optional_seconds(start["max"]),
+                    end_p50=_format_optional_seconds(end["p50"]),
+                    end_p95=_format_optional_seconds(end["p95"]),
+                    end_max=_format_optional_seconds(end["max"]),
+                    drift=_format_optional_seconds(start_drift),
+                )
+            )
+    lines.append("")
+
     capacity_sweep = analysis.get("capacity_sweep")
     if capacity_sweep is not None:
         lines.extend(

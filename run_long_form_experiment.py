@@ -33,16 +33,23 @@ import requests
 from analyze_playback_policy import build_analysis, render_markdown
 from batch_latency_test import (
     AUDIO_METADATA_PROTOCOL_VERSION,
+    BYTES_PER_SAMPLE,
     LONG_FORM_FILES,
     PREFLIGHT_FILE,
+    SAMPLE_RATE,
     TestResult,
     TimingEvent,
+    ValidatedAudioFrame,
     generate_csv,
     generate_plot,
     generate_summary,
     run_test,
     validate_capture_result,
     validate_input_pacing_evidence,
+)
+from headless_playback_scheduler import (
+    HeadlessPlaybackScheduler,
+    compare_headless_playback_reports,
 )
 
 
@@ -652,6 +659,7 @@ def _validate_saved_audio_metadata_observation(
         audio_metadata_completed_parents=observation.get(
             "completed_parents"
         ),
+        headless_playback_report=summary.get("headless_playback"),
         chunks_sent=summary.get("chunks_sent", 0),
         audio_responses=summary.get("audio_responses", 0),
         total_received_bytes=summary.get("total_received_bytes", 0),
@@ -806,6 +814,203 @@ def _artifact_hashes(run_dir: Path, entry: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _replay_headless_playback_report(
+    summary: dict[str, Any],
+    received_rows: Sequence[dict[str, str]],
+) -> tuple[bool, str]:
+    """Rebuild protocol-v1 scheduling evidence from the promoted CSV."""
+
+    observation = summary.get("audio_metadata_observation")
+    if not isinstance(observation, dict):
+        return False, "headless playback replay lacks metadata observation"
+    saved_report = summary.get("headless_playback")
+    if not isinstance(saved_report, dict):
+        return False, "headless playback report is missing"
+
+    input_end_ms = summary.get("input_end_timestamp_ms")
+    input_sample_zero_ms = observation.get(
+        "input_sample_zero_timestamp_ms"
+    )
+    for value, field_name in (
+        (input_end_ms, "input_end_timestamp_ms"),
+        (input_sample_zero_ms, "input_sample_zero_timestamp_ms"),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return False, (
+                f"headless playback replay has invalid {field_name}"
+            )
+
+    def required_int(
+        row: dict[str, str],
+        field_name: str,
+        *,
+        minimum: int = 0,
+    ) -> int:
+        raw = row.get(field_name)
+        if raw is None or raw.strip() == "":
+            raise ValueError(f"{field_name} is missing")
+        value = int(raw)
+        if str(value) != raw.strip() or value < minimum:
+            raise ValueError(f"{field_name} is invalid")
+        return value
+
+    def optional_float(
+        row: dict[str, str],
+        field_name: str,
+        *,
+        allow_negative: bool = False,
+    ) -> float | None:
+        raw = row.get(field_name)
+        if raw is None or raw.strip() == "":
+            return None
+        value = float(raw)
+        if (
+            not math.isfinite(value)
+            or (not allow_negative and value < 0)
+        ):
+            raise ValueError(f"{field_name} is invalid")
+        return value
+
+    scheduler = HeadlessPlaybackScheduler()
+    cumulative_audio_bytes = 0
+    try:
+        for receive_index, row in enumerate(received_rows):
+            timestamp_ms = optional_float(row, "timestamp_ms")
+            if timestamp_ms is None:
+                raise ValueError("timestamp_ms is missing")
+            if required_int(row, "chunk_index") != receive_index:
+                raise ValueError(
+                    "audio_received chunk_index must be contiguous "
+                    "and zero-based"
+                )
+            audio_bytes = required_int(
+                row,
+                "audio_bytes",
+                minimum=1,
+            )
+            if audio_bytes % BYTES_PER_SAMPLE:
+                raise ValueError(
+                    "audio_bytes is not aligned to fixed mono int16 PCM"
+                )
+            if (
+                required_int(row, "protocol_version", minimum=1)
+                != AUDIO_METADATA_PROTOCOL_VERSION
+            ):
+                raise ValueError("protocol_version must equal 1")
+            source_start_ms = optional_float(row, "source_start_ms")
+            source_end_ms = optional_float(row, "source_end_ms")
+            if source_start_ms is not None and source_end_ms is None:
+                raise ValueError(
+                    "source_start_ms requires source_end_ms"
+                )
+            if (
+                source_start_ms is not None
+                and source_end_ms is not None
+                and source_end_ms < source_start_ms
+            ):
+                raise ValueError("source range is reversed")
+
+            source_end_to_receipt_ms = optional_float(
+                row,
+                "source_end_to_receipt_ms",
+                allow_negative=True,
+            )
+            if source_end_ms is None:
+                if source_end_to_receipt_ms is not None:
+                    raise ValueError(
+                        "source_end_to_receipt_ms requires source_end_ms"
+                    )
+            else:
+                if source_end_to_receipt_ms is None:
+                    raise ValueError(
+                        "source_end_to_receipt_ms is missing"
+                    )
+                expected_receipt_ms = (
+                    timestamp_ms
+                    - float(input_sample_zero_ms)
+                    - source_end_ms
+                )
+                if not math.isclose(
+                    source_end_to_receipt_ms,
+                    expected_receipt_ms,
+                    rel_tol=0.0,
+                    # generate_csv uses Python's exact round-trip float
+                    # representation for every replay input.
+                    abs_tol=1e-9,
+                ):
+                    raise ValueError(
+                        "source_end_to_receipt_ms does not match "
+                        "timestamp and sample-zero evidence"
+                    )
+
+            cumulative_audio_bytes += audio_bytes
+            source_position = optional_float(
+                row,
+                "source_position_sec",
+            )
+            expected_source_position = cumulative_audio_bytes / (
+                SAMPLE_RATE * BYTES_PER_SAMPLE
+            )
+            if source_position is None or not math.isclose(
+                source_position,
+                expected_source_position,
+                rel_tol=0.0,
+                # generate_csv uses Python's exact round-trip float
+                # representation for every replay input.
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "audio_received source_position_sec does not match "
+                    "cumulative fixed-format PCM"
+                )
+
+            scheduler.accept(
+                ValidatedAudioFrame(
+                    arrival_seconds=timestamp_ms / 1000.0,
+                    audio_bytes=audio_bytes,
+                    protocol_version=AUDIO_METADATA_PROTOCOL_VERSION,
+                    stream_generation=required_int(
+                        row,
+                        "stream_generation",
+                        minimum=1,
+                    ),
+                    parent_sequence_id=required_int(
+                        row,
+                        "parent_sequence_id",
+                    ),
+                    audio_frame_id=required_int(
+                        row,
+                        "audio_frame_id",
+                    ),
+                    sample_rate_hz=SAMPLE_RATE,
+                    channels=1,
+                    bytes_per_sample=BYTES_PER_SAMPLE,
+                    source_start_ms=source_start_ms,
+                    source_end_ms=source_end_ms,
+                )
+            )
+
+        replayed_report = scheduler.finalize(
+            input_end_seconds=float(input_end_ms) / 1000.0,
+            input_sample_zero_seconds=(
+                float(input_sample_zero_ms) / 1000.0
+            ),
+        )
+        compare_headless_playback_reports(
+            saved_report,
+            replayed_report,
+            csv_timestamp_rounding_ms=1e-9,
+        )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return False, f"headless playback CSV replay failed: {exc}"
+    return True, "ok"
+
+
 def validate_artifact_set(
     csv_path: Path,
     summary_path: Path,
@@ -837,6 +1042,7 @@ def validate_artifact_set(
         sent_events: list[TimingEvent] = []
         received_count = 0
         received_bytes = 0
+        received_rows: list[dict[str, str]] = []
         observation = summary.get("audio_metadata_observation")
         protocol_v1 = (
             isinstance(observation, dict)
@@ -852,6 +1058,13 @@ def validate_artifact_set(
                         "timestamp_ms",
                         "chunk_index",
                         "source_position_sec",
+                        "protocol_version",
+                        "stream_generation",
+                        "parent_sequence_id",
+                        "audio_frame_id",
+                        "source_start_ms",
+                        "source_end_ms",
+                        "source_end_to_receipt_ms",
                     }
                 )
             missing = required.difference(reader.fieldnames or ())
@@ -880,6 +1093,8 @@ def validate_artifact_set(
                 elif row["stage"] == "audio_received":
                     received_count += 1
                     received_bytes += int(row["audio_bytes"])
+                    if protocol_v1:
+                        received_rows.append(dict(row))
     except (OSError, csv.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
         return False, f"invalid capture artifacts: {exc}"
 
@@ -915,14 +1130,24 @@ def validate_artifact_set(
         pacing_errors = validate_input_pacing_evidence(
             pacing_result,
             require_chunk_events=True,
-            # generate_csv serializes client timestamps to 0.01 ms.
-            timing_tolerance_ms=0.011,
+            # Exact round-trip serialization keeps the saved extrema tightly
+            # bound to the replayed ledger. The validator separately allows
+            # a 100 ns numeric epsilon for an on-deadline emission represented
+            # fractionally early after large monotonic-clock subtraction.
+            timing_tolerance_ms=1e-9,
+            numeric_early_tolerance_ms=1e-4,
         )
         if pacing_errors:
             return False, (
                 "input pacing CSV/summary validation failed: "
                 + "; ".join(pacing_errors)
             )
+        replay_valid, replay_reason = _replay_headless_playback_report(
+            summary,
+            received_rows,
+        )
+        if not replay_valid:
+            return False, replay_reason
 
     if expected_hashes:
         actual_hashes = {
@@ -1285,11 +1510,11 @@ def add_candidate_gate_results(analysis: dict[str, Any]) -> None:
     for trace in analysis["traces"]:
         adaptive = trace["adaptive"]
         gates = {
-            "queue_p95_at_or_below_10_seconds": (
-                adaptive["time_weighted_queue_p95_seconds"] <= 10.0
+            "time_weighted_queue_p95_at_or_below_5_seconds": (
+                adaptive["time_weighted_queue_p95_seconds"] <= 5.0
             ),
-            "time_over_10_seconds_below_1_percent": (
-                adaptive["percent_playback_window_above_limit"] < 1.0
+            "peak_queue_at_or_below_10_seconds": (
+                adaptive["peak_queue_depth_seconds"] <= 10.0
             ),
             "no_audio_chunks_dropped": adaptive["chunks_dropped"] == 0,
         }
@@ -1302,7 +1527,9 @@ def add_candidate_gate_results(analysis: dict[str, Any]) -> None:
         "all_traces_pass": all_pass,
         "note": (
             "An SLA miss is an experiment result, not an operational runner failure. "
-            "Browser parity, semantic joke delay, and native-listener quality remain separate gates."
+            "The gate covers scheduled digital playback; exact joke delay, "
+            "physical audibility, and native-listener quality remain separate "
+            "evidence tiers."
         ),
     }
 
@@ -1319,20 +1546,27 @@ def render_experiment_markdown(analysis: dict[str, Any]) -> str:
         ),
         "",
         (
-            "| Trace | Time-weighted adaptive p95 | Time >10s | Longest continuous 1.10x "
-            "playback | Candidate gates |"
+            "| Trace | Time-weighted adaptive p95 | Adaptive peak | "
+            "Time >10s | Source-range proxy | Candidate gates |"
         ),
-        "|---|---:|---:|---:|---|",
+        "|---|---:|---:|---:|---|---|",
     ]
     for trace in analysis["traces"]:
         adaptive = trace["adaptive"]
+        frontier = adaptive.get(
+            "source_frontier_to_scheduled_playback",
+            {},
+        )
+        eligibility = frontier.get("semantic_proxy_eligibility", {})
         passed = trace["candidate_acceptance"]["pass"]
         lines.append(
-            "| {trace} | {p95:.3f}s | {above:.3f}% | {urgent:.3f}s | {status} |".format(
+            "| {trace} | {p95:.3f}s | {peak:.3f}s | {above:.3f}% | "
+            "{proxy} | {status} |".format(
                 trace=trace["trace_csv"],
                 p95=adaptive["time_weighted_queue_p95_seconds"],
+                peak=adaptive["peak_queue_depth_seconds"],
                 above=adaptive["percent_playback_window_above_limit"],
-                urgent=adaptive["max_continuous_urgent_playback_seconds"],
+                proxy=eligibility.get("status", "unavailable"),
                 status="PASS" if passed else "MISS",
             )
         )

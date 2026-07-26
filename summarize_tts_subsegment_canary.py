@@ -722,7 +722,7 @@ def _playback_metrics(
     captures: Sequence[dict[str, Any]],
     label: str,
 ) -> dict[str, Any]:
-    if analysis.get("schema_version") != 1:
+    if analysis.get("schema_version") not in {1, 2}:
         raise ValueError(f"{label}: unsupported playback analysis schema")
     traces = analysis.get("traces")
     if not isinstance(traces, list) or len(traces) != len(captures):
