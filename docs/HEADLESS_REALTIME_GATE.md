@@ -261,6 +261,19 @@ Interpret the outputs in separate evidence categories:
 | Listener schedule | time-weighted queue p50/p95, peak queue, time above 10 seconds, fixed/adaptive listener tail, rate occupancy | How a no-drop digital listener schedule would accumulate and drain backlog |
 | Source freshness | protocol-v1 source offsets and source-end-to-receipt timing | How old an attributed source boundary was when translated PCM reached the client |
 
+## Formal matrix result
+
+The first clean merged-commit protocol-v1 matrix completed on 2026-07-26. All
+three long-form captures passed transport, terminal, and artifact-integrity
+validation, but all three missed the candidate five-second-p95 and
+ten-second-peak listener queue gates. A no-drop offline replay found that
+constant playback through 1.25x was not sufficient; even 1.25x playback plus
+a counterfactual 20% reduction in every translated chunk's duration missed on
+all three traces because captured delivery remained bursty. See
+[Browser-independent formal matrix result](HEADLESS_FORMAL_MATRIX_RESULT_2026-07-26.md)
+for the frozen provenance, per-sample metrics, interpretation, and recommended
+next experiment.
+
 The policy objective is to keep the queue near five seconds, move into urgent
 catch-up at eight seconds, and avoid exceeding ten seconds. A useful candidate
 must also preserve every frame and pass all ordering, byte, terminal, and

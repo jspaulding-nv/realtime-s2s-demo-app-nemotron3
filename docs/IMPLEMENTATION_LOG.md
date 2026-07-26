@@ -1605,6 +1605,37 @@ landmarks remain necessary.
 
 See [Browser-independent real-time S2S gate](HEADLESS_REALTIME_GATE.md).
 
+## 2026-07-26: clean merged-commit headless matrix completed
+
+The protocol-v1 formal run from clean merged commit `4ab2da9` completed the
+60-second preflight and all three long-form samples in 1 hour 47 minutes
+5 seconds from manifest creation through completion. All 14,209 translated PCM
+frames and 2,020 parents reconciled without loss, duplication, reorder, or
+terminal failure. Sample 02 used and recovered three NMT retries; no TTS retry
+occurred. Separate operator checks before and after the run observed the three
+containers healthy with zero restarts or OOM events; those observations are
+not frozen in the harness artifacts. The runner's resume path subsequently
+revalidated every artifact hash and exact CSV scheduler replay.
+
+Adaptive playback reduced aggregate fixed-rate listener tail from 503.274
+seconds to 119.750 seconds, a 76.2% reduction, but all three samples missed the
+candidate queue gates. Adaptive p95/peak queue values were 71.642/83.052,
+32.745/40.478, and 21.525/34.474 seconds. Sample 03 produced essentially the
+same amount of translated and source audio yet still missed, showing that
+nonuniform end-to-end delivery contributes alongside translated-media
+duration. Stage attribution remains a separate next step.
+
+The post-run no-drop capacity sweep then held captured arrival timestamps
+fixed while testing constant playback from 1.10x through 1.25x and translated
+media-duration scales down to 0.80. Playback acceleration alone did not pass.
+Even the strongest tested counterfactual, 1.25x playback plus 20% shorter
+translated chunks, produced p95/peak queues of 11.674/25.569,
+8.450/16.737, and 6.306/21.236 seconds. This directs the next work toward
+stage-level burst attribution and a short controlled TTS-duration canary
+before another full matrix.
+
+See [formal headless matrix result](HEADLESS_FORMAL_MATRIX_RESULT_2026-07-26.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1640,7 +1671,7 @@ See [Browser-independent real-time S2S gate](HEADLESS_REALTIME_GATE.md).
   formal two-run qualification
 - [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
-- [ ] Run protocol v1 across all three long-form samples
+- [x] Run protocol v1 across all three long-form samples
 - [x] Implement and live-preflight the browser-independent protocol-v1
   scheduled-playback gate
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
