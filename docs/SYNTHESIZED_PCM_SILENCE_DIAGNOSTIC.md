@@ -168,3 +168,9 @@ pipeline intervention, not a native Magpie control.
 - [NVIDIA Speech NIM 26.02 TTS customization](https://docs.nvidia.com/nim/speech/26.02.0/tts/customization.html)
 - [NVIDIA Speech NIM 26.02 TTS protobuf API](https://docs.nvidia.com/nim/speech/26.02.0/reference/api-references/tts/protos.html)
 - [NVIDIA Speech NIM 26.02 release notes](https://docs.nvidia.com/nim/speech/26.02.0/about/release-notes.html)
+
+## Live status
+
+The formal 60-second gate and promoted five-minute Sample 02 capture passed on
+July 26, 2026. See the
+[aggregate live result](SYNTHESIZED_PCM_SILENCE_RESULT_2026-07-26.md).

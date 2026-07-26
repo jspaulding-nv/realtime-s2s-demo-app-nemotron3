@@ -1766,6 +1766,32 @@ installed; those scripts are outside the automated `tests/` and
 See
 [synthesized low-energy PCM diagnostic](SYNTHESIZED_PCM_SILENCE_DIAGNOSTIC.md).
 
+The live gate then passed on the same clean commit for a 60-second Sample 01
+preflight and a promoted five-minute Sample 02 capture. The primary -50 dBFS
+threshold classified 4.683 of 52.803 seconds (8.87%) and 26.129 of 311.243
+seconds (8.39%), respectively, as combined leading/trailing low-energy PCM.
+All 778 frames across both captures were retained once and in order. Live scan
+p95 was 0.891 and 0.901 ms, with maxima of 1.308 and 1.485 ms.
+
+The five-minute capture still failed the audience queue objective. Its
+existing adaptive schedule had queue p95 12.246 seconds, peak 23.371 seconds,
+36.380 seconds above ten seconds, and a 28.132-second listener tail. TTS parent
+audio had p95 8.731 seconds and maximum 13.468 seconds; the strongest aligned
+30-second window delivered 40.403 seconds of translated media. Publisher and
+WebSocket intervals remained in milliseconds.
+
+A duration-only capacity replay found that ideal removal of every primary
+edge plus constant 1.10x playback would lower queue p95 to 9.113 seconds, but
+peak would remain 20.299 seconds and tail 25.059 seconds. Even theoretical
+1.50x playback plus ideal all-edge removal left a 13.317-second peak. This
+establishes low-energy edge compression as a useful supporting control, not
+the main fix. The next gate is a parent/frame-aligned guarded-edge
+counterfactual plus a design to reduce semantic parent burst size without
+reintroducing the repeated-padding cost observed in earlier TTS splitting.
+
+See
+[synthesized low-energy PCM live result](SYNTHESIZED_PCM_SILENCE_RESULT_2026-07-26.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1811,8 +1837,9 @@ See
   Sample 02 diagnostic
 - [x] Implement and unit-test aggregate-only synthesized low-energy PCM
   telemetry
-- [ ] Pass the one-minute synthesized low-energy PCM live gate
-- [ ] Promote the synthesized low-energy PCM gate to five-minute Sample 02
+- [x] Pass the one-minute synthesized low-energy PCM live gate
+- [x] Promote the synthesized low-energy PCM gate to five-minute Sample 02
+- [ ] Run a parent/frame-aligned guarded-edge capacity counterfactual
 - [ ] Repeat publisher-handoff telemetry over complete long-form samples before
   claiming the historical late-sample anomaly is eliminated
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
