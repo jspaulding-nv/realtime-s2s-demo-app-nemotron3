@@ -1605,6 +1605,54 @@ landmarks remain necessary.
 
 See [Browser-independent real-time S2S gate](HEADLESS_REALTIME_GATE.md).
 
+## 2026-07-26: privacy-safe stage and burst attribution
+
+Added `analyze_stage_burst_attribution.py` to join complete schema-3
+CSV/summary evidence with the validated ASR, segmenter, NMT, TTS, output,
+WebSocket, protocol-v1 client-arrival, and deterministic no-drop playback
+contracts. The analyzer:
+
+- accepts only staged, closed, complete schema-3 captures with incremental TTS
+  publication enabled and TTS request subsegmentation disabled;
+- validates parent/frame coverage, stage order, queue residence, processing
+  envelopes, retry bounds, frame relay order, and server/client cadence without
+  mixing clock domains;
+- evaluates aligned fixed-grid 30-second windows, including the final capture
+  tail, and separately labels complete one-second-stride rolling windows;
+- uses a fixed numeric metric whitelist and never serializes text lengths,
+  transcript or translation text, paths, filenames, endpoints, session
+  identifiers, raw events, PCM, or wall-clock time; and
+- rejects output paths that could overwrite an input CSV, its inferred summary,
+  or the other generated report.
+
+The retained formal three-sample evidence reconciled 2,020 parents and 14,209
+client PCM frames. Source-boundary-to-first-client-frame p95 was 5.773, 5.536,
+and 4.765 seconds, while source-boundary-to-scheduled-start p95 was 74.302,
+35.561, and 24.090 seconds. The largest aligned 30-second bins delivered
+72.958, 56.053, and 49.412 seconds of translated media and grew the adaptive
+listener queue by 36.325, 21.109, and 25.842 seconds.
+
+Aligned-window translated-media volume had descriptive Spearman associations
+of 0.849, 0.934, and 0.793 with queue change. Parent audio duration had
+associations of 0.999, 0.995, and 0.997 with its immediate queue change,
+whereas source-boundary-to-first-frame timing had much smaller associations of
+0.158, 0.145, and 0.105. Output queue residence and WebSocket relay remained in
+the millisecond range. This supports translated-media bursts as the immediate
+queue-growth mechanism, but it does not independently identify a causal model
+stage.
+
+The analysis also exposed rare TTS-frame-received to output-enqueue gaps:
+2/9/2 frames exceeded 100 ms, 1/7/0 exceeded one second, and the per-sample
+maxima were 5.648, 7.054, and 0.930 seconds. The next diagnostic is explicit
+privacy-safe TTS-worker-to-publisher handoff and response-chunk timing, followed
+by a one-minute preflight and the shortest five-minute unsplit canary. Earlier
+40-, 45-, and 60-character request splitting remains rejected because it
+reduced individual burst size but increased total generated duration and
+listener backlog.
+
+See [Stage-burst attribution](STAGE_BURST_ATTRIBUTION.md) and
+[formal attribution result](STAGE_BURST_ATTRIBUTION_RESULT_2026-07-26.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1643,6 +1691,10 @@ See [Browser-independent real-time S2S gate](HEADLESS_REALTIME_GATE.md).
 - [ ] Run protocol v1 across all three long-form samples
 - [x] Implement and live-preflight the browser-independent protocol-v1
   scheduled-playback gate
+- [x] Attribute all three formal schema-3 traces across model stages,
+  publication, transport, and listener burst windows
+- [ ] Instrument the TTS-worker-to-publisher handoff and run the unsplit
+  one-minute preflight plus five-minute diagnostic
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries
