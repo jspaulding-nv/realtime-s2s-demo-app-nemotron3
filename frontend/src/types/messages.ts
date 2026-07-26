@@ -113,6 +113,7 @@ export interface AudioConfig {
     ttsMaxSegmentAudioSeconds: number;
     ttsMaxRetries: number;
     ttsResponseChunkTelemetryEnabled: boolean;
+    ttsPublisherHandoffTelemetryEnabled: boolean;
     ttsSubsegmentMaxChars: number;
     ttsSubsegmentMinChars: number;
     closeTimeoutSeconds: number;

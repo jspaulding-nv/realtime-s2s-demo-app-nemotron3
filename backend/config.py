@@ -221,6 +221,14 @@ class StagedPipelineConfig:
             return 2
         return 1
 
+    @property
+    def tts_publisher_handoff_telemetry_enabled(self) -> bool:
+        """Whether schema-3 publisher handoff timing is available."""
+        return (
+            self.tts_incremental_publish_enabled
+            and self.tts_response_chunk_telemetry_enabled
+        )
+
 
 # Supported target languages with their TTS voice names
 # Note: Only languages with voices installed on the Riva server will work

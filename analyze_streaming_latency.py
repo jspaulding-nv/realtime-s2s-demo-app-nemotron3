@@ -16,6 +16,7 @@ from typing import Any, Iterable, Sequence
 ANALYSIS_SCHEMA_VERSION = 1
 SUPPORTED_TELEMETRY_SCHEMA_VERSIONS = {1, 2, 3}
 SOURCE_TIME_TOLERANCE_MS = 1e-3
+PUBLISHER_HANDOFF_BLOCKED_TOLERANCE_MS = 10.0
 PCM_BYTES_PER_SAMPLE = 2
 
 
@@ -50,6 +51,8 @@ class SampleLatency:
     parent_websocket_final_sends: tuple[TimedObservation, ...]
     tts_response_series: tuple["TTSResponseSeries", ...]
     incremental_publications: tuple["IncrementalPublicationSeries", ...]
+    publisher_handoffs: tuple["PublisherHandoffFrame", ...]
+    publisher_handoff_telemetry_enabled: bool
 
     @property
     def sample_label(self) -> str:
@@ -142,6 +145,8 @@ class TTSResponseSeries:
     completed_elapsed_ms: float
     response_audio_duration_ms: tuple[float, ...]
     inter_response_arrival_ms: tuple[float, ...]
+    response_cumulative_audio_bytes: tuple[int, ...]
+    response_received_elapsed_ms: tuple[float, ...]
 
     @property
     def first_to_last_seconds(self) -> float:
@@ -160,6 +165,82 @@ class TTSResponseSeries:
         return (
             self.completed_elapsed_ms - self.last_received_elapsed_ms
         ) / 1_000.0
+
+
+@dataclass(frozen=True)
+class PublisherHandoffFrame:
+    """One privacy-safe, fully reconciled schema-v3 publisher handoff."""
+
+    identity: tuple[int, int]
+    audio_bytes: int
+    retry_count: int
+    frame_ready_ms: float
+    publish_requested_ms: float
+    event_loop_callback_started_ms: float
+    output_capacity_acquired_ms: float
+    frame_enqueued_ms: float
+    frame_dequeued_ms: float
+    send_started_ms: float
+    send_completed_ms: float
+    atomic_fallback_applied: bool
+    prior_frame_serialization_wait_ms: float
+    ready_or_prior_commit_to_publish_request_ms: float
+
+    def _seconds(self, end_ms: float, start_ms: float) -> float:
+        return (end_ms - start_ms) / 1_000.0
+
+    @property
+    def frame_ready_to_publish_request_seconds(self) -> float:
+        return self._seconds(self.publish_requested_ms, self.frame_ready_ms)
+
+    @property
+    def prior_frame_serialization_wait_seconds(self) -> float:
+        return self.prior_frame_serialization_wait_ms / 1_000.0
+
+    @property
+    def ready_or_prior_commit_to_publish_request_seconds(self) -> float:
+        return self.ready_or_prior_commit_to_publish_request_ms / 1_000.0
+
+    @property
+    def publish_request_to_event_loop_callback_seconds(self) -> float:
+        return self._seconds(
+            self.event_loop_callback_started_ms,
+            self.publish_requested_ms,
+        )
+
+    @property
+    def event_loop_callback_to_output_capacity_seconds(self) -> float:
+        return self._seconds(
+            self.output_capacity_acquired_ms,
+            self.event_loop_callback_started_ms,
+        )
+
+    @property
+    def output_capacity_to_enqueue_seconds(self) -> float:
+        return self._seconds(
+            self.frame_enqueued_ms,
+            self.output_capacity_acquired_ms,
+        )
+
+    @property
+    def enqueue_to_dequeue_seconds(self) -> float:
+        return self._seconds(self.frame_dequeued_ms, self.frame_enqueued_ms)
+
+    @property
+    def frame_ready_to_enqueue_seconds(self) -> float:
+        return self._seconds(self.frame_enqueued_ms, self.frame_ready_ms)
+
+    @property
+    def dequeue_to_send_start_seconds(self) -> float:
+        return self._seconds(self.send_started_ms, self.frame_dequeued_ms)
+
+    @property
+    def send_start_to_completion_seconds(self) -> float:
+        return self._seconds(self.send_completed_ms, self.send_started_ms)
+
+    @property
+    def frame_ready_to_send_completion_seconds(self) -> float:
+        return self._seconds(self.send_completed_ms, self.frame_ready_ms)
 
 
 def _require_object(value: Any, *, field: str, label: str) -> dict[str, Any]:
@@ -1044,6 +1125,13 @@ def _load_tts_response_series(
                     item["audio_duration_ms"] for item in observed
                 ),
                 inter_response_arrival_ms=tuple(inter_arrivals),
+                response_cumulative_audio_bytes=tuple(
+                    item["cumulative_audio_bytes"] for item in observed
+                ),
+                response_received_elapsed_ms=tuple(
+                    item["received_monotonic_ms"] - pipeline_start_ms
+                    for item in observed
+                ),
             )
         )
     return tuple(series)
@@ -1407,6 +1495,397 @@ def _load_incremental_publication_series(
     return logical_sends, tuple(series)
 
 
+def _load_publisher_handoff_series(
+    staged: dict[str, Any],
+    *,
+    telemetry_schema_version: int,
+    events: list[dict[str, Any]],
+    pipeline_start_ms: float,
+    tts_response_series: tuple[TTSResponseSeries, ...],
+    label: str,
+) -> tuple[PublisherHandoffFrame, ...]:
+    """Validate optional worker-to-event-loop handoff evidence.
+
+    A missing marker preserves legacy schema-v3 behavior. An explicit false
+    marker is invalid because the producer emits this computed capability only
+    when active. A true marker is fail-closed: every committed frame must have
+    one complete timing row at every existing identity/byte/retry layer.
+    """
+
+    marker_name = "tts_publisher_handoff_telemetry_enabled"
+    if marker_name not in staged:
+        return ()
+    enabled = staged[marker_name]
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{label}: staged_pipeline.{marker_name} must be boolean")
+    if not enabled:
+        raise ValueError(
+            f"{label}: staged_pipeline.{marker_name} must be true when present"
+        )
+    if telemetry_schema_version != 3:
+        raise ValueError(
+            f"{label}: publisher handoff telemetry requires schema v3"
+        )
+    if (
+        staged.get("tts_response_chunk_telemetry_enabled") is not True
+        or not tts_response_series
+    ):
+        raise ValueError(
+            f"{label}: publisher handoff telemetry requires the "
+            "TTS response-chunk sidecar"
+        )
+
+    frame_keys = _audio_frame_keys(
+        staged.get("published_audio_frame_keys"),
+        field="staged_pipeline.published_audio_frame_keys",
+        label=label,
+    )
+    frame_bytes = _positive_int_list(
+        staged.get("published_audio_frame_bytes"),
+        field="staged_pipeline.published_audio_frame_bytes",
+        label=label,
+    )
+    if len(frame_keys) != len(frame_bytes):
+        raise ValueError(
+            f"{label}: publisher handoff frame identities and bytes differ "
+            "in length"
+        )
+
+    parent_summaries = _parent_summaries(
+        staged.get("produced_parent_summaries"),
+        field="staged_pipeline.produced_parent_summaries",
+        label=label,
+    )
+    parent_retry: dict[int, int] = {}
+    parent_fallback: dict[int, bool] = {}
+    parent_expected_bytes: dict[int, int] = {}
+    for (
+        parent_id,
+        _frame_count,
+        audio_bytes,
+        retry_count,
+        fallback_applied,
+    ) in parent_summaries:
+        parent_retry[parent_id] = retry_count
+        parent_fallback[parent_id] = fallback_applied
+        parent_expected_bytes[parent_id] = audio_bytes
+
+    event_names = (
+        ("tts", "frame_received"),
+        ("output", "frame_enqueued"),
+        ("output", "frame_dequeued"),
+    )
+    event_layers: dict[
+        tuple[str, str],
+        list[tuple[tuple[int, int], int, int, dict[str, Any], str]],
+    ] = {name: [] for name in event_names}
+    for index, event in enumerate(events):
+        event_name = (event.get("stage"), event.get("event"))
+        if event_name not in event_layers:
+            continue
+        field = f"staged_pipeline.events[{index}]"
+        key = _audio_frame_key(
+            event,
+            field=field,
+            label=label,
+            require_sequence_alias=True,
+        )
+        audio_bytes = _require_positive_int(
+            event.get("audio_bytes"),
+            field=f"{field}.audio_bytes",
+            label=label,
+        )
+        retry_count = _require_nonnegative_int(
+            event.get("retry_count"),
+            field=f"{field}.retry_count",
+            label=label,
+        )
+        if retry_count not in {0, 1}:
+            raise ValueError(
+                f"{label}: {field}.retry_count must be zero or one"
+            )
+        event_layers[event_name].append(
+            (key, audio_bytes, retry_count, event, field)
+        )
+
+    websocket_events = _require_list(
+        staged.get("websocket_send_events"),
+        field="staged_pipeline.websocket_send_events",
+        label=label,
+    )
+    websocket_layer: list[
+        tuple[tuple[int, int], int, dict[str, Any], str]
+    ] = []
+    for index, raw_event in enumerate(websocket_events):
+        field = f"staged_pipeline.websocket_send_events[{index}]"
+        event = _require_object(raw_event, field=field, label=label)
+        key = _audio_frame_key(
+            event,
+            field=field,
+            label=label,
+            require_sequence_alias=True,
+        )
+        audio_bytes = _require_positive_int(
+            event.get("audio_bytes"),
+            field=f"{field}.audio_bytes",
+            label=label,
+        )
+        websocket_layer.append((key, audio_bytes, event, field))
+
+    canonical_rows = tuple(zip(frame_keys, frame_bytes))
+    for layer_name, rows in (
+        *event_layers.items(),
+        (("websocket", "sent"), websocket_layer),
+    ):
+        observed = tuple((row[0], row[1]) for row in rows)
+        if observed != canonical_rows:
+            raise ValueError(
+                f"{label}: {layer_name[0]}/{layer_name[1]} publisher "
+                "handoff frame evidence does not exactly match canonical "
+                "frame order and bytes"
+            )
+        if layer_name == ("websocket", "sent"):
+            continue
+        for key, _audio_bytes, retry_count, _event, field in rows:
+            expected_retry = parent_retry.get(key[0])
+            if expected_retry is None or retry_count != expected_retry:
+                raise ValueError(
+                    f"{label}: {field}.retry_count does not match its "
+                    "parent completion"
+                )
+
+    response_by_parent = {
+        series.identity[0]: series for series in tts_response_series
+    }
+    if set(response_by_parent) != set(parent_retry):
+        raise ValueError(
+            f"{label}: publisher handoff response and parent identities "
+            "do not reconcile"
+        )
+
+    parent_frame_bytes: dict[int, int] = {
+        parent_id: 0 for parent_id in parent_retry
+    }
+    parent_frame_cumulative: dict[int, int] = {
+        parent_id: 0 for parent_id in parent_retry
+    }
+    result: list[PublisherHandoffFrame] = []
+    for index, (key, audio_bytes) in enumerate(canonical_rows):
+        parent_id, _frame_id = key
+        parent_frame_bytes[parent_id] += audio_bytes
+        parent_frame_cumulative[parent_id] += audio_bytes
+        received_event = event_layers[("tts", "frame_received")][index][3]
+        received_field = event_layers[("tts", "frame_received")][index][4]
+        enqueued_event = event_layers[("output", "frame_enqueued")][index][3]
+        enqueued_field = event_layers[("output", "frame_enqueued")][index][4]
+        dequeued_event = event_layers[("output", "frame_dequeued")][index][3]
+        dequeued_field = event_layers[("output", "frame_dequeued")][index][4]
+        websocket_event = websocket_layer[index][2]
+        websocket_field = websocket_layer[index][3]
+
+        frame_ready_ms = _require_nonnegative_finite(
+            received_event.get("monotonic_ms"),
+            field=f"{received_field}.monotonic_ms",
+            label=label,
+        )
+        publish_requested_ms = _require_nonnegative_finite(
+            enqueued_event.get("publish_requested_monotonic_ms"),
+            field=f"{enqueued_field}.publish_requested_monotonic_ms",
+            label=label,
+        )
+        callback_started_ms = _require_nonnegative_finite(
+            enqueued_event.get("event_loop_callback_started_monotonic_ms"),
+            field=(
+                f"{enqueued_field}."
+                "event_loop_callback_started_monotonic_ms"
+            ),
+            label=label,
+        )
+        capacity_acquired_ms = _require_nonnegative_finite(
+            enqueued_event.get("output_capacity_acquired_monotonic_ms"),
+            field=(
+                f"{enqueued_field}."
+                "output_capacity_acquired_monotonic_ms"
+            ),
+            label=label,
+        )
+        frame_enqueued_ms = _require_nonnegative_finite(
+            enqueued_event.get("monotonic_ms"),
+            field=f"{enqueued_field}.monotonic_ms",
+            label=label,
+        )
+        frame_dequeued_ms = _require_nonnegative_finite(
+            dequeued_event.get("monotonic_ms"),
+            field=f"{dequeued_field}.monotonic_ms",
+            label=label,
+        )
+        send_started_ms = _require_nonnegative_finite(
+            websocket_event.get("send_started_monotonic_ms"),
+            field=f"{websocket_field}.send_started_monotonic_ms",
+            label=label,
+        )
+        send_completed_ms = _require_nonnegative_finite(
+            websocket_event.get("sent_monotonic_ms"),
+            field=f"{websocket_field}.sent_monotonic_ms",
+            label=label,
+        )
+        timeline = (
+            frame_ready_ms,
+            publish_requested_ms,
+            callback_started_ms,
+            capacity_acquired_ms,
+            frame_enqueued_ms,
+            frame_dequeued_ms,
+            send_started_ms,
+            send_completed_ms,
+        )
+        if timeline[0] < pipeline_start_ms or any(
+            later < earlier for earlier, later in zip(timeline, timeline[1:])
+        ):
+            raise ValueError(
+                f"{label}: publisher handoff timestamps are not ordered for "
+                f"frame {key}"
+            )
+
+        blocked_put_ms = _require_nonnegative_finite(
+            enqueued_event.get("blocked_put_ms"),
+            field=f"{enqueued_field}.blocked_put_ms",
+            label=label,
+        )
+        measured_capacity_wait_ms = capacity_acquired_ms - callback_started_ms
+        if blocked_put_ms > 0 and not math.isclose(
+            blocked_put_ms,
+            measured_capacity_wait_ms,
+            rel_tol=0.0,
+            abs_tol=PUBLISHER_HANDOFF_BLOCKED_TOLERANCE_MS,
+        ):
+            raise ValueError(
+                f"{label}: publisher blocked_put_ms does not reconcile with "
+                "event-loop capacity wait"
+            )
+
+        response = response_by_parent[parent_id]
+        fallback_applied = parent_fallback[parent_id]
+        frame_ready_elapsed_ms = frame_ready_ms - pipeline_start_ms
+        if fallback_applied:
+            if (
+                not math.isclose(
+                    frame_ready_elapsed_ms,
+                    response.completed_elapsed_ms,
+                    rel_tol=0.0,
+                    abs_tol=SOURCE_TIME_TOLERANCE_MS,
+                )
+                or response.last_received_elapsed_ms
+                > frame_ready_elapsed_ms + SOURCE_TIME_TOLERANCE_MS
+            ):
+                raise ValueError(
+                    f"{label}: atomic fallback frame-ready timing does not "
+                    "match TTS completion"
+                )
+        else:
+            cumulative_frame_bytes = parent_frame_cumulative[parent_id]
+            expected_response_index = next(
+                (
+                    response_index
+                    for response_index, cumulative_response_bytes in enumerate(
+                        response.response_cumulative_audio_bytes
+                    )
+                    if cumulative_response_bytes >= cumulative_frame_bytes
+                ),
+                None,
+            )
+            if expected_response_index is None or not math.isclose(
+                frame_ready_elapsed_ms,
+                response.response_received_elapsed_ms[
+                    expected_response_index
+                ],
+                rel_tol=0.0,
+                abs_tol=SOURCE_TIME_TOLERANCE_MS,
+            ):
+                raise ValueError(
+                    f"{label}: direct frame-ready timing does not reconcile "
+                    "with response cumulative bytes"
+                )
+
+        previous_enqueued_ms = (
+            result[-1].frame_enqueued_ms if result else None
+        )
+        if (
+            previous_enqueued_ms is not None
+            and publish_requested_ms + SOURCE_TIME_TOLERANCE_MS
+            < previous_enqueued_ms
+        ):
+            raise ValueError(
+                f"{label}: publisher request for frame {key} precedes the "
+                "previous frame commit"
+            )
+        publication_available_ms = max(
+            frame_ready_ms,
+            (
+                previous_enqueued_ms
+                if previous_enqueued_ms is not None
+                else frame_ready_ms
+            ),
+        )
+        prior_frame_serialization_wait_ms = max(
+            0.0,
+            publication_available_ms - frame_ready_ms,
+        )
+        ready_or_prior_commit_to_publish_request_ms = max(
+            0.0,
+            publish_requested_ms - publication_available_ms,
+        )
+
+        result.append(
+            PublisherHandoffFrame(
+                identity=key,
+                audio_bytes=audio_bytes,
+                retry_count=parent_retry[parent_id],
+                frame_ready_ms=frame_ready_ms,
+                publish_requested_ms=publish_requested_ms,
+                event_loop_callback_started_ms=callback_started_ms,
+                output_capacity_acquired_ms=capacity_acquired_ms,
+                frame_enqueued_ms=frame_enqueued_ms,
+                frame_dequeued_ms=frame_dequeued_ms,
+                send_started_ms=send_started_ms,
+                send_completed_ms=send_completed_ms,
+                atomic_fallback_applied=fallback_applied,
+                prior_frame_serialization_wait_ms=(
+                    prior_frame_serialization_wait_ms
+                ),
+                ready_or_prior_commit_to_publish_request_ms=(
+                    ready_or_prior_commit_to_publish_request_ms
+                ),
+            )
+        )
+
+    if parent_frame_bytes != parent_expected_bytes:
+        raise ValueError(
+            f"{label}: publisher handoff frame bytes do not reconcile with "
+            "parent totals"
+        )
+    for attribute in (
+        "frame_ready_ms",
+        "publish_requested_ms",
+        "event_loop_callback_started_ms",
+        "output_capacity_acquired_ms",
+        "frame_enqueued_ms",
+        "frame_dequeued_ms",
+        "send_started_ms",
+        "send_completed_ms",
+    ):
+        boundaries = [getattr(frame, attribute) for frame in result]
+        if any(
+            later < earlier
+            for earlier, later in zip(boundaries, boundaries[1:])
+        ):
+            raise ValueError(
+                f"{label}: publisher handoff {attribute} is not globally "
+                "ordered by canonical frame identity"
+            )
+    return tuple(result)
+
+
 def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
     """Load and validate one completed staged batch summary.
 
@@ -1445,6 +1924,17 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
         raise ValueError(
             f"{label}: telemetry_schema_version must be one, two, or three"
         )
+    handoff_marker = "tts_publisher_handoff_telemetry_enabled"
+    if handoff_marker in staged:
+        handoff_enabled = staged[handoff_marker]
+        if not isinstance(handoff_enabled, bool):
+            raise ValueError(
+                f"{label}: staged_pipeline.{handoff_marker} must be boolean"
+            )
+        if handoff_enabled and schema_version != 3:
+            raise ValueError(
+                f"{label}: publisher handoff telemetry requires schema v3"
+            )
 
     events = _require_list(
         staged.get("events"),
@@ -1872,6 +2362,14 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
         tts_retry_counts=tts_retry_counts,
         label=label,
     )
+    publisher_handoffs = _load_publisher_handoff_series(
+        staged,
+        telemetry_schema_version=schema_version,
+        events=events,
+        pipeline_start_ms=pipeline_start_ms,
+        tts_response_series=tts_response_series,
+        label=label,
+    )
 
     _require_numeric_count(
         staged,
@@ -1987,6 +2485,10 @@ def load_summary_latency(path: Path, *, sample_index: int) -> SampleLatency:
         parent_websocket_final_sends=tuple(parent_ws_final),
         tts_response_series=tts_response_series,
         incremental_publications=incremental_publications,
+        publisher_handoffs=publisher_handoffs,
+        publisher_handoff_telemetry_enabled=(
+            staged.get("tts_publisher_handoff_telemetry_enabled") is True
+        ),
     )
 
 
@@ -2067,6 +2569,106 @@ def _response_chunk_metrics(
         ),
         "last_response_to_rpc_complete_seconds": _distribution(
             item.last_to_complete_seconds for item in series
+        ),
+    }
+
+
+def _publisher_handoff_metrics(
+    samples: Sequence[SampleLatency],
+) -> dict[str, Any]:
+    enabled_sample_count = sum(
+        sample.publisher_handoff_telemetry_enabled for sample in samples
+    )
+    legacy_sample_count = len(samples) - enabled_sample_count
+    if enabled_sample_count and legacy_sample_count:
+        raise ValueError(
+            "publisher handoff analysis cannot mix telemetry-enabled and "
+            "legacy samples"
+        )
+    all_frames = tuple(
+        frame
+        for sample in samples
+        for frame in sample.publisher_handoffs
+    )
+    if not all_frames:
+        return {
+            "available": False,
+            "sample_count": len(samples),
+            "enabled_sample_count": enabled_sample_count,
+            "legacy_sample_count": legacy_sample_count,
+        }
+    direct_frames = tuple(
+        frame for frame in all_frames if not frame.atomic_fallback_applied
+    )
+    fallback_frames = tuple(
+        frame for frame in all_frames if frame.atomic_fallback_applied
+    )
+    available = bool(direct_frames)
+
+    def distribution(attribute: str) -> dict[str, Any] | None:
+        return _optional_distribution(
+            getattr(frame, attribute) for frame in direct_frames
+        )
+
+    return {
+        "available": available,
+        "sample_count": len(samples),
+        "enabled_sample_count": enabled_sample_count,
+        "legacy_sample_count": legacy_sample_count,
+        "unavailable_reason": (
+            None
+            if available
+            else "all_publisher_handoff_frames_used_atomic_fallback"
+        ),
+        "comparison_basis": (
+            "committed direct schema-v3 frames on one monotonic clock; "
+            "atomic-fallback frames are excluded; worker serial-publication "
+            "wait is separated from post-predecessor adapter work"
+        ),
+        "total_observed_frame_count": len(all_frames),
+        "direct_incremental_frame_count": len(direct_frames),
+        "atomic_fallback_frame_count": len(fallback_frames),
+        "excluded_atomic_fallback_frame_count": len(fallback_frames),
+        "frame_ready_to_publish_request_seconds": distribution(
+            "frame_ready_to_publish_request_seconds"
+        ),
+        "prior_frame_serialization_wait_seconds": distribution(
+            "prior_frame_serialization_wait_seconds"
+        ),
+        "ready_or_prior_commit_to_publish_request_seconds": distribution(
+            "ready_or_prior_commit_to_publish_request_seconds"
+        ),
+        "publish_request_to_event_loop_callback_seconds": distribution(
+            "publish_request_to_event_loop_callback_seconds"
+        ),
+        "event_loop_callback_to_output_capacity_seconds": distribution(
+            "event_loop_callback_to_output_capacity_seconds"
+        ),
+        "output_capacity_to_enqueue_seconds": distribution(
+            "output_capacity_to_enqueue_seconds"
+        ),
+        "enqueue_to_dequeue_seconds": distribution(
+            "enqueue_to_dequeue_seconds"
+        ),
+        "frame_ready_to_enqueue_seconds": distribution(
+            "frame_ready_to_enqueue_seconds"
+        ),
+        "frame_ready_to_enqueue_over_100ms_count": sum(
+            frame.frame_ready_to_enqueue_seconds > 0.1
+            for frame in direct_frames
+        ),
+        "frame_ready_to_enqueue_over_1s_count": sum(
+            frame.frame_ready_to_enqueue_seconds > 1.0
+            for frame in direct_frames
+        ),
+        "dequeue_to_send_start_seconds": distribution(
+            "dequeue_to_send_start_seconds"
+        ),
+        "send_start_to_completion_seconds": distribution(
+            "send_start_to_completion_seconds"
+        ),
+        "frame_ready_to_send_completion_seconds": distribution(
+            "frame_ready_to_send_completion_seconds"
         ),
     }
 
@@ -2345,6 +2947,11 @@ def _structural_digest(samples: Sequence[SampleLatency]) -> str:
                         round(value, 6)
                         for value in series.inter_response_arrival_ms
                     ],
+                    list(series.response_cumulative_audio_bytes),
+                    [
+                        round(value, 6)
+                        for value in series.response_received_elapsed_ms
+                    ],
                 ]
             )
         for publication in sample.incremental_publications:
@@ -2364,6 +2971,26 @@ def _structural_digest(samples: Sequence[SampleLatency]) -> str:
                     round(publication.tts_first_elapsed_ms, 6),
                     round(publication.tts_completed_elapsed_ms, 6),
                     publication.atomic_fallback_applied,
+                ]
+            )
+        for handoff in sample.publisher_handoffs:
+            records.append(
+                [
+                    sample.sample_index,
+                    sample.telemetry_schema_version,
+                    "publisher_handoff_frame",
+                    list(handoff.identity),
+                    handoff.audio_bytes,
+                    handoff.retry_count,
+                    round(handoff.frame_ready_ms, 6),
+                    round(handoff.publish_requested_ms, 6),
+                    round(handoff.event_loop_callback_started_ms, 6),
+                    round(handoff.output_capacity_acquired_ms, 6),
+                    round(handoff.frame_enqueued_ms, 6),
+                    round(handoff.frame_dequeued_ms, 6),
+                    round(handoff.send_started_ms, 6),
+                    round(handoff.send_completed_ms, 6),
+                    handoff.atomic_fallback_applied,
                 ]
             )
     encoded = json.dumps(
@@ -2409,6 +3036,7 @@ def _sample_payload(sample: SampleLatency) -> dict[str, Any]:
                 item.atomic_fallback_applied
                 for item in sample.incremental_publications
             ),
+            "publisher_handoff_frames": len(sample.publisher_handoffs),
         },
         "request_level": _observed_metrics((sample,)),
         "parent_level": _parent_metrics((sample,)),
@@ -2416,6 +3044,7 @@ def _sample_payload(sample: SampleLatency) -> dict[str, Any]:
             _incremental_publication_metrics((sample,))
         ),
         "tts_response_chunk_diagnostic": _response_chunk_metrics((sample,)),
+        "tts_publisher_handoff": _publisher_handoff_metrics((sample,)),
         "initial_server_path": _initial_path(sample),
     }
 
@@ -2470,6 +3099,9 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             for sample in normalized
             for item in sample.tts_response_series
         ),
+        "publisher_handoff_frames": sum(
+            len(sample.publisher_handoffs) for sample in normalized
+        ),
     }
     frame_durations = sorted(
         {round(sample.harness_frame_duration_ms, 6) for sample in normalized}
@@ -2519,6 +3151,12 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
                 "WebSocket metrics, but are excluded from direct incremental "
                 "first-publish distributions"
             ),
+            "schema_v3_publisher_handoff": (
+                "per-frame intervals span frame readiness in the TTS worker, "
+                "publisher request, event-loop callback, output admission, "
+                "dequeue, and successful WebSocket send; atomic-fallback "
+                "frames are excluded from direct handoff distributions"
+            ),
             "negative_boundary_latency_is_retained": True,
         },
         "caveats": {
@@ -2567,6 +3205,7 @@ def build_analysis(samples: Sequence[SampleLatency]) -> dict[str, Any]:
             "tts_response_chunk_diagnostic": _response_chunk_metrics(
                 normalized
             ),
+            "tts_publisher_handoff": _publisher_handoff_metrics(normalized),
         },
         "samples": [_sample_payload(sample) for sample in normalized],
     }
@@ -2717,6 +3356,123 @@ def render_markdown(analysis: dict[str, Any]) -> str:
                     "schema-v3 parent(s) used the short-parent atomic "
                     "fallback. Audience-facing WebSocket and parent latency "
                     "metrics above still include those parents."
+                ),
+            ]
+        )
+
+    handoff = aggregate["tts_publisher_handoff"]
+    if handoff["available"]:
+        lines.extend(
+            [
+                "",
+                "## TTS publisher handoff (schema v3)",
+                "",
+                (
+                    f"Observed {handoff['direct_incremental_frame_count']:,} "
+                    "direct incremental frame handoff(s). Excluded "
+                    f"{handoff['excluded_atomic_fallback_frame_count']:,} "
+                    "atomic-fallback frame(s) from direct handoff "
+                    "distributions."
+                ),
+                "",
+                "| Interval | Count | Min | p50 | p95 | Max | Mean |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        handoff_rows = (
+            (
+                "Frame ready → publish request (serial total)",
+                handoff["frame_ready_to_publish_request_seconds"],
+            ),
+            (
+                "Prior-frame serialization wait",
+                handoff["prior_frame_serialization_wait_seconds"],
+            ),
+            (
+                "Ready/prior commit → publish request",
+                handoff[
+                    "ready_or_prior_commit_to_publish_request_seconds"
+                ],
+            ),
+            (
+                "Publish request → event-loop callback",
+                handoff[
+                    "publish_request_to_event_loop_callback_seconds"
+                ],
+            ),
+            (
+                "Event-loop callback → output capacity",
+                handoff[
+                    "event_loop_callback_to_output_capacity_seconds"
+                ],
+            ),
+            (
+                "Output capacity → enqueue",
+                handoff["output_capacity_to_enqueue_seconds"],
+            ),
+            (
+                "Enqueue → dequeue",
+                handoff["enqueue_to_dequeue_seconds"],
+            ),
+            (
+                "Frame ready → enqueue",
+                handoff["frame_ready_to_enqueue_seconds"],
+            ),
+            (
+                "Dequeue → WebSocket send start",
+                handoff["dequeue_to_send_start_seconds"],
+            ),
+            (
+                "WebSocket send start → completion",
+                handoff["send_start_to_completion_seconds"],
+            ),
+            (
+                "Frame ready → WebSocket send completion",
+                handoff["frame_ready_to_send_completion_seconds"],
+            ),
+        )
+        for name, distribution in handoff_rows:
+            lines.append(
+                "| {name} | {count:,} | {minimum} | {p50} | {p95} | "
+                "{maximum} | {mean} |".format(
+                    name=name,
+                    count=distribution["observation_count"],
+                    minimum=_format_seconds(distribution["min"]),
+                    p50=_format_seconds(distribution["p50"]),
+                    p95=_format_seconds(distribution["p95"]),
+                    maximum=_format_seconds(distribution["max"]),
+                    mean=_format_seconds(distribution["mean"]),
+                )
+            )
+        lines.extend(
+            [
+                "",
+                (
+                    "Frame ready → enqueue exceeded 100 ms for "
+                    f"{handoff['frame_ready_to_enqueue_over_100ms_count']:,} "
+                    "frame(s) and exceeded 1 s for "
+                    f"{handoff['frame_ready_to_enqueue_over_1s_count']:,} "
+                    "frame(s)."
+                ),
+                "",
+                (
+                    "The serial-total row can include earlier-frame output "
+                    "backpressure when one TTS response yields multiple "
+                    "frames. Use the two predecessor-aware rows to separate "
+                    "that propagated wait from worker/adapter work."
+                ),
+            ]
+        )
+    elif handoff.get("atomic_fallback_frame_count", 0):
+        lines.extend(
+            [
+                "",
+                "## TTS publisher handoff (schema v3)",
+                "",
+                (
+                    "Direct publisher-handoff interpretation is unavailable: "
+                    f"all {handoff['atomic_fallback_frame_count']:,} observed "
+                    "frame(s) came from atomic-fallback parents."
                 ),
             ]
         )

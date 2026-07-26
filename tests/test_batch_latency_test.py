@@ -637,6 +637,196 @@ def successful_staged_export_v3():
     }
 
 
+def enable_publisher_handoff_v3(export, config):
+    config["stagedConfig"].update(
+        {
+            "ttsPublisherHandoffTelemetryEnabled": True,
+            "ttsResponseChunkTelemetryEnabled": True,
+        }
+    )
+    export.update(
+        {
+            "tts_publisher_handoff_telemetry_enabled": True,
+            "tts_response_chunk_telemetry_enabled": True,
+        }
+    )
+    canonical_keys = [
+        (item["parent_sequence_id"], item["audio_frame_id"])
+        for item in export["published_audio_frame_keys"]
+    ]
+    retry_by_parent = {
+        item["parent_sequence_id"]: item["retry_count"]
+        for item in export["produced_parent_summaries"]
+    }
+    fallback_by_parent = {
+        item["parent_sequence_id"]: item.get(
+            "atomic_fallback_applied",
+            False,
+        )
+        for item in export["produced_parent_summaries"]
+    }
+    direct_ready_by_key = {
+        key: 1_000.0 + index * 100.0
+        for index, key in enumerate(canonical_keys)
+    }
+    ready_by_key = dict(direct_ready_by_key)
+    for parent, fallback_applied in fallback_by_parent.items():
+        if not fallback_applied:
+            continue
+        parent_ready = min(
+            direct_ready_by_key[key]
+            for key in canonical_keys
+            if key[0] == parent
+        )
+        for key in canonical_keys:
+            if key[0] == parent:
+                ready_by_key[key] = parent_ready
+
+    for event in export["events"]:
+        event_name = (event.get("stage"), event.get("event"))
+        if event_name not in {
+            ("tts", "frame_received"),
+            ("output", "frame_enqueued"),
+            ("output", "frame_dequeued"),
+        }:
+            continue
+        key = (event["parent_sequence_id"], event["audio_frame_id"])
+        ready_ms = ready_by_key[key]
+        request_offset = key[1] * 10.0
+        requested_ms = ready_ms + 1.0 + request_offset
+        event["retry_count"] = retry_by_parent[key[0]]
+        event.update(
+            {
+                "session_id": export["session_id"],
+                "error_code": "",
+                "emission_reason": "punctuation",
+                "asr_final_id": None,
+                "contributing_final_ids": [key[0]],
+                "source_start_ms": key[0] * 1_000.0,
+                "source_end_ms": key[0] * 1_000.0 + 500.0,
+            }
+        )
+        if event_name == ("tts", "frame_received"):
+            event["monotonic_ms"] = ready_ms
+        elif event_name == ("output", "frame_enqueued"):
+            event.update(
+                {
+                    "publish_requested_monotonic_ms": requested_ms,
+                    "event_loop_callback_started_monotonic_ms": (
+                        requested_ms + 1.0
+                    ),
+                    "output_capacity_acquired_monotonic_ms": (
+                        requested_ms + 3.0
+                    ),
+                    "monotonic_ms": requested_ms + 4.0,
+                    "blocked_put_ms": 0.0,
+                }
+            )
+        else:
+            event["monotonic_ms"] = requested_ms + 5.0
+    for event in export["websocket_send_events"]:
+        key = (event["parent_sequence_id"], event["audio_frame_id"])
+        requested_ms = ready_by_key[key] + 1.0 + key[1] * 10.0
+        event["send_started_monotonic_ms"] = requested_ms + 6.0
+        event["sent_monotonic_ms"] = requested_ms + 7.0
+
+    chunks = []
+    bytes_per_ms = (
+        export["tts_incremental_frame_bytes"]
+        / config["stagedConfig"]["ttsIncrementalFrameMs"]
+    )
+    response_times_by_parent = {}
+    for parent in sorted(retry_by_parent):
+        parent_frames = [
+            (key, audio_bytes)
+            for key, audio_bytes in zip(
+                canonical_keys,
+                export["published_audio_frame_bytes"],
+            )
+            if key[0] == parent
+        ]
+        if fallback_by_parent[parent]:
+            completion_ms = ready_by_key[parent_frames[0][0]]
+            response_times = [
+                completion_ms - (len(parent_frames) - index) * 10.0
+                for index in range(len(parent_frames))
+            ]
+        else:
+            response_times = [
+                ready_by_key[key] for key, _audio_bytes in parent_frames
+            ]
+        response_times_by_parent[parent] = response_times
+        request_started_ms = response_times[0] - 100.0
+        cumulative_bytes = 0
+        cumulative_duration_ms = 0.0
+        previous_received_ms = request_started_ms
+        for response_index, (
+            (_key, audio_bytes),
+            received_ms,
+        ) in enumerate(zip(parent_frames, response_times)):
+            audio_duration_ms = audio_bytes / bytes_per_ms
+            cumulative_bytes += audio_bytes
+            cumulative_duration_ms += audio_duration_ms
+            chunks.append(
+                {
+                    "parent_sequence_id": parent,
+                    "subsequence_id": 0,
+                    "subsequence_count": 1,
+                    "response_index": response_index,
+                    "response_count": len(parent_frames),
+                    "audio_bytes": audio_bytes,
+                    "cumulative_audio_bytes": cumulative_bytes,
+                    "audio_duration_ms": audio_duration_ms,
+                    "cumulative_audio_duration_ms": cumulative_duration_ms,
+                    "received_monotonic_ms": received_ms,
+                    "since_request_start_ms": (
+                        received_ms - request_started_ms
+                    ),
+                    "since_previous_response_ms": (
+                        received_ms - previous_received_ms
+                    ),
+                    "retry_count": retry_by_parent[parent],
+                }
+            )
+            previous_received_ms = received_ms
+
+    lifecycle_events = []
+    for parent in sorted(retry_by_parent):
+        response_times = response_times_by_parent[parent]
+        completion_ms = (
+            ready_by_key[
+                next(key for key in canonical_keys if key[0] == parent)
+            ]
+            if fallback_by_parent[parent]
+            else response_times[-1] + 50.0
+        )
+        lifecycle_events.append(
+            {
+                "session_id": export["session_id"],
+                "stage": "tts",
+                "event": "first_audio",
+                "sequence_id": parent,
+                "monotonic_ms": response_times[0],
+            }
+        )
+        completed = next(
+            event
+            for event in export["events"]
+            if (event.get("stage"), event.get("event"))
+            == ("tts", "completed")
+            and event.get("sequence_id") == parent
+        )
+        completed["monotonic_ms"] = completion_ms
+    export["events"].extend(lifecycle_events)
+    export["tts_response_chunk_telemetry"] = {
+        "schema_version": 1,
+        "segments_observed": len(retry_by_parent),
+        "response_chunk_count": len(chunks),
+        "chunks": chunks,
+    }
+    return export, config
+
+
 def enable_atomic_fallback_v3(
     export,
     config,
@@ -1062,6 +1252,571 @@ def test_staged_integrity_accepts_schema_v3_incremental_frame_lifecycle():
     )
 
     assert errors == []
+
+
+def test_staged_integrity_v3_accepts_publisher_handoff_telemetry():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_v3_rejects_enabled_handoff_without_config_marker():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    del config["stagedConfig"]["ttsPublisherHandoffTelemetryEnabled"]
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "ttsPublisherHandoffTelemetryEnabled=true" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_incorrect_computed_config_capability():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    config["stagedConfig"].update(
+        {
+            "ttsResponseChunkTelemetryEnabled": True,
+            "ttsPublisherHandoffTelemetryEnabled": False,
+        }
+    )
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "must equal ttsIncrementalPublishEnabled" in error for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_explicit_false_handoff_summary_marker():
+    export = successful_staged_export_v3()
+    export["tts_publisher_handoff_telemetry_enabled"] = False
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        staged_config_v3(),
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "legacy captures must omit the marker" in error for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_enabled_handoff_without_response_sidecar():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    del export["tts_response_chunk_telemetry"]
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "requires tts_response_chunk_telemetry" in error for error in errors
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "publish_requested_monotonic_ms",
+        "event_loop_callback_started_monotonic_ms",
+        "output_capacity_acquired_monotonic_ms",
+    ],
+)
+def test_staged_integrity_v3_requires_every_enqueue_boundary(field):
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    enqueued = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("output", "frame_enqueued")
+    )
+    del enqueued[field]
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(field in error for error in errors)
+
+
+def test_staged_integrity_v3_requires_websocket_send_started_boundary():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    del export["websocket_send_events"][0]["send_started_monotonic_ms"]
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("send_started_monotonic_ms" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("error_code", "free-form-error", "empty success code"),
+        ("emission_reason", "customer-label", "fixed supported value"),
+        ("source_start_ms", "not-numeric", "non-negative, finite"),
+        (
+            "contributing_final_ids",
+            [0, "external-id"],
+            "non-negative integer IDs",
+        ),
+        ("session_id", "", "nonempty and match"),
+    ],
+)
+def test_staged_integrity_v3_rejects_frame_value_smuggling(
+    field,
+    value,
+    message,
+):
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    row = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("output", "frame_enqueued")
+    )
+    row[field] = value
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(message in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("layer", "field", "value"),
+    [
+        ("enqueued", "publish_requested_monotonic_ms", 999.0),
+        (
+            "enqueued",
+            "event_loop_callback_started_monotonic_ms",
+            1_000.5,
+        ),
+        (
+            "enqueued",
+            "output_capacity_acquired_monotonic_ms",
+            1_001.5,
+        ),
+        ("enqueued", "monotonic_ms", 1_003.0),
+        ("dequeued", "monotonic_ms", 1_004.5),
+        ("websocket", "send_started_monotonic_ms", 1_005.5),
+        ("websocket", "sent_monotonic_ms", 1_006.5),
+    ],
+)
+def test_staged_integrity_v3_rejects_handoff_timestamp_inversion(
+    layer,
+    field,
+    value,
+):
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    if layer == "websocket":
+        row = export["websocket_send_events"][0]
+    else:
+        row = next(
+            event
+            for event in export["events"]
+            if (event.get("stage"), event.get("event"))
+            == ("output", f"frame_{layer}")
+        )
+    row[field] = value
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("timestamps are inverted" in error for error in errors)
+
+
+def test_staged_integrity_v3_rejects_global_boundary_column_regression():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    first_send = export["websocket_send_events"][0]
+    first_send["send_started_monotonic_ms"] = 1_150.0
+    first_send["sent_monotonic_ms"] = 1_151.0
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "send_started timestamps must be globally nondecreasing" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize(
+    ("layer", "field", "value"),
+    [
+        ("tts", "audio_bytes", 1_234),
+        ("output", "retry_count", 1),
+        ("websocket", "audio_frame_id", 99),
+    ],
+)
+def test_staged_integrity_v3_rejects_handoff_layer_mismatch(
+    layer,
+    field,
+    value,
+):
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    if layer == "websocket":
+        row = export["websocket_send_events"][0]
+    else:
+        row = next(
+            event
+            for event in export["events"]
+            if event.get("stage") == layer
+            and event.get("event")
+            in {"frame_received", "frame_enqueued"}
+        )
+    row[field] = value
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "canonical frame" in error or "retry coverage" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_duplicate_handoff_frame_row():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    duplicate = next(
+        dict(event)
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("tts", "frame_received")
+    )
+    export["events"].append(duplicate)
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("exactly one canonical frame row" in error for error in errors)
+
+
+def test_staged_integrity_v3_rejects_response_first_audio_mismatch():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    first_audio = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("tts", "first_audio")
+        and event.get("sequence_id") == 0
+    )
+    first_audio["monotonic_ms"] += 1.0
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("tts/first_audio does not match" in error for error in errors)
+
+
+def test_staged_integrity_v3_rejects_response_after_tts_completion():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    completed = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("tts", "completed")
+        and event.get("sequence_id") == 0
+    )
+    completed["monotonic_ms"] = 1_099.0
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("final response chunk follows" in error for error in errors)
+
+
+def test_staged_integrity_v3_rejects_direct_frame_response_boundary_mismatch():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    received = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("tts", "frame_received")
+        and event.get("parent_sequence_id") == 0
+        and event.get("audio_frame_id") == 1
+    )
+    received["monotonic_ms"] += 0.5
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "readiness does not match cumulative TTS response bytes" in error
+        for error in errors
+    )
+
+
+def test_staged_integrity_v3_accepts_atomic_fallback_handoff_boundary():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    enable_atomic_fallback_v3(export, config)
+    enable_publisher_handoff_v3(export, config)
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_v3_rejects_atomic_fallback_ready_before_completion():
+    export = successful_staged_export_v3()
+    config = staged_config_v3()
+    enable_atomic_fallback_v3(export, config)
+    enable_publisher_handoff_v3(export, config)
+    fallback_received = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("tts", "frame_received")
+        and event.get("parent_sequence_id") == 1
+    )
+    fallback_received["monotonic_ms"] -= 1.0
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("must match tts/completed" in error for error in errors)
+
+
+def test_staged_integrity_v3_does_not_treat_unblocked_capacity_gap_as_wait():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    enqueued = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("output", "frame_enqueued")
+        and event.get("parent_sequence_id") == 1
+    )
+    dequeued = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("output", "frame_dequeued")
+        and event.get("parent_sequence_id") == 1
+    )
+    websocket = next(
+        event
+        for event in export["websocket_send_events"]
+        if event.get("parent_sequence_id") == 1
+    )
+    enqueued.update(
+        {
+            "output_capacity_acquired_monotonic_ms": 1_240.0,
+            "monotonic_ms": 1_241.0,
+            "blocked_put_ms": 0.0,
+        }
+    )
+    dequeued["monotonic_ms"] = 1_242.0
+    websocket.update(
+        {
+            "send_started_monotonic_ms": 1_243.0,
+            "sent_monotonic_ms": 1_244.0,
+        }
+    )
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert errors == []
+
+
+def test_staged_integrity_v3_reconciles_handoff_blocked_wait_with_tolerance():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    enqueued = next(
+        event
+        for event in export["events"]
+        if (event.get("stage"), event.get("event"))
+        == ("output", "frame_enqueued")
+    )
+    enqueued["blocked_put_ms"] = 12.0
+    accepted = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+    assert accepted == []
+
+    enqueued["blocked_put_ms"] = 12.001
+    rejected = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+    assert any("blocked_put_ms does not reconcile" in error for error in rejected)
+
+
+@pytest.mark.parametrize("location", ["event", "websocket", "response_chunk"])
+def test_staged_integrity_v3_rejects_private_handoff_payload_fields(location):
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    if location == "event":
+        row = next(
+            event
+            for event in export["events"]
+            if (event.get("stage"), event.get("event"))
+            == ("tts", "frame_received")
+        )
+        row["audio"] = "raw-payload"
+    elif location == "websocket":
+        export["websocket_send_events"][0]["transcript"] = "private-text"
+    else:
+        export["tts_response_chunk_telemetry"]["chunks"][0][
+            "endpoint"
+        ] = "private-endpoint"
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any(
+        "private or unsupported payload fields" in error for error in errors
+    )
+
+
+def test_staged_integrity_v3_rejects_handoff_fields_without_active_marker():
+    export, config = enable_publisher_handoff_v3(
+        successful_staged_export_v3(),
+        staged_config_v3(),
+    )
+    export["tts_publisher_handoff_telemetry_enabled"] = False
+    config["stagedConfig"]["ttsPublisherHandoffTelemetryEnabled"] = False
+
+    errors = validate_staged_pipeline_integrity(
+        export,
+        config,
+        successful_websocket_receive_events_v3(),
+        4.5,
+    )
+
+    assert any("timing fields require" in error for error in errors)
 
 
 def test_staged_integrity_v3_accepts_mixed_atomic_fallback():

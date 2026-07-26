@@ -261,10 +261,13 @@ def incremental_parent_complete(
 class FakeIncrementalStagedPipeline(FakeStagedPipeline):
     """Schema-v3 output fake with independent frame/parent accounting."""
 
-    def __init__(self):
+    def __init__(self, *, handoff_telemetry_enabled=False):
         super().__init__()
         self.config.tts_incremental_publish_enabled = True
         self.config.tts_incremental_atomic_fallback_max_chars = 4
+        self.config.tts_publisher_handoff_telemetry_enabled = (
+            handoff_telemetry_enabled
+        )
         self.published_audio_frame_keys = []
         self.published_audio_frame_bytes = []
         self.dequeued_audio_frame_keys = []
@@ -314,7 +317,7 @@ class FakeIncrementalStagedPipeline(FakeStagedPipeline):
             for item in self.produced_parent_summaries
             if item["atomic_fallback_applied"]
         ]
-        return {
+        result = {
             "telemetry_schema_version": 3,
             "tts_incremental_publish_enabled": True,
             "tts_incremental_atomic_fallback_max_chars": 4,
@@ -355,6 +358,9 @@ class FakeIncrementalStagedPipeline(FakeStagedPipeline):
                 else None
             ),
         }
+        if self.config.tts_publisher_handoff_telemetry_enabled:
+            result["tts_publisher_handoff_telemetry_enabled"] = True
+        return result
 
 
 @pytest.mark.asyncio
@@ -881,6 +887,45 @@ async def test_schema_v3_summary_reconciles_frames_bytes_and_parents(
         )
         for event in snapshot["websocket_send_events"]
     ] == [(0, 0, 2), (0, 1, 4)]
+    assert all(
+        "send_started_monotonic_ms" not in event
+        for event in snapshot["websocket_send_events"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_handoff_telemetry_records_websocket_send_start(
+    mock_websocket,
+):
+    pipeline = FakeIncrementalStagedPipeline(
+        handoff_telemetry_enabled=True
+    )
+    session = TranslationSession(
+        websocket=mock_websocket,
+        pipeline_mode="staged",
+        staged_pipeline_factory=lambda target: pipeline,
+    )
+
+    await session.start_stream("es-US")
+    await session.finish_input()
+    await pipeline.outputs.put(incremental_audio_frame(0, 0, b"aa"))
+    await pipeline.outputs.put(incremental_parent_complete(0, 1, 2))
+    await pipeline.outputs.put(
+        SimpleNamespace(kind=StagedOutputEventKind.COMPLETE)
+    )
+    await _wait_until(lambda: session.status is SessionStatus.COMPLETED)
+    snapshot = session.staged_telemetry_snapshot()
+
+    assert snapshot["tts_publisher_handoff_telemetry_enabled"] is True
+    assert len(snapshot["websocket_send_events"]) == 1
+    event = snapshot["websocket_send_events"][0]
+    assert event["parent_sequence_id"] == 0
+    assert event["audio_frame_id"] == 0
+    assert (
+        0
+        <= event["send_started_monotonic_ms"]
+        <= event["sent_monotonic_ms"]
+    )
 
 
 @pytest.mark.asyncio

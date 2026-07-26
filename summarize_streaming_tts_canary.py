@@ -245,6 +245,14 @@ def _backend_provenance(
     )
     if reported_incremental is not incremental:
         raise ValueError(f"{label}: incremental-publication flag mismatch")
+    reported_handoff = staged.get(
+        "ttsPublisherHandoffTelemetryEnabled"
+    )
+    if (
+        reported_handoff is not None
+        and reported_handoff is not incremental
+    ):
+        raise ValueError(f"{label}: publisher-handoff flag mismatch")
     if incremental:
         _integer(
             staged.get("ttsIncrementalFrameMs"),
@@ -278,6 +286,7 @@ def _backend_provenance(
         "ttsIncrementalPublishEnabled",
         "ttsIncrementalFrameMs",
         "ttsIncrementalAtomicFallbackMaxChars",
+        "ttsPublisherHandoffTelemetryEnabled",
     ):
         projection_staged.pop(field, None)
     return projection
@@ -1282,6 +1291,16 @@ def _load_arm(
         raise ValueError(f"{arm_name}: staged feature flags are inconsistent")
     if (staged.get("tts_incremental_publish_enabled", False) is not incremental):
         raise ValueError(f"{arm_name}: staged incremental flag is inconsistent")
+    reported_handoff = staged.get(
+        "tts_publisher_handoff_telemetry_enabled"
+    )
+    if (
+        reported_handoff is not None
+        and reported_handoff is not incremental
+    ):
+        raise ValueError(
+            f"{arm_name}: staged publisher-handoff flag is inconsistent"
+        )
     if (
         staged.get("state") != "closed"
         or staged.get("outcome") != "complete"

@@ -14,6 +14,10 @@ diagnostic components, not requirements for the primary service gate.
 For a completed schema-3 trace, use the
 [stage-burst attribution method](docs/STAGE_BURST_ATTRIBUTION.md) to separate
 ordinary first-frame availability from accumulated listener-queue growth.
+Use the
+[publisher-handoff diagnostic](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md) to split
+frame-ready-to-send delay across the TTS worker, event loop, bounded output
+queue, relay, and WebSocket writer.
 
 GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains the sanitized upstream history as a standalone repository and records that project as the upstream source.
 
@@ -41,6 +45,9 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A fail-closed, privacy-safe stage/burst analyzer that joins ASR, NMT, TTS,
   publisher, WebSocket, and client-schedule evidence without exporting text or
   private artifact identifiers
+- Default-off, per-frame TTS publisher-handoff timing that decomposes worker,
+  event-loop, output-capacity, dequeue, and WebSocket-send intervals without
+  changing PCM publication
 - A fail-closed schema-v3 trace joiner and lossy whole-parent freshness simulator at 5-, 8-, and 10-second queue caps
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
@@ -188,7 +195,7 @@ realtime-s2s-demo-app/
 ├── analyze_semantic_event_latency.py # Source-event parent-envelope gate
 ├── freshness_trace.py      # Fail-closed schema-v3 evidence join
 ├── playback_simulation.py  # No-drop and whole-parent queue simulators
-├── run_streaming_tts_canary.sh # Matched atomic/schema-v3 live canary
+├── run_streaming_tts_canary.sh # Matched or publisher-handoff live canary
 ├── summarize_streaming_tts_canary.py # Privacy-safe matched comparison
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
@@ -825,6 +832,19 @@ retry before any PCM is published; those parents remain in audience metrics
 but are excluded from the direct incremental-lead distribution. See the
 [incremental publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md).
 
+To run only the evidence-directed publisher-handoff arm, first use a one-minute
+preflight and promote the same clean commit to five minutes only if all timing,
+frame, byte, terminal, and privacy gates pass:
+
+```bash
+CANARY_MODE=handoff CANARY_DURATION_SECONDS=60 \
+  CANARY_INCREMENTAL_FRAME_MS=500 \
+  ./run_streaming_tts_canary.sh
+```
+
+See the
+[TTS publisher-handoff diagnostic](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md).
+
 Detailed guides:
 
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
@@ -852,6 +872,7 @@ Detailed guides:
 - [Default-off incremental TTS publication design](docs/STREAMING_TTS_PUBLICATION_DESIGN.md)
 - [Incremental TTS publication 60-second formal canary](docs/STREAMING_TTS_60S_CANARY_2026-07-24.md)
 - [Incremental TTS publication five-minute matched canary](docs/STREAMING_TTS_5MIN_CANARY_2026-07-24.md)
+- [TTS publisher-handoff diagnostic and promotion gate](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md)
 - [Schema-3 whole-parent freshness-cap simulation](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)

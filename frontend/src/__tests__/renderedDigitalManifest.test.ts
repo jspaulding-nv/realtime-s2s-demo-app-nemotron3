@@ -141,6 +141,7 @@ async function fixture() {
       ttsMaxSegmentAudioSeconds: 60,
       ttsMaxRetries: 1,
       ttsResponseChunkTelemetryEnabled: false,
+      ttsPublisherHandoffTelemetryEnabled: false,
       ttsSubsegmentMaxChars: 0,
       ttsSubsegmentMinChars: 12,
       closeTimeoutSeconds: 10,

@@ -188,10 +188,16 @@ class _ThreadsafeFramePublisher:
         """Return only after ``frame`` is committed to the output queue."""
         if self._thread_aborted.is_set():
             raise _FramePublisherAborted("incremental frame publisher aborted")
+        publish_requested_ms = (
+            self._session._clock_ms()
+            if self._session.config.tts_publisher_handoff_telemetry_enabled
+            else None
+        )
         pending = asyncio.run_coroutine_threadsafe(
             self._session._enqueue_incremental_frame(
                 frame,
                 abort_event=self._async_aborted,
+                publish_requested_monotonic_ms=publish_requested_ms,
             ),
             self._loop,
         )
@@ -425,8 +431,17 @@ class StagedPipelineSession:
             raise ValueError("timeout_s must be positive")
         get = self._wait_for_output_or_close()
         item = await (get if timeout_s is None else asyncio.wait_for(get, timeout_s))
-        self._output_queue.task_done()
         output = item.payload
+        handoff_dequeued_ms = (
+            self._clock_ms()
+            if (
+                self.config.tts_publisher_handoff_telemetry_enabled
+                and isinstance(output, StagedOutputEvent)
+                and output.kind is StagedOutputEventKind.AUDIO_FRAME
+            )
+            else None
+        )
+        self._output_queue.task_done()
         if not isinstance(output, StagedOutputEvent):
             raise StagedPipelineError("output queue contained an invalid item")
         if (
@@ -481,6 +496,11 @@ class StagedPipelineSession:
                 else "parent_complete_dequeued"
             )
         )
+        residence_clock_ms = (
+            handoff_dequeued_ms
+            if handoff_dequeued_ms is not None
+            else self._clock_ms()
+        )
         self._record(
             stage="output",
             event=event_name,
@@ -496,7 +516,10 @@ class StagedPipelineSession:
                 }
                 else self._output_queue.maxsize
             ),
-            queue_residence_ms=max(0.0, self._clock_ms() - item.enqueued_monotonic_ms),
+            queue_residence_ms=max(
+                0.0,
+                residence_clock_ms - item.enqueued_monotonic_ms,
+            ),
             audio_bytes=(
                 len(payload.audio)
                 if isinstance(payload, (SynthesizedSegment, SynthesizedAudioFrame))
@@ -520,6 +543,7 @@ class StagedPipelineSession:
                 )
                 else 0
             ),
+            monotonic_ms=handoff_dequeued_ms,
         )
         if output.kind in {
             StagedOutputEventKind.COMPLETE,
@@ -603,6 +627,8 @@ class StagedPipelineSession:
                     for metric in self._tts_response_chunk_metrics
                 ],
             }
+        if self.config.tts_publisher_handoff_telemetry_enabled:
+            result["tts_publisher_handoff_telemetry_enabled"] = True
         if self.config.tts_incremental_publish_enabled:
             atomic_fallback_parent_ids = [
                 item["parent_sequence_id"]
@@ -1331,8 +1357,26 @@ class StagedPipelineSession:
         frame: SynthesizedAudioFrame,
         *,
         abort_event: asyncio.Event,
+        publish_requested_monotonic_ms: Optional[float] = None,
     ) -> bool:
         """Commit one frame or return ``False`` before consuming capacity."""
+        handoff_telemetry_enabled = (
+            self.config.tts_publisher_handoff_telemetry_enabled
+        )
+        event_loop_callback_started_ms = (
+            self._clock_ms() if handoff_telemetry_enabled else None
+        )
+        if handoff_telemetry_enabled and publish_requested_monotonic_ms is None:
+            raise StagedPipelineError(
+                "publisher handoff telemetry requires a request timestamp"
+            )
+        if (
+            not handoff_telemetry_enabled
+            and publish_requested_monotonic_ms is not None
+        ):
+            raise StagedPipelineError(
+                "publisher handoff timestamp received while telemetry is disabled"
+            )
         if not self.config.tts_incremental_publish_enabled:
             raise StagedPipelineError(
                 "incremental frame received while schema 3 is disabled"
@@ -1346,7 +1390,11 @@ class StagedPipelineSession:
             return False
 
         slots = self._queue_slots["output"]
-        requested_ms = self._clock_ms()
+        requested_ms = (
+            event_loop_callback_started_ms
+            if handoff_telemetry_enabled
+            else self._clock_ms()
+        )
         was_full = slots.locked()
         acquire_task = asyncio.create_task(slots.acquire())
         abort_task = asyncio.create_task(abort_event.wait())
@@ -1394,8 +1442,12 @@ class StagedPipelineSession:
             await asyncio.gather(acquire_task, return_exceptions=True)
             return False
         abort_task.cancel()
-        accepted_ms = self._clock_ms()
-        blocked_ms = max(0.0, accepted_ms - requested_ms) if was_full else 0.0
+        capacity_acquired_ms = self._clock_ms()
+        blocked_ms = (
+            max(0.0, capacity_acquired_ms - requested_ms)
+            if was_full
+            else 0.0
+        )
         output = StagedOutputEvent(
             kind=StagedOutputEventKind.AUDIO_FRAME,
             frame=frame,
@@ -1411,7 +1463,7 @@ class StagedPipelineSession:
                 audio_duration_ms=frame.audio_duration_ms,
                 retry_count=frame.retry_count,
             )
-            self._record(
+            enqueue_record_candidate = self._build_record(
                 stage="output",
                 event="frame_enqueued",
                 segment=frame,
@@ -1421,12 +1473,36 @@ class StagedPipelineSession:
                 audio_bytes=len(frame.audio),
                 audio_duration_ms=frame.audio_duration_ms,
                 retry_count=frame.retry_count,
+                monotonic_ms=capacity_acquired_ms,
+                publish_requested_monotonic_ms=(
+                    publish_requested_monotonic_ms
+                ),
+                event_loop_callback_started_monotonic_ms=(
+                    event_loop_callback_started_ms
+                ),
+                output_capacity_acquired_monotonic_ms=(
+                    capacity_acquired_ms
+                    if handoff_telemetry_enabled
+                    else None
+                ),
             )
-            self._output_queue.put_nowait(_QueuedItem(output, accepted_ms))
+            # All validation and potentially fallible telemetry bookkeeping is
+            # complete before this timestamp. Queue insertion is the commit
+            # boundary and is the immediately following operation.
+            enqueued_ms = self._clock_ms()
+            enqueue_record = replace(
+                enqueue_record_candidate,
+                monotonic_ms=enqueued_ms,
+            )
+            self._output_queue.put_nowait(_QueuedItem(output, enqueued_ms))
         except Exception:
             slots.release()
             raise
 
+        # The frame is committed. A best-effort external telemetry sink must
+        # never turn that successful commit into a worker-visible failure that
+        # could cause the same PCM frame to be retried.
+        self._emit_record(enqueue_record, sink_errors_fatal=False)
         if was_full:
             self._blocked_put_counts["output"] += 1
         self._max_queue_depths["output"] = max(
@@ -1889,7 +1965,7 @@ class StagedPipelineSession:
                 return False
             await asyncio.sleep(0.01)
 
-    def _record(
+    def _build_record(
         self,
         *,
         stage: str,
@@ -1911,7 +1987,10 @@ class StagedPipelineSession:
         retry_count: int = 0,
         error_code: str = "",
         monotonic_ms: Optional[float] = None,
-    ) -> None:
+        publish_requested_monotonic_ms: Optional[float] = None,
+        event_loop_callback_started_monotonic_ms: Optional[float] = None,
+        output_capacity_acquired_monotonic_ms: Optional[float] = None,
+    ) -> PipelineEvent:
         source = _source_segment(segment)
         subsequence = (
             _subsequence_identity(segment)
@@ -1933,7 +2012,7 @@ class StagedPipelineSession:
             if isinstance(segment, SynthesizedStreamCompletion)
             else None
         )
-        record = PipelineEvent(
+        return PipelineEvent(
             session_id=self.session_id,
             stage=stage,
             event=event,
@@ -1972,11 +2051,98 @@ class StagedPipelineSession:
             atomic_fallback_applied=atomic_fallback_applied,
             retry_count=retry_count,
             error_code=error_code,
+            publish_requested_monotonic_ms=(
+                publish_requested_monotonic_ms
+            ),
+            event_loop_callback_started_monotonic_ms=(
+                event_loop_callback_started_monotonic_ms
+            ),
+            output_capacity_acquired_monotonic_ms=(
+                output_capacity_acquired_monotonic_ms
+            ),
         )
+
+    def _emit_record(
+        self,
+        record: PipelineEvent,
+        *,
+        sink_errors_fatal: bool = True,
+    ) -> None:
         if self._retain_telemetry:
             self._telemetry.append(record)
         if self._event_sink is not None:
-            self._event_sink(record)
+            try:
+                self._event_sink(record)
+            except Exception as exc:
+                if sink_errors_fatal:
+                    raise
+                self._cleanup_errors.append(
+                    {
+                        "stage": "telemetry",
+                        "code": type(exc).__name__,
+                        "error": (
+                            "event sink failed after committed output frame"
+                        ),
+                    }
+                )
+
+    def _record(
+        self,
+        *,
+        stage: str,
+        event: str,
+        segment: Any = None,
+        asr_final_id: Optional[int] = None,
+        contributing_final_ids: Tuple[int, ...] = (),
+        source_start_ms: Optional[float] = None,
+        source_end_ms: Optional[float] = None,
+        queue_depth: Optional[int] = None,
+        queue_capacity: Optional[int] = None,
+        queue_residence_ms: float = 0.0,
+        processing_duration_ms: float = 0.0,
+        blocked_put_ms: float = 0.0,
+        text_chars: int = 0,
+        parent_text_chars: Optional[int] = None,
+        audio_bytes: int = 0,
+        audio_duration_ms: float = 0.0,
+        retry_count: int = 0,
+        error_code: str = "",
+        monotonic_ms: Optional[float] = None,
+        publish_requested_monotonic_ms: Optional[float] = None,
+        event_loop_callback_started_monotonic_ms: Optional[float] = None,
+        output_capacity_acquired_monotonic_ms: Optional[float] = None,
+    ) -> None:
+        record = self._build_record(
+            stage=stage,
+            event=event,
+            segment=segment,
+            asr_final_id=asr_final_id,
+            contributing_final_ids=contributing_final_ids,
+            source_start_ms=source_start_ms,
+            source_end_ms=source_end_ms,
+            queue_depth=queue_depth,
+            queue_capacity=queue_capacity,
+            queue_residence_ms=queue_residence_ms,
+            processing_duration_ms=processing_duration_ms,
+            blocked_put_ms=blocked_put_ms,
+            text_chars=text_chars,
+            parent_text_chars=parent_text_chars,
+            audio_bytes=audio_bytes,
+            audio_duration_ms=audio_duration_ms,
+            retry_count=retry_count,
+            error_code=error_code,
+            monotonic_ms=monotonic_ms,
+            publish_requested_monotonic_ms=(
+                publish_requested_monotonic_ms
+            ),
+            event_loop_callback_started_monotonic_ms=(
+                event_loop_callback_started_monotonic_ms
+            ),
+            output_capacity_acquired_monotonic_ms=(
+                output_capacity_acquired_monotonic_ms
+            ),
+        )
+        self._emit_record(record)
 
 
 def _is_connected(client: Any) -> bool:

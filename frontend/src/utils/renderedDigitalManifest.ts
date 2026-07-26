@@ -610,6 +610,7 @@ export async function buildRenderedDigitalManifest({
     || stagedConfig.ttsMaxSegmentAudioSeconds !== 60
     || stagedConfig.ttsMaxRetries !== 1
     || stagedConfig.ttsResponseChunkTelemetryEnabled !== false
+    || stagedConfig.ttsPublisherHandoffTelemetryEnabled !== false
     || stagedConfig.ttsSubsegmentMaxChars !== 0
     || stagedConfig.ttsSubsegmentMinChars !== 12
     || stagedConfig.closeTimeoutSeconds !== 10
@@ -654,6 +655,9 @@ export async function buildRenderedDigitalManifest({
       tts_max_retries: stagedConfig.ttsMaxRetries,
       tts_response_chunk_telemetry_enabled: (
         stagedConfig.ttsResponseChunkTelemetryEnabled
+      ),
+      tts_publisher_handoff_telemetry_enabled: (
+        stagedConfig.ttsPublisherHandoffTelemetryEnabled
       ),
       tts_subsegment_max_chars: stagedConfig.ttsSubsegmentMaxChars,
       tts_subsegment_min_chars: stagedConfig.ttsSubsegmentMinChars,
