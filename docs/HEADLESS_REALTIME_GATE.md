@@ -276,6 +276,31 @@ Keep these clocks and tails distinct:
 - listener queue depth does not include ASR finalization, NMT, or the delay
   before a parent's first TTS frame arrives.
 
+### Attribute queue-growth windows
+
+After a complete schema-3 run, align all three retained CSV/summary pairs with
+the server stages and deterministic listener schedule:
+
+```bash
+PYTHONPATH=backend:.python-packages:. \
+python3 analyze_stage_burst_attribution.py \
+  experiment_results/<run-id>/repeat-01/*_results.csv \
+  --window-seconds 30 \
+  --top-window-count 5 \
+  --json-output experiment_results/<run-id>/stage_burst_attribution.json \
+  --markdown-output experiment_results/<run-id>/stage_burst_attribution.md
+```
+
+The analyzer fails closed on incompatible or inconsistent evidence and writes
+only neutral numeric aggregates. It reports aligned fixed-grid burst windows
+and separately labeled complete rolling-window associations. Keep the
+generated reports with the ignored raw run; commit only a reviewed sanitized
+summary.
+
+See [Stage-burst attribution](STAGE_BURST_ATTRIBUTION.md) for the method and
+[the 2026-07-26 formal result](STAGE_BURST_ATTRIBUTION_RESULT_2026-07-26.md)
+for the current interpretation.
+
 ## What can be claimed
 
 After a complete run, it is reasonable to claim that the pinned staged

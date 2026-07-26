@@ -11,6 +11,9 @@ For deployment qualification, use the
 [browser-independent real-time S2S gate](docs/HEADLESS_REALTIME_GATE.md).
 Chrome, Vite, and Web Audio are optional demonstration or rendered-digital
 diagnostic components, not requirements for the primary service gate.
+For a completed schema-3 trace, use the
+[stage-burst attribution method](docs/STAGE_BURST_ATTRIBUTION.md) to separate
+ordinary first-frame availability from accumulated listener-queue growth.
 
 GitHub permits only one fork of a source repository per owner. Because `jspaulding-nv/realtime-s2s-demo-app` already occupies that fork slot, this clean evaluation repository retains the sanitized upstream history as a standalone repository and records that project as the upstream source.
 
@@ -35,6 +38,9 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A dashboard switch for fixed 1.00x control runs versus adaptive runs, recorded in the CSV
 - A resumable one-command harness for sequential matched-policy runs across all three samples
 - Optional no-drop constant-rate/media-duration sweeps and wall-clock burst diagnostics over saved arrival traces
+- A fail-closed, privacy-safe stage/burst analyzer that joins ASR, NMT, TTS,
+  publisher, WebSocket, and client-schedule evidence without exporting text or
+  private artifact identifiers
 - A fail-closed schema-v3 trace joiner and lossy whole-parent freshness simulator at 5-, 8-, and 10-second queue caps
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
@@ -177,6 +183,7 @@ realtime-s2s-demo-app/
 ├── diagnose_short_segment.py # Privacy-safe isolated/context replay
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
+├── analyze_stage_burst_attribution.py # Stage timing and listener-burst attribution
 ├── analyze_freshness_cap.py # Parent-aware lossy queue counterfactual
 ├── analyze_semantic_event_latency.py # Source-event parent-envelope gate
 ├── freshness_trace.py      # Fail-closed schema-v3 evidence join
