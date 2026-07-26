@@ -42,6 +42,10 @@ from audio_metadata_protocol import (
     AudioMetadataProtocolError,
     AudioMetadataTracker,
 )
+from headless_playback_scheduler import (
+    HeadlessPlaybackScheduler,
+    validate_headless_playback_report,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -108,6 +112,34 @@ class DriftSample:
     drift_sec: float
 
 
+@dataclass(frozen=True)
+class ValidatedAudioFrame:
+    """Privacy-safe observation of one protocol-validated PCM frame.
+
+    The sink receives timing, identity, PCM-format, and source-attribution
+    metadata only. It deliberately does not receive the PCM payload, transcript,
+    translation, filename, URL, or a wall-clock timestamp.
+    """
+
+    arrival_seconds: float
+    audio_bytes: int
+    protocol_version: int
+    stream_generation: int
+    parent_sequence_id: int
+    audio_frame_id: int
+    sample_rate_hz: int
+    channels: int
+    bytes_per_sample: int
+    source_start_ms: float | None
+    source_end_ms: float | None
+
+
+# The callback executes inline in the sole WebSocket receive loop. It must be
+# an O(1), nonblocking observer: enqueue work with ``put_nowait`` if downstream
+# processing could perform I/O, wait on a device, or otherwise block.
+ValidatedAudioFrameSink = Callable[[ValidatedAudioFrame], None]
+
+
 @dataclass
 class TestResult:
     audio_path: str
@@ -132,6 +164,7 @@ class TestResult:
     source_end_to_receipt_p95_ms: float | None = None
     source_end_to_receipt_max_ms: float | None = None
     source_end_to_receipt_availability: str = "protocol_not_negotiated"
+    headless_playback_report: dict[str, Any] | None = None
     chunks_sent: int = 0
     audio_responses: int = 0
     total_received_bytes: int = 0
@@ -2351,11 +2384,41 @@ def validate_staged_pipeline_integrity(
     return errors
 
 
+def _canonical_capture_time(
+    monotonic_timestamp: float,
+    client_clock_origin: float,
+) -> tuple[float, float]:
+    """Return one persisted millisecond value and its scheduler coordinate."""
+
+    timestamp_ms = (
+        monotonic_timestamp - client_clock_origin
+    ) * 1000
+    return timestamp_ms, timestamp_ms / 1000.0
+
+
+def _relative_pacing_margin_ms(
+    *,
+    send_timestamp: float,
+    client_clock_origin: float,
+    sample_zero_timestamp_ms: float,
+    chunk_index: int,
+    chunk_duration_ms: float,
+) -> float:
+    """Compute a pacing margin in the exact coordinate system we persist."""
+
+    return (
+        (send_timestamp - client_clock_origin) * 1000
+        - sample_zero_timestamp_ms
+        - (chunk_index + 1) * chunk_duration_ms
+    )
+
+
 def validate_input_pacing_evidence(
     result: TestResult,
     *,
     require_chunk_events: bool,
     timing_tolerance_ms: float = 1e-6,
+    numeric_early_tolerance_ms: float = 1e-4,
 ) -> list[str]:
     """Validate measured end-boundary pacing provenance.
 
@@ -2472,7 +2535,7 @@ def validate_input_pacing_evidence(
         errors.append(
             "audio metadata input pacing emission margin range is invalid"
         )
-    elif minimum_margin < -timing_tolerance_ms:
+    elif minimum_margin < -numeric_early_tolerance_ms:
         errors.append(
             "audio metadata input pacing contains an early chunk emission"
         )
@@ -2540,7 +2603,7 @@ def validate_input_pacing_evidence(
         return errors
     calculated_minimum = min(calculated_margins)
     calculated_maximum = max(calculated_margins)
-    if calculated_minimum < -timing_tolerance_ms:
+    if calculated_minimum < -numeric_early_tolerance_ms:
         errors.append(
             "audio metadata input pacing event ledger contains an early "
             "chunk emission"
@@ -2892,6 +2955,90 @@ def validate_capture_result(
             require_pacing_chunk_events=require_pacing_chunk_events,
         )
     )
+    if result.audio_metadata_protocol_version is None:
+        if result.headless_playback_report is not None:
+            errors.append(
+                "headless playback report requires audio metadata "
+                "protocol version 1"
+            )
+    elif not isinstance(result.headless_playback_report, dict):
+        errors.append(
+            "audio metadata capture requires a headless playback report"
+        )
+    else:
+        report = result.headless_playback_report
+        try:
+            validate_headless_playback_report(
+                report,
+                expected_frames=result.audio_responses,
+                expected_parents=(
+                    result.audio_metadata_completed_parents
+                ),
+                expected_stream_generation=(
+                    result.audio_metadata_stream_generation
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            errors.append(f"headless playback report is invalid: {exc}")
+        if report.get("schema_version") != 1:
+            errors.append("headless playback report schema is invalid")
+        if (
+            report.get("report_type")
+            != "headless_scheduled_digital_playback"
+        ):
+            errors.append("headless playback report type is invalid")
+        capture = report.get("capture")
+        if not isinstance(capture, dict):
+            errors.append("headless playback capture summary is missing")
+        else:
+            if capture.get("frames_received") != result.audio_responses:
+                errors.append(
+                    "headless playback received-frame count does not "
+                    "match translated responses"
+                )
+            if capture.get("frames_scheduled") != result.audio_responses:
+                errors.append(
+                    "headless playback scheduled-frame count does not "
+                    "match translated responses"
+                )
+            if (
+                capture.get("complete_parents")
+                != result.audio_metadata_completed_parents
+            ):
+                errors.append(
+                    "headless playback parent count does not match "
+                    "protocol completion evidence"
+                )
+            if capture.get("canonical_replay_verified") is not True:
+                errors.append(
+                    "headless playback canonical replay was not verified"
+                )
+        queue_gate = report.get("queue_gate")
+        if not isinstance(queue_gate, dict):
+            errors.append("headless playback queue gate is missing")
+        elif (
+            queue_gate.get("frames_dropped") != 0
+            or queue_gate.get("frames_reordered") != 0
+            or queue_gate.get("frames_duplicated") != 0
+            or queue_gate.get("all_frames_preserved_once_in_order")
+            is not True
+        ):
+            errors.append(
+                "headless playback did not preserve every frame once "
+                "and in order"
+            )
+        privacy = report.get("privacy")
+        if not isinstance(privacy, dict) or any(
+            privacy.get(field_name) is not expected
+            for field_name, expected in {
+                "aggregate_only": True,
+                "contains_pcm": False,
+                "contains_transcript_or_translation_text": False,
+                "contains_file_path_or_uri": False,
+                "contains_wall_clock_timestamp": False,
+            }.items()
+        ):
+            errors.append("headless playback privacy declaration is invalid")
     errors.extend(result.staged_integrity_errors)
     return errors
 
@@ -3097,8 +3244,15 @@ async def run_test(
     backend_url: str,
     *,
     audio_metadata_protocol_version: int | None = None,
+    audio_frame_sink: ValidatedAudioFrameSink | None = None,
 ) -> TestResult:
-    """Run a single latency test against one audio file."""
+    """Run a single latency test against one audio file.
+
+    ``audio_frame_sink`` is an optional nonblocking observation hook invoked
+    after protocol-v1 header/binary validation. It executes inline so receipt
+    timestamps remain causally ordered; blocking work would perturb later
+    arrival measurements and must be queued by the callback instead.
+    """
 
     if (
         audio_metadata_protocol_version is not None
@@ -3112,6 +3266,18 @@ async def run_test(
         raise ValueError(
             "audio_metadata_protocol_version must be omitted or equal 1"
         )
+    if (
+        audio_frame_sink is not None
+        and audio_metadata_protocol_version is None
+    ):
+        raise ValueError(
+            "audio_frame_sink requires audio metadata protocol version 1"
+        )
+    headless_scheduler = (
+        HeadlessPlaybackScheduler()
+        if audio_metadata_protocol_version is not None
+        else None
+    )
 
     ws_url = backend_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/ws/translate"
@@ -3186,6 +3352,7 @@ async def run_test(
         *,
         frame_type: str,
         received_at: float,
+        timestamp_ms: float | None = None,
         control: dict[str, Any] | None = None,
         audio_bytes: int = 0,
         metadata: dict[str, Any] | None = None,
@@ -3194,7 +3361,11 @@ async def run_test(
         nonlocal receive_order
         event: dict[str, Any] = {
             "order": receive_order,
-            "timestamp_ms": (received_at - client_clock_origin) * 1000,
+            "timestamp_ms": (
+                timestamp_ms
+                if timestamp_ms is not None
+                else (received_at - client_clock_origin) * 1000
+            ),
             "frame_type": frame_type,
             "audio_bytes": audio_bytes,
         }
@@ -3327,17 +3498,29 @@ async def run_test(
             def record_successful_send(
                 idx: int,
                 send_timestamp: float,
-                deadline: float,
+                _deadline: float,
             ) -> None:
                 if audio_metadata_protocol_version is None:
                     return
-                pacing_margins_ms.append(
-                    (send_timestamp - deadline) * 1000
-                )
                 if not isinstance(result.input_pacing, dict):
                     raise RuntimeError(
                         "input pacing sample-zero anchor was not recorded"
                     )
+                if result.input_sample_zero_timestamp_ms is None:
+                    raise RuntimeError(
+                        "input pacing sample-zero marker was not recorded"
+                    )
+                pacing_margins_ms.append(
+                    _relative_pacing_margin_ms(
+                        send_timestamp=send_timestamp,
+                        client_clock_origin=client_clock_origin,
+                        sample_zero_timestamp_ms=(
+                            result.input_sample_zero_timestamp_ms
+                        ),
+                        chunk_index=idx,
+                        chunk_duration_ms=CHUNK_DURATION * 1000,
+                    )
+                )
                 result.input_pacing.update(
                     {
                         "observed_chunk_count": idx + 1,
@@ -3416,6 +3599,13 @@ async def run_test(
                     raw = await ws.recv()
                     if isinstance(raw, bytes):
                         recv_ts = time.monotonic()
+                        (
+                            arrival_timestamp_ms,
+                            arrival_seconds,
+                        ) = _canonical_capture_time(
+                            recv_ts,
+                            client_clock_origin,
+                        )
                         try:
                             paired_metadata = (
                                 metadata_tracker.accept_binary(raw)
@@ -3424,6 +3614,7 @@ async def run_test(
                             record_receive(
                                 frame_type="pcm",
                                 received_at=recv_ts,
+                                timestamp_ms=arrival_timestamp_ms,
                                 audio_bytes=len(raw),
                             )
                             server_error = (
@@ -3441,7 +3632,7 @@ async def run_test(
                             is not None
                         ):
                             source_end_to_receipt_ms = (
-                                (recv_ts - client_clock_origin) * 1000
+                                arrival_timestamp_ms
                                 - result.input_sample_zero_timestamp_ms
                                 - paired_metadata["sourceEndMs"]
                             )
@@ -3451,6 +3642,7 @@ async def run_test(
                         record_receive(
                             frame_type="pcm",
                             received_at=recv_ts,
+                            timestamp_ms=arrival_timestamp_ms,
                             audio_bytes=len(raw),
                             metadata=paired_metadata,
                             source_end_to_receipt_ms=(
@@ -3463,9 +3655,7 @@ async def run_test(
                         result.client_events.append(TimingEvent(
                             source="client",
                             stage="audio_received",
-                            timestamp_ms=(
-                                recv_ts - client_clock_origin
-                            ) * 1000,
+                            timestamp_ms=arrival_timestamp_ms,
                             chunk_index=recv_idx,
                             source_position_sec=total_recv_bytes / (SAMPLE_RATE * BYTES_PER_SAMPLE),
                             audio_bytes=len(raw),
@@ -3503,6 +3693,51 @@ async def run_test(
                                 source_end_to_receipt_ms
                             ),
                         ))
+                        if paired_metadata is not None:
+                            validated_frame = ValidatedAudioFrame(
+                                arrival_seconds=arrival_seconds,
+                                audio_bytes=len(raw),
+                                protocol_version=paired_metadata[
+                                    "protocolVersion"
+                                ],
+                                stream_generation=paired_metadata[
+                                    "streamGeneration"
+                                ],
+                                parent_sequence_id=paired_metadata[
+                                    "parentSequenceId"
+                                ],
+                                audio_frame_id=paired_metadata[
+                                    "audioFrameId"
+                                ],
+                                sample_rate_hz=paired_metadata[
+                                    "sampleRateHz"
+                                ],
+                                channels=paired_metadata["channels"],
+                                bytes_per_sample=paired_metadata[
+                                    "bytesPerSample"
+                                ],
+                                source_start_ms=paired_metadata[
+                                    "sourceStartMs"
+                                ],
+                                source_end_ms=paired_metadata[
+                                    "sourceEndMs"
+                                ],
+                            )
+                            try:
+                                if headless_scheduler is not None:
+                                    headless_scheduler.accept(
+                                        validated_frame
+                                    )
+                                if audio_frame_sink is not None:
+                                    audio_frame_sink(validated_frame)
+                            except Exception as exc:
+                                server_error = (
+                                    "validated audio frame sink failed: "
+                                    f"{type(exc).__name__}"
+                                )
+                                stream_abort.set()
+                                terminal_received.set()
+                                return
                         recv_idx += 1
                     elif isinstance(raw, str):
                         try:
@@ -3786,6 +4021,20 @@ async def run_test(
             result.source_end_to_receipt_samples_ms,
             default=None,
         )
+        if (
+            result.translation_completed
+            and not result.server_error
+            and headless_scheduler is not None
+            and result.input_sample_zero_timestamp_ms is not None
+        ):
+            result.headless_playback_report = headless_scheduler.finalize(
+                input_end_seconds=(
+                    result.input_end_timestamp_ms / 1000.0
+                ),
+                input_sample_zero_seconds=(
+                    result.input_sample_zero_timestamp_ms / 1000.0
+                ),
+            )
 
     # -- Compute summary stats ----------------------------------------------
     result.chunks_sent = chunks_sent
@@ -3898,7 +4147,13 @@ def generate_plot(result: TestResult, output_path: str):
 
 
 def generate_csv(result: TestResult, output_path: str):
-    """Write combined client + backend timing events to CSV."""
+    """Write combined client + backend timing events to CSV.
+
+    Float fields use Python's round-trip representation. Protocol-v1 artifact
+    replay must see the exact arrival/source values used by the live scheduler;
+    fixed decimal rounding could cross a 5/8/10-second policy boundary and
+    produce a different playback mode during resume validation.
+    """
     all_events = result.client_events + result.backend_events
     all_events.sort(key=lambda e: e.timestamp_ms)
 
@@ -3914,8 +4169,8 @@ def generate_csv(result: TestResult, output_path: str):
         ])
         for ev in all_events:
             writer.writerow([
-                ev.source, ev.stage, f"{ev.timestamp_ms:.2f}",
-                ev.chunk_index, f"{ev.source_position_sec:.3f}",
+                ev.source, ev.stage, repr(float(ev.timestamp_ms)),
+                ev.chunk_index, repr(float(ev.source_position_sec)),
                 ev.audio_bytes,
                 (
                     ev.protocol_version
@@ -3938,17 +4193,17 @@ def generate_csv(result: TestResult, output_path: str):
                     else ""
                 ),
                 (
-                    f"{ev.source_start_ms:.3f}"
+                    repr(float(ev.source_start_ms))
                     if ev.source_start_ms is not None
                     else ""
                 ),
                 (
-                    f"{ev.source_end_ms:.3f}"
+                    repr(float(ev.source_end_ms))
                     if ev.source_end_ms is not None
                     else ""
                 ),
                 (
-                    f"{ev.source_end_to_receipt_ms:.3f}"
+                    repr(float(ev.source_end_to_receipt_ms))
                     if ev.source_end_to_receipt_ms is not None
                     else ""
                 ),
@@ -4008,6 +4263,7 @@ def generate_summary(result: TestResult, output_path: str):
             "playback_behavior_changed": False,
             "contains_transcript_or_translation_text": False,
         },
+        "headless_playback": result.headless_playback_report,
         "input_duration_sec": result.duration_sec,
         "chunks_sent": result.chunks_sent,
         "audio_responses": result.audio_responses,

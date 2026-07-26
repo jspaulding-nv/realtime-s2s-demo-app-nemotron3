@@ -995,7 +995,7 @@ def _playback_metrics(
     expected_csv_name: str,
     label: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if analysis.get("schema_version") != 1:
+    if analysis.get("schema_version") not in {1, 2}:
         raise ValueError(f"{label}: unsupported playback schema")
     policy = _object(analysis.get("policy"), field="policy", label=label)
     traces = _list(analysis.get("traces"), field="traces", label=label)

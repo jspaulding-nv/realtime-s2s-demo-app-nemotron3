@@ -113,7 +113,7 @@ def _playback(*, streaming: bool) -> dict:
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "policy": {
             "target_queue_seconds": 5.0,
             "urgent_queue_seconds": 8.0,
@@ -664,6 +664,19 @@ def test_builds_privacy_safe_matched_comparison(tmp_path: Path) -> None:
     assert "localhost" not in rendered
     assert str(input_dir) not in rendered
     assert "shared-prefix.wav" not in rendered
+
+
+def test_archived_playback_schema_v1_remains_supported(tmp_path: Path) -> None:
+    input_dir, _ = _write_fixture(tmp_path)
+    for path in input_dir.glob("*/playback_policy_analysis.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = build_canary_summary(input_dir)
+
+    assert result["matched_design"]["passed"] is True
+    assert result["cross_arm_playback_conclusion"]["confounded"] is False
 
 
 def test_mixed_fallback_excludes_fallback_from_primary_direct_metrics(

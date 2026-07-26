@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 
 import pytest
@@ -9,16 +10,146 @@ from batch_latency_test import (
     INPUT_SAMPLE_ZERO_CLOCK,
     TestResult as BatchTestResult,
     TimingEvent,
+    _canonical_capture_time,
+    _relative_pacing_margin_ms,
     _send_pcm_chunks_at_end_boundaries,
     compute_playback_metrics,
     fetch_backend_export,
     fetch_backend_config,
+    generate_csv,
     generate_summary,
     resolve_pipeline_mode,
     run_batch,
     run_test,
+    validate_input_pacing_evidence,
     validate_staged_pipeline_integrity,
 )
+
+
+def test_relative_pacing_margin_matches_persisted_large_clock_coordinates():
+    """Large monotonic origins must not change arithmetic during replay."""
+
+    client_clock_origin = 9_876_543.0
+    sample_zero = client_clock_origin + 0.123456789
+    send_timestamp = sample_zero + 0.3
+    sample_zero_timestamp_ms = (
+        sample_zero - client_clock_origin
+    ) * 1000
+    persisted_ledger_margin_ms = (
+        (send_timestamp - client_clock_origin) * 1000
+        - sample_zero_timestamp_ms
+        - 300.0
+    )
+
+    observed = _relative_pacing_margin_ms(
+        send_timestamp=send_timestamp,
+        client_clock_origin=client_clock_origin,
+        sample_zero_timestamp_ms=sample_zero_timestamp_ms,
+        chunk_index=0,
+        chunk_duration_ms=300.0,
+    )
+
+    assert observed == persisted_ledger_margin_ms
+    assert observed == 7.450580596923828e-07
+
+
+def test_pacing_validator_allows_large_clock_numeric_early_noise():
+    """An on-deadline send can round a few nanoseconds early."""
+
+    client_clock_origin = 84_597_763.30097976
+    sample_zero = client_clock_origin + 0.757954403758049
+    send_timestamp = sample_zero + 0.3
+    sample_zero_timestamp_ms = (
+        sample_zero - client_clock_origin
+    ) * 1000
+    margin_ms = _relative_pacing_margin_ms(
+        send_timestamp=send_timestamp,
+        client_clock_origin=client_clock_origin,
+        sample_zero_timestamp_ms=sample_zero_timestamp_ms,
+        chunk_index=0,
+        chunk_duration_ms=300.0,
+    )
+    result = BatchTestResult(
+        audio_path="test.wav",
+        duration_sec=0.3,
+        chunks_sent=1,
+        input_sample_zero_timestamp_ms=sample_zero_timestamp_ms,
+        input_pacing={
+            "mode": INPUT_PACING_MODE,
+            "chunk_duration_ms": 300.0,
+            "source_sample_zero_clock": INPUT_SAMPLE_ZERO_CLOCK,
+            "deadline_basis": INPUT_PACING_DEADLINE_BASIS,
+            "source_sample_zero_timestamp_ms": sample_zero_timestamp_ms,
+            "observed_chunk_count": 1,
+            "min_emission_minus_deadline_ms": margin_ms,
+            "max_emission_minus_deadline_ms": margin_ms,
+        },
+        client_events=[
+            TimingEvent(
+                "client",
+                "chunk_sent",
+                (send_timestamp - client_clock_origin) * 1000,
+                0,
+                0.0,
+                9_600,
+            )
+        ],
+    )
+
+    assert -1e-4 <= margin_ms < -1e-6
+    assert validate_input_pacing_evidence(
+        result,
+        require_chunk_events=True,
+        timing_tolerance_ms=1e-9,
+        numeric_early_tolerance_ms=1e-4,
+    ) == []
+
+
+def test_canonical_capture_time_uses_persisted_scheduler_coordinate():
+    """Live and replay scheduling must use the same floating-point value."""
+
+    raw_arrival_seconds = 4_036.609045744068
+    timestamp_ms, scheduler_seconds = _canonical_capture_time(
+        raw_arrival_seconds,
+        0.0,
+    )
+
+    assert scheduler_seconds == timestamp_ms / 1000.0
+    assert scheduler_seconds != raw_arrival_seconds
+
+
+def test_generate_csv_preserves_playback_boundary_timestamp(tmp_path):
+    """Sub-hundredth-ms arrivals must survive artifact round trips exactly."""
+
+    boundary_timestamp_ms = 0.0049
+    result = BatchTestResult(
+        audio_path="test.wav",
+        duration_sec=5.0,
+        client_events=[
+            TimingEvent(
+                "client",
+                "audio_received",
+                boundary_timestamp_ms,
+                1,
+                5.0,
+                3_200,
+                protocol_version=1,
+                stream_generation=1,
+                parent_sequence_id=0,
+                audio_frame_id=1,
+                source_start_ms=0.0,
+                source_end_ms=5_000.0,
+                source_end_to_receipt_ms=-4_999.9951,
+            )
+        ],
+    )
+    csv_path = tmp_path / "results.csv"
+
+    generate_csv(result, str(csv_path))
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert float(row["timestamp_ms"]) == boundary_timestamp_ms
 
 
 def staged_config():

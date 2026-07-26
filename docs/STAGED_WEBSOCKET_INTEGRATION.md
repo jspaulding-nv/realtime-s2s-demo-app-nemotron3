@@ -17,9 +17,12 @@ preflight-gated three-sample matrix also passed its operational gates with
 2,027/2,027 ordered segments, but all three traces missed the audience queue
 gate. The remaining live promotion sequence is:
 
-1. execute browser/Web Audio queue measurements at 1.00x, 1.05x, and 1.10x;
-2. measure a synchronized source phrase to audible Spanish; and
-3. obtain native-Spanish review of any playback/prosody acceleration.
+1. execute the browser-independent scheduled-digital queue gate at 1.00x,
+   1.05x, and 1.10x;
+2. measure source-boundary freshness and then a synchronized source phrase to
+   the corresponding Spanish audio;
+3. optionally cross-check the selected client renderer on a common clock; and
+4. obtain native-Spanish review of any playback/prosody acceleration.
 
 ## Selecting the backend path
 
@@ -176,14 +179,20 @@ references for formal comparison runs. A historical summary without
 Formal runs should also begin at a clean Git commit and retain each source
 audio SHA from the harness manifest.
 
-## Browser audience evidence
+## Listener scheduling and optional browser evidence
 
-The normal translation panel displays the actual Web Audio schedule backlog,
+The primary repeatable gate is the Python WebSocket runner and deterministic
+no-drop listener scheduler described in
+[Browser-independent real-time S2S gate](HEADLESS_REALTIME_GATE.md). Chrome,
+Vite, and Web Audio are not required for that path.
+
+The optional translation panel displays its actual Web Audio schedule backlog,
 including current and peak seconds, playback rate/mode, and entries above the
 10-second limit. Stable `data-*` attributes make those values available to
 browser automation.
 
-The latency dashboard remains the authoritative detailed browser evidence. It
+For that browser implementation, the latency dashboard records detailed
+rendering evidence. It
 records queue samples and scheduled chunks in CSV. Natural test completion now
 requires all three conditions:
 
@@ -345,7 +354,7 @@ Hard gate:
 
 Audience/quality observations:
 
-- browser queue p95, peak, and time above 10 seconds;
+- listener-schedule queue p95, peak, and time above 10 seconds;
 - listener playback tail;
 - exact marked-phrase or joke delay;
 - exposure to 1.05x and 1.10x playback; and
@@ -354,8 +363,10 @@ Audience/quality observations:
 The 5-10 second playback queue remains a soft audience target, not a guaranteed
 hard bound. If translated production persistently exceeds 1.10x consumption,
 the application cannot preserve every word and also enforce a hard queue cap.
-Browser queue distributions, synchronized marked-phrase delay, and native
-Spanish review of 1.05x/1.10x playback remain pending.
+Scheduled-digital queue distributions, synchronized marked-phrase delay, and
+native Spanish review of 1.05x/1.10x playback remain the relevant evidence.
+An optional rendered-client cross-check is separate and need not use Chrome in
+deployment.
 
 ### Post-canary hardening status
 

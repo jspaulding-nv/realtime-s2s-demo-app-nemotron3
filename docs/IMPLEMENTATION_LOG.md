@@ -1551,6 +1551,60 @@ pacing, queue, and audience-latency gates remain unchanged. See
 [Chrome render-clock shadow diagnostic
 result](RENDER_CLOCK_SHADOW_RESULT_2026-07-26.md).
 
+## 2026-07-26: browser-independent scheduled-playback gate
+
+The primary deployment-oriented gate no longer depends on Chrome, Vite, Web
+Audio, a display server, a microphone, or an output sound device. The existing
+Python WebSocket client already supplied absolute source-end pacing, staged
+Riva transport, terminal-aware drain behavior, and three-sample automation.
+The new integration sends each protocol-v1 PCM frame to the headless scheduler
+only after strict metadata-header/binary pairing succeeds.
+
+The scheduler accepts no PCM payload, transcript, translation, path, URI, or
+wall-clock timestamp. It schedules every validated frame immediately with the
+registered 5/8/10-second, 1.00x/1.05x/1.10x no-drop policy and independently
+replays the completed trace through `simulate_playback`. A mismatch fails the
+capture. Per-sample summaries now include an aggregate-only report with:
+
+- exact time-weighted queue percentiles, peak, threshold exposure, and rate
+  occupancy;
+- a mechanical pass criterion of queue p95 at or below five seconds, peak at
+  or below ten seconds, and zero drop/reorder/duplicate counts;
+- source-end to first-arrival and scheduled-parent-envelope timing;
+- first-versus-final-quartile source-frontier drift when at least four parents
+  have bounded ASR source ranges; and
+- explicit flags that scheduled digital playback is not DAC/acoustic
+  audibility or an exact joke/punchline landmark measurement.
+
+The saved-CSV analyzer now emits schema 2 and repeats the fixed/adaptive
+source-frontier projection. Legacy traces remain supported, and older canary
+summarizers accept both schema 1 and schema 2. The formal three-sample command
+remains:
+
+```bash
+python3 run_long_form_experiment.py --audio-metadata-protocol-v1
+```
+
+After the artifact-integrity and large-clock timing review, the intended
+automated Python suites passed with 1,123 tests and one environment-specific
+skip. Root-level manual microphone scripts were excluded because this headless
+VM has no PortAudio device/library.
+
+A live 60-second staged preflight then passed against the three healthy pinned
+services. It sent all 200 source chunks at real-time pace, received and
+scheduled 112 translated frames, drained through the single completed
+terminal, produced 49.7 seconds of translated PCM (0.828x of the whole input),
+and measured a 1.4-second service tail. The new report validator found no loss,
+reorder, duplication, or canonical-replay mismatch.
+
+This preflight proves the browser-independent service and scheduling path is
+operational. It does not prove the 5-second-p95/10-second-peak objective on the
+long-form samples. Retained protocol-v1 canaries still miss that queue
+objective, so another three-sample live matrix and later reviewed semantic
+landmarks remain necessary.
+
+See [Browser-independent real-time S2S gate](HEADLESS_REALTIME_GATE.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1587,6 +1641,8 @@ result](RENDER_CLOCK_SHADOW_RESULT_2026-07-26.md).
 - [ ] Capture a formal two-reviewer semantic source-event gate run
 - [ ] Pass a five-minute matched live canary with protocol-v1 evidence
 - [ ] Run protocol v1 across all three long-form samples
+- [x] Implement and live-preflight the browser-independent protocol-v1
+  scheduled-playback gate
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries

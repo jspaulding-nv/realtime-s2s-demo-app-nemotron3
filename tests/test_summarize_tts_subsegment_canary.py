@@ -252,7 +252,7 @@ def write_arm(root, cap):
         }
 
     playback = {
-        "schema_version": 1,
+        "schema_version": 2,
         "policy": {
             "limit_queue_seconds": 10.0,
         },
@@ -356,6 +356,19 @@ def test_builds_deterministic_privacy_safe_cross_arm_summary(tmp_path):
     assert str(tmp_path) not in serialized
     assert "capture_summary" not in serialized
     assert "No automatic winner" in markdown
+
+
+def test_archived_playback_schema_v1_remains_supported(tmp_path):
+    write_matrix(tmp_path)
+    for path in tmp_path.glob("*/playback_policy_analysis.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = build_canary_summary(tmp_path)
+
+    assert summary["matched_design"]["passed"] is True
+    assert len(summary["arms"]) == 4
 
 
 def test_explicit_gates_select_only_from_passing_noncontrol_arms(tmp_path):
