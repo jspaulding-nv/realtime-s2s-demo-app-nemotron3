@@ -1792,6 +1792,41 @@ reintroducing the repeated-padding cost observed in earlier TTS splitting.
 See
 [synthesized low-energy PCM live result](SYNTHESIZED_PCM_SILENCE_RESULT_2026-07-26.md).
 
+## 2026-07-26: Chatterbox TTS default-off canary
+
+Added a pinned, default-off Chatterbox TTS Multilingual `1.0.0` Compose
+profile on separate loopback-only ports. It is not connected to NMT; Magpie
+remains the active TTS dependency. The Chatterbox comparison uses an isolated
+`nvidia-riva-client==2.26.0` target so the main application remains on its
+proven `2.24.0` client.
+
+Added privacy-safe Chatterbox and matched Magpie streaming benchmarks. Both
+exclude one warm-up from measured aggregates, enforce active RPC deadlines
+and incremental PCM limits,
+measure nonempty-chunk cadence and continuity through the last audio arrival,
+separate the terminal RPC-completion tail, and write exclusive private
+artifacts. Reports omit input text, paths, fingerprints, service hostnames,
+payloads, and raw exception messages. Image metadata is explicitly labeled as
+declared and unverified rather than runtime-attested. The default Chatterbox
+Compose image is also qualified by its immutable repository digest.
+
+The live Chatterbox gate passed 12 of 12 measured requests. On the identical
+short Spanish fixture, its factor medians were 4.130–4.410 seconds versus
+4.923 seconds for Magpie, a 10.4–16.1% duration reduction. Chatterbox median
+first audio was 0.900–0.930 seconds versus 0.145 seconds for Magpie. Every
+Chatterbox trial showed an immediate-playback continuity deficit, while all
+three Magpie controls streamed without one. The exaggeration sweep was not
+monotonic.
+
+All four NIM services coexisted for the single-stream canary at 85,274 MiB
+used of 97,887 MiB. The duration signal justifies native quality review and a
+small multi-text gate, but not an immediate TTS replacement or long-form
+promotion. Chatterbox was then stopped gracefully; the three active services
+remained healthy and GPU use returned to 32,300 MiB.
+
+See [Chatterbox TTS canary](CHATTERBOX_TTS_CANARY.md) and
+[Chatterbox TTS live result](CHATTERBOX_TTS_RESULT_2026-07-26.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch

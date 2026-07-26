@@ -8,7 +8,9 @@ venv/
 env/
 ENV/
 .venv/
+.venv-chatterbox/
 .python-packages/
+.python-packages-chatterbox/
 .cache/
 *.egg-info/
 dist/
@@ -80,3 +82,4 @@ rendered-digital-preflight-*.blocks.csv
 # Development notes
 *.txt
 !requirements-dev.txt
+!requirements-chatterbox-canary.txt

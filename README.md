@@ -65,6 +65,8 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Browser acceptance that requires server completion as well as an empty Web Audio queue
 - Standalone hesitation-filler suppression before sequence allocation, narrow known-short-utterance overrides, fail-closed target-script validation, and one guarded punctuation-normalized NMT recovery before TTS
 - One atomic Magpie retry only for a server-side gRPC `UNKNOWN`, with privacy-safe retry telemetry and no partial-audio publication
+- A default-off, pinned Chatterbox TTS Multilingual `1.0.0` comparison profile
+  with an isolated Riva client `2.26.0` exaggeration-factor canary
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - A privacy-safe short-segment replay tool that retains structural metadata and per-run keyed equality fingerprints, never text
 - A default-off 60-second rendered-digital browser preflight that records the
@@ -143,6 +145,10 @@ interface.
 realtime-s2s-demo-app/
 ├── docker-compose.yaml     # Pinned Nemotron ASR, NMT, and TTS services
 ├── .env.example            # Compose and application configuration template
+├── requirements-chatterbox-canary.txt # Isolated Riva client 2.26 pin
+├── chatterbox_tts_canary.py # Default-off Spanish duration/latency sweep
+├── magpie_tts_control.py    # Matched warm Magpie streaming control
+├── tts_comparison_fixture.py # Shared versioned text identity and counts
 ├── NEMOTRON_TEST_RESULTS.md
 ├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
@@ -214,6 +220,11 @@ realtime-s2s-demo-app/
 
 The selected profiles allocate approximately 26.4 GB of GPU memory in total: 6 GB for ASR, 9.5 GB for NMT, and 10.87 GB for TTS. They fit comfortably on the tested 96 GB RTX PRO 6000 Blackwell Server Edition and should fit a 48 GB RTX 6000 Ada, though peak usage should be checked during an end-to-end stream.
 
+The optional Chatterbox profile is different: NVIDIA documents 52.5 GB of GPU
+memory for that TTS container alone. It can be canaried alongside the current
+stack on the tested 96 GB Blackwell GPU with close monitoring, but it does not
+fit on a 48 GB RTX 6000 Ada.
+
 ## Quick Start
 
 ### 1. Configure NGC and the application
@@ -270,6 +281,30 @@ nvidia-smi
 ```
 
 The application connects to the NMT/S2S gRPC endpoint at `localhost:50051`. ASR and TTS are also exposed at `localhost:50052` and `localhost:50053` for direct tests.
+
+Optional: run the pinned Chatterbox TTS comparison arm on separate ports
+without changing NMT's Magpie dependency:
+
+```bash
+docker compose --profile chatterbox-canary up -d chatterbox-tts
+curl --fail http://localhost:9004/v1/health/ready
+
+python3 -m pip install \
+  --disable-pip-version-check \
+  --target .python-packages-chatterbox \
+  -r requirements-chatterbox-canary.txt
+
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$PWD/.python-packages-chatterbox" \
+  python3 -S chatterbox_tts_canary.py
+```
+
+Do not run an unredacted `docker compose config` with a real key in `.env`;
+Compose expands `NGC_API_KEY` into its output. See the
+[Chatterbox canary guide](docs/CHATTERBOX_TTS_CANARY.md) for isolation,
+resource checks, runtime voice discovery, metrics, quality gates, and the
+promotion order. The first repeated live comparison is documented in the
+[Chatterbox TTS result](docs/CHATTERBOX_TTS_RESULT_2026-07-26.md).
 
 After a host reboot, Compose's `unless-stopped` policy should restart the three
 NIM containers, but readiness must still be verified with the commands above.
