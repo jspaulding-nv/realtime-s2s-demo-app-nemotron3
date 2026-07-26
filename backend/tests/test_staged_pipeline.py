@@ -1855,6 +1855,7 @@ async def test_incremental_clean_order_is_frames_parent_marker_then_complete():
         config=config(
             output_queue_maxsize=4,
             tts_incremental_publish_enabled=True,
+            tts_incremental_frame_ms=100,
         ),
         session_id="incremental-clean-order",
     )
@@ -1926,6 +1927,7 @@ async def test_incremental_short_target_records_atomic_fallback_at_every_barrier
         config=config(
             output_queue_maxsize=4,
             tts_incremental_publish_enabled=True,
+            tts_incremental_frame_ms=100,
             tts_incremental_atomic_fallback_max_chars=4,
         ),
         session_id="incremental-atomic-fallback",
@@ -2075,6 +2077,7 @@ async def test_incremental_output_capacity_one_backpressures_worker():
         config=config(
             output_queue_maxsize=1,
             tts_incremental_publish_enabled=True,
+            tts_incremental_frame_ms=100,
         ),
         session_id="incremental-backpressure",
     )

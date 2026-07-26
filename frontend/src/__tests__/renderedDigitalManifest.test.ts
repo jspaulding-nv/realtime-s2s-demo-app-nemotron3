@@ -145,7 +145,7 @@ async function fixture() {
       ttsSubsegmentMinChars: 12,
       closeTimeoutSeconds: 10,
       ttsIncrementalPublishEnabled: true,
-      ttsIncrementalFrameMs: 100,
+      ttsIncrementalFrameMs: 500,
       ttsIncrementalAtomicFallbackMaxChars: 4,
     },
   };

@@ -24,6 +24,12 @@ const WORKLET_BLOCK_FRAMES = 8000;
 // registered drain time. Keep a small teardown margin beyond that full window.
 const MAXIMUM_CAPTURE_SECONDS = 420;
 const CONTROL_TIMEOUT_MS = 5000;
+const RECORDER_CAPTURE_ERROR_CODES = new Set([
+  'invalid_source_clock',
+  'capture_started_after_source',
+  'noncontiguous_render_quantum',
+  'capture_frame_limit_exceeded',
+]);
 
 interface RawRenderedDigitalPcmBlock {
   sequence: number;
@@ -61,6 +67,8 @@ interface ActiveCaptureSession {
 
 export interface UseRenderedDigitalCaptureReturn {
   isCapturing: boolean;
+  fatalError: Error | null;
+  fatalDiagnostic: RenderedDigitalRecorderFatalDiagnostic | null;
   start: () => Promise<RenderedDigitalCaptureRouting>;
   createPlaybackRouting: (
     captureInputIndex: 0 | 1,
@@ -71,6 +79,13 @@ export interface UseRenderedDigitalCaptureReturn {
   ) => Promise<RenderedDigitalSourceClock>;
   stop: () => Promise<RenderedDigitalCaptureResult>;
   abort: () => Promise<void>;
+}
+
+export interface RenderedDigitalRecorderFatalDiagnostic {
+  code: string;
+  expectedContextFrame: number | null;
+  observedContextFrame: number | null;
+  deltaFrames: number | null;
 }
 
 function deferred<T = void>(): {
@@ -139,6 +154,10 @@ function closeSessionNodes(session: ActiveCaptureSession): void {
 export function useRenderedDigitalCapture():
 UseRenderedDigitalCaptureReturn {
   const [isCapturing, setIsCapturing] = useState(false);
+  const [fatalError, setFatalError] = useState<Error | null>(null);
+  const [fatalDiagnostic, setFatalDiagnostic] = useState<
+  RenderedDigitalRecorderFatalDiagnostic | null
+  >(null);
   const activeSessionRef = useRef<ActiveCaptureSession | null>(null);
   const startInProgressRef = useRef(false);
   const pendingContextRef = useRef<AudioContext | null>(null);
@@ -147,12 +166,20 @@ UseRenderedDigitalCaptureReturn {
   const failSession = useCallback((
     session: ActiveCaptureSession,
     error: Error,
+    diagnostic: RenderedDigitalRecorderFatalDiagnostic | null = null,
   ) => {
-    if (session.fatalError === null) session.fatalError = error;
-    session.readyReject?.(error);
-    session.captureStartedReject?.(error);
-    session.sourceClockReject?.(error);
-    session.stoppedReject?.(error);
+    if (session.fatalError === null) {
+      session.fatalError = error;
+      if (mountedRef.current) {
+        setFatalError(error);
+        setFatalDiagnostic(diagnostic);
+      }
+    }
+    const firstError = session.fatalError;
+    session.readyReject?.(firstError);
+    session.captureStartedReject?.(firstError);
+    session.sourceClockReject?.(firstError);
+    session.stoppedReject?.(firstError);
   }, []);
 
   const start = useCallback(async (): Promise<
@@ -164,6 +191,8 @@ UseRenderedDigitalCaptureReturn {
     ) {
       throw new Error('A rendered-digital capture is already active.');
     }
+    setFatalError(null);
+    setFatalDiagnostic(null);
     if (!globalThis.isSecureContext) {
       throw new Error(
         'Rendered-digital capture requires HTTPS or a localhost origin.',
@@ -448,12 +477,38 @@ UseRenderedDigitalCaptureReturn {
           return;
         }
         if (message.type === 'capture_error') {
-          const code = typeof message.code === 'string'
-            ? message.code
-            : 'unknown';
+          const code = (
+            typeof message.code === 'string'
+            && RECORDER_CAPTURE_ERROR_CODES.has(message.code)
+          ) ? message.code : 'unknown';
+          const rawExpectedContextFrame = (
+            code === 'capture_started_after_source'
+              ? message.sourceStartContextFrame
+              : message.expectedContextFrame
+          );
+          const expectedContextFrame = isSafeInteger(
+            rawExpectedContextFrame,
+          ) ? rawExpectedContextFrame : null;
+          const observedContextFrame = isSafeInteger(
+            message.observedContextFrame,
+          ) ? message.observedContextFrame : null;
+          const candidateDelta = (
+            expectedContextFrame !== null
+            && observedContextFrame !== null
+          ) ? observedContextFrame - expectedContextFrame : null;
+          const deltaFrames = (
+            candidateDelta !== null
+            && Number.isSafeInteger(candidateDelta)
+          ) ? candidateDelta : null;
           failSession(
             session,
             new Error(`Recorder rejected the capture (${code}).`),
+            {
+              code,
+              expectedContextFrame,
+              observedContextFrame,
+              deltaFrames,
+            },
           );
         }
       };
@@ -769,6 +824,8 @@ UseRenderedDigitalCaptureReturn {
 
   return {
     isCapturing,
+    fatalError,
+    fatalDiagnostic,
     start,
     createPlaybackRouting,
     getCurrentContextFrame,

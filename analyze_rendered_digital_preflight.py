@@ -821,7 +821,7 @@ def _validate_runtime(runtime_value: Any) -> None:
     )
     _literal(
         tts["incremental_frame_ms"],
-        100,
+        500,
         "runtime.tts.incremental_frame_ms",
     )
 

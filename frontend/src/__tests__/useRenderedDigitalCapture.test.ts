@@ -256,12 +256,82 @@ describe('useRenderedDigitalCapture', () => {
       recorder.port.emit({
         type: 'capture_error',
         code: 'noncontiguous_render_quantum',
+        expectedContextFrame: 16128,
+        observedContextFrame: 16384,
       });
     });
 
+    expect(result.current.fatalError?.message).toBe(
+      'Recorder rejected the capture (noncontiguous_render_quantum).',
+    );
+    expect(result.current.fatalDiagnostic).toEqual({
+      code: 'noncontiguous_render_quantum',
+      expectedContextFrame: 16128,
+      observedContextFrame: 16384,
+      deltaFrames: 256,
+    });
     await expect(act(async () => {
       await result.current.stop();
     })).rejects.toThrow(/noncontiguous_render_quantum/);
+  });
+
+  it('normalizes the source frame for a late capture start', async () => {
+    const { result } = renderHook(() => useRenderedDigitalCapture());
+
+    await act(async () => {
+      await result.current.start();
+      await result.current.armSourceClock({
+        sourceStartContextFrame: 8000,
+        sourceFrameCount: 960000,
+        sourceChunkFrames: 4800,
+      });
+    });
+    act(() => {
+      recorder.port.emit({
+        type: 'capture_error',
+        code: 'capture_started_after_source',
+        sourceStartContextFrame: 8000,
+        observedContextFrame: 8064,
+      });
+    });
+
+    expect(result.current.fatalDiagnostic).toEqual({
+      code: 'capture_started_after_source',
+      expectedContextFrame: 8000,
+      observedContextFrame: 8064,
+      deltaFrames: 64,
+    });
+  });
+
+  it('does not expose arbitrary recorder error content', async () => {
+    const { result } = renderHook(() => useRenderedDigitalCapture());
+
+    await act(async () => {
+      await result.current.start();
+      await result.current.armSourceClock({
+        sourceStartContextFrame: 8000,
+        sourceFrameCount: 960000,
+        sourceChunkFrames: 4800,
+      });
+    });
+    act(() => {
+      recorder.port.emit({
+        type: 'capture_error',
+        code: 'unsafe arbitrary detail',
+        expectedContextFrame: 'not-a-frame',
+        observedContextFrame: 16384,
+      });
+    });
+
+    expect(result.current.fatalError?.message).toBe(
+      'Recorder rejected the capture (unknown).',
+    );
+    expect(result.current.fatalDiagnostic).toEqual({
+      code: 'unknown',
+      expectedContextFrame: null,
+      observedContextFrame: 16384,
+      deltaFrames: null,
+    });
   });
 
   it('rejects a gap in the worklet block ledger', async () => {

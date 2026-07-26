@@ -60,7 +60,7 @@ def valid_api_config():
             "ttsIncrementalAtomicFallbackMaxChars": 4,
             "closeTimeoutSeconds": 10.0,
             "ttsIncrementalPublishEnabled": True,
-            "ttsIncrementalFrameMs": 100,
+            "ttsIncrementalFrameMs": 500,
         },
     }
 
@@ -342,7 +342,7 @@ def test_validate_api_config_rejects_invalid_numeric_timeout_forms(value):
         (("pipelineMode",), "monolithic"),
         (("repositoryProvenance", "dirty"), True),
         (("modelConfig", "asr", "eouMs"), 300),
-        (("stagedConfig", "ttsIncrementalFrameMs"), 200),
+        (("stagedConfig", "ttsIncrementalFrameMs"), 100),
     ],
 )
 def test_validate_api_config_rejects_runtime_drift(path, value):
@@ -961,6 +961,187 @@ def test_dashboard_driver_fails_closed_on_any_alert():
 
     with pytest.raises(runner.PreflightRunnerError, match="alert"):
         driver._fail_on_alert({"phase": "completed", "alert": True})
+
+
+@pytest.mark.parametrize(
+    ("phase", "alert"),
+    (("running", True), ("failed", False)),
+)
+def test_dashboard_completion_failure_reports_safe_recorder_state(
+    monkeypatch,
+    phase,
+    alert,
+):
+    class FailedCaptureCDP(FakeCDP):
+        def evaluate(self, expression, *, user_gesture=False):
+            self.calls.append(("evaluate", expression, user_gesture))
+            if "const root=document.querySelector" in expression:
+                return {
+                    "phase": phase,
+                    "sourceChunksSent": 100,
+                    "serverTerminalState": "error",
+                    "recorderFatalCode": "noncontiguous_render_quantum",
+                    "recorderGapExpectedContextFrame": 482_304,
+                    "recorderGapObservedContextFrame": 482_560,
+                    "recorderGapDeltaFrames": 256,
+                    "alert": alert,
+                    "devClient": False,
+                    "alertText": "private alert text must not appear",
+                }
+            return True
+
+    def poll_once(predicate, **_kwargs):
+        return predicate()
+
+    monkeypatch.setattr(runner, "wait_for", poll_once)
+    driver = runner.DashboardDriver(
+        FailedCaptureCDP(),
+        chrome_process=FakeProcess(),
+    )
+
+    with pytest.raises(runner.PreflightRunnerError) as error:
+        driver.wait_for_completed(600)
+
+    message = str(error.value)
+    payload = json.loads(message.split("safe_state=", 1)[1])
+    assert payload == {
+        "phase": phase,
+        "recorder_fatal_code": "noncontiguous_render_quantum",
+        "recorder_gap_delta_frames": 256,
+        "recorder_gap_expected_context_frame": 482_304,
+        "recorder_gap_observed_context_frame": 482_560,
+        "server_terminal_state": "error",
+        "source_chunks_sent": 100,
+    }
+    assert "private alert text" not in message
+    assert "displayed an alert" not in message
+
+
+def test_dashboard_completion_timeout_reports_only_safe_structured_state(
+    monkeypatch,
+):
+    class DiagnosticCDP(FakeCDP):
+        def evaluate(self, expression, *, user_gesture=False):
+            self.calls.append(("evaluate", expression, user_gesture))
+            if "const root=document.querySelector" in expression:
+                return {
+                    "phase": "running",
+                    "sourceChunksSent": 100,
+                    "serverTerminalState": "pending",
+                    "recorderFatalCode": "noncontiguous_render_quantum",
+                    "recorderGapExpectedContextFrame": 482_304,
+                    "recorderGapObservedContextFrame": 482_560,
+                    # The runner derives the delta from the two frame values.
+                    "recorderGapDeltaFrames": 999,
+                    "alert": False,
+                    "devClient": False,
+                    "transcript": "must-not-appear",
+                    "audio": "must-not-appear",
+                }
+            return True
+
+    def timeout_after_one_poll(predicate, **_kwargs):
+        assert predicate() is False
+        raise runner.WaitTimeoutError(
+            "timed out waiting for completed rendered-digital capture "
+            "and queue drain"
+        )
+
+    monkeypatch.setattr(runner, "wait_for", timeout_after_one_poll)
+    driver = runner.DashboardDriver(
+        DiagnosticCDP(),
+        chrome_process=FakeProcess(),
+    )
+
+    with pytest.raises(runner.PreflightRunnerError) as error:
+        driver.wait_for_completed(600)
+
+    message = str(error.value)
+    payload = json.loads(message.split("safe_state=", 1)[1])
+    assert payload == {
+        "phase": "running",
+        "recorder_fatal_code": "noncontiguous_render_quantum",
+        "recorder_gap_delta_frames": 256,
+        "recorder_gap_expected_context_frame": 482_304,
+        "recorder_gap_observed_context_frame": 482_560,
+        "server_terminal_state": "pending",
+        "source_chunks_sent": 100,
+    }
+    assert "must-not-appear" not in message
+    assert "transcript" not in message
+    assert "audio" not in message
+    assert "alert" not in payload
+
+
+def test_dashboard_completion_timeout_rejects_untrusted_diagnostic_values(
+    monkeypatch,
+):
+    class UntrustedDiagnosticCDP(FakeCDP):
+        def evaluate(self, expression, *, user_gesture=False):
+            self.calls.append(("evaluate", expression, user_gesture))
+            if "const root=document.querySelector" in expression:
+                return {
+                    "phase": ["running", "private phase text"],
+                    "sourceChunksSent": True,
+                    "serverTerminalState": "pending private state text",
+                    "recorderFatalCode": "private_recorder_text",
+                    "recorderGapExpectedContextFrame": "482304 private",
+                    "recorderGapObservedContextFrame": 1 << 60,
+                    "recorderGapDeltaFrames": -(1 << 60),
+                    "alert": False,
+                    "devClient": False,
+                }
+            return True
+
+    def timeout_after_one_poll(predicate, **_kwargs):
+        assert predicate() is False
+        raise runner.WaitTimeoutError("timed out waiting for completion")
+
+    monkeypatch.setattr(runner, "wait_for", timeout_after_one_poll)
+    driver = runner.DashboardDriver(
+        UntrustedDiagnosticCDP(),
+        chrome_process=FakeProcess(),
+    )
+
+    with pytest.raises(runner.PreflightRunnerError) as error:
+        driver.wait_for_completed(600)
+
+    message = str(error.value)
+    payload = json.loads(message.split("safe_state=", 1)[1])
+    assert payload == {
+        "phase": "unknown",
+        "server_terminal_state": "unknown",
+        "source_chunks_sent": None,
+    }
+    assert "private" not in message
+
+
+def test_dashboard_state_reads_only_explicit_safe_diagnostic_attributes():
+    cdp = FakeCDP()
+    driver = runner.DashboardDriver(cdp, chrome_process=FakeProcess())
+
+    driver.state()
+
+    expression = next(
+        call[1]
+        for call in cdp.calls
+        if (
+            call[0] == "evaluate"
+            and "const root=document.querySelector" in call[1]
+        )
+    )
+    for attribute in (
+        "data-s2s-phase",
+        "data-s2s-source-chunks-sent",
+        "data-s2s-server-terminal-state",
+        "data-s2s-recorder-fatal-code",
+        "data-s2s-recorder-gap-expected-context-frame",
+        "data-s2s-recorder-gap-observed-context-frame",
+        "data-s2s-recorder-gap-delta-frames",
+    ):
+        assert attribute in expression
+    assert "innerText" not in expression
+    assert "textContent" not in expression
 
 
 def test_output_directory_must_be_new_and_outside_repository(

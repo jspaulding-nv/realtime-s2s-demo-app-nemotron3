@@ -193,7 +193,7 @@ class DirectTTSClient:
         max_audio_duration_s: float = 60.0,
         max_retries: int = 0,
         capture_response_chunk_metrics: bool = False,
-        incremental_frame_ms: int = 100,
+        incremental_frame_ms: int = 500,
         incremental_atomic_fallback_max_chars: int = 4,
         language_configs: Optional[Dict[str, dict]] = None,
         clock_ms: Optional[Callable[[], float]] = None,

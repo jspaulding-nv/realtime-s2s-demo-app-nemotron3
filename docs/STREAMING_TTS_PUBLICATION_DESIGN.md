@@ -11,7 +11,7 @@ The experiment is disabled by default:
 
 ```dotenv
 STAGED_TTS_INCREMENTAL_PUBLISH=0
-STAGED_TTS_INCREMENTAL_FRAME_MS=100
+STAGED_TTS_INCREMENTAL_FRAME_MS=500
 STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS=4
 ```
 
@@ -31,8 +31,10 @@ Each published PCM frame has:
 ```
 
 `audio_frame_id` starts at zero for each parent and is contiguous. Variable
-Riva responses are reframed into 100 ms blocks aligned to mono Int16 sample
-boundaries. The final frame may be shorter. Concatenating the published frames
+Riva responses are reframed into configured-duration blocks aligned to mono
+Int16 sample boundaries. The current default and registered rendered-digital
+profile use 500 ms; the earlier 60-second and five-minute canaries used
+100 ms. The final frame may be shorter. Concatenating the published frames
 must reproduce the exact successful RPC PCM byte stream.
 
 The output queue carries three nonterminal event types:

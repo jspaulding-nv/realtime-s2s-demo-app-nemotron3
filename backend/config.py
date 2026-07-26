@@ -106,7 +106,7 @@ class StagedPipelineConfig:
         os.getenv("STAGED_TTS_INCREMENTAL_PUBLISH", "0") == "1"
     )
     tts_incremental_frame_ms: int = int(
-        os.getenv("STAGED_TTS_INCREMENTAL_FRAME_MS", "100")
+        os.getenv("STAGED_TTS_INCREMENTAL_FRAME_MS", "500")
     )
     # Tiny validated targets retain atomic retry safety even under schema 3,
     # then publish the successful private PCM through normal output frames.

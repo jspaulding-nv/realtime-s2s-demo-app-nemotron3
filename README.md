@@ -30,7 +30,7 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - A fail-closed schema-v3 trace joiner and lossy whole-parent freshness simulator at 5-, 8-, and 10-second queue caps
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
-- Default-off schema-v3 incremental TTS publication with 100 ms PCM framing,
+- Default-off schema-v3 incremental TTS publication with 500 ms PCM framing,
   bounded backpressure, pre-commit-only retry, and a tiny-target atomic
   reliability fallback
 - A matched atomic-versus-incremental canary with same-audio publication timing and explicit stochastic-output confounding checks
@@ -407,7 +407,7 @@ STAGED_TTS_MAX_SEGMENT_AUDIO_SECONDS=60
 STAGED_TTS_MAX_RETRIES=1
 STAGED_TTS_RESPONSE_CHUNK_TELEMETRY=0
 STAGED_TTS_INCREMENTAL_PUBLISH=0
-STAGED_TTS_INCREMENTAL_FRAME_MS=100
+STAGED_TTS_INCREMENTAL_FRAME_MS=500
 STAGED_TTS_INCREMENTAL_ATOMIC_FALLBACK_MAX_CHARS=4
 STAGED_TTS_SUBSEGMENT_MAX_CHARS=0
 STAGED_TTS_SUBSEGMENT_MIN_CHARS=12

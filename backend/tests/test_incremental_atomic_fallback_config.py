@@ -3,6 +3,10 @@ import pytest
 from config import StagedPipelineConfig
 
 
+def test_incremental_publication_defaults_to_500_ms():
+    assert StagedPipelineConfig().tts_incremental_frame_ms == 500
+
+
 def test_incremental_atomic_fallback_defaults_to_four_and_zero_disables():
     assert StagedPipelineConfig().tts_incremental_atomic_fallback_max_chars == 4
     assert (

@@ -74,10 +74,30 @@ GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+SAFE_INTEGER_MAX = (1 << 53) - 1
+SAFE_DASHBOARD_PHASES = frozenset(
+    {"idle", "starting", "running", "draining", "completed", "failed"}
+)
+SAFE_SERVER_TERMINAL_STATES = frozenset(
+    {"pending", "completed", "error"}
+)
+SAFE_RECORDER_FATAL_CODES = frozenset(
+    {
+        "invalid_source_clock",
+        "capture_started_after_source",
+        "noncontiguous_render_quantum",
+        "capture_frame_limit_exceeded",
+        "unknown",
+    }
+)
 
 
 class PreflightRunnerError(RuntimeError):
     """An expected fail-closed preflight error safe to show to the operator."""
+
+
+class WaitTimeoutError(PreflightRunnerError):
+    """A bounded local wait expired without its predicate becoming true."""
 
 
 class ValidatorFailure(PreflightRunnerError):
@@ -436,7 +456,7 @@ def validate_api_config(payload: Mapping[str, Any], commit: str) -> None:
         ),
         (("stagedConfig", "closeTimeoutSeconds"), 10),
         (("stagedConfig", "ttsIncrementalPublishEnabled"), True),
-        (("stagedConfig", "ttsIncrementalFrameMs"), 100),
+        (("stagedConfig", "ttsIncrementalFrameMs"), 500),
     )
     versions = _nested_value(payload, "audioMetadataProtocolVersions")
     if (
@@ -1045,7 +1065,7 @@ def wait_for(
         if last_value:
             return last_value
         sleep(interval_seconds)
-    raise PreflightRunnerError(f"timed out waiting for {description}")
+    raise WaitTimeoutError(f"timed out waiting for {description}")
 
 
 def ensure_local_http_url(url: str, *, label: str) -> None:
@@ -1659,8 +1679,45 @@ class DashboardDriver:
         value = self.cdp.evaluate(
             "(() => {"
             f"const root=document.querySelector('{self.PHASE_SELECTOR}');"
+            "const phases=new Set(["
+            "'idle','starting','running','draining','completed','failed'"
+            "]);"
+            "const terminalStates=new Set(["
+            "'pending','completed','error'"
+            "]);"
+            "const recorderFatalCodes=new Set(["
+            "'invalid_source_clock','capture_started_after_source',"
+            "'noncontiguous_render_quantum','capture_frame_limit_exceeded',"
+            "'unknown'"
+            "]);"
+            "const integerAttribute=(name,signed=false)=>{"
+            "const raw=root?.getAttribute(name)??null;"
+            "if(raw===null)return null;"
+            "const pattern=signed?/^-?(0|[1-9][0-9]*)$/"
+            ":/^(0|[1-9][0-9]*)$/;"
+            "if(!pattern.test(raw))return null;"
+            "const parsed=Number(raw);"
+            "return Number.isSafeInteger(parsed)?parsed:null;"
+            "};"
+            "const phaseAttribute=root?.getAttribute('data-s2s-phase')??null;"
+            "const terminalAttribute=root?.getAttribute("
+            "'data-s2s-server-terminal-state')??null;"
+            "const fatalAttribute=root?.getAttribute("
+            "'data-s2s-recorder-fatal-code')??null;"
             "return {"
-            "phase:root?.getAttribute('data-s2s-phase')||null,"
+            "phase:phases.has(phaseAttribute)?phaseAttribute:'unknown',"
+            "sourceChunksSent:integerAttribute("
+            "'data-s2s-source-chunks-sent'),"
+            "serverTerminalState:terminalStates.has(terminalAttribute)"
+            "?terminalAttribute:'unknown',"
+            "recorderFatalCode:recorderFatalCodes.has(fatalAttribute)"
+            "?fatalAttribute:null,"
+            "recorderGapExpectedContextFrame:integerAttribute("
+            "'data-s2s-recorder-gap-expected-context-frame'),"
+            "recorderGapObservedContextFrame:integerAttribute("
+            "'data-s2s-recorder-gap-observed-context-frame'),"
+            "recorderGapDeltaFrames:integerAttribute("
+            "'data-s2s-recorder-gap-delta-frames',true),"
             "alert:Boolean(document.querySelector('[role=\"alert\"]')),"
             "devClient:Boolean(document.querySelector("
             "'script[src*=\"/@vite/client\"],script[src*=\"/@react-refresh\"]'"
@@ -1674,6 +1731,119 @@ class DashboardDriver:
                 "dashboard is running through mutable Vite development/HMR"
             )
         return state
+
+    @staticmethod
+    def _safe_completion_diagnostics(
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return the fixed, transcript-free completion diagnostic schema."""
+
+        phase = state.get("phase")
+        source_chunks_sent = state.get("sourceChunksSent")
+        server_terminal_state = state.get("serverTerminalState")
+        diagnostics: dict[str, Any] = {
+            "phase": (
+                phase
+                if (
+                    isinstance(phase, str)
+                    and phase in SAFE_DASHBOARD_PHASES
+                )
+                else "unknown"
+            ),
+            "source_chunks_sent": (
+                source_chunks_sent
+                if (
+                    isinstance(source_chunks_sent, int)
+                    and not isinstance(source_chunks_sent, bool)
+                    and 0 <= source_chunks_sent <= SAFE_INTEGER_MAX
+                )
+                else None
+            ),
+            "server_terminal_state": (
+                server_terminal_state
+                if (
+                    isinstance(server_terminal_state, str)
+                    and server_terminal_state in SAFE_SERVER_TERMINAL_STATES
+                )
+                else "unknown"
+            ),
+        }
+
+        fatal_code = state.get("recorderFatalCode")
+        if (
+            isinstance(fatal_code, str)
+            and fatal_code in SAFE_RECORDER_FATAL_CODES
+        ):
+            diagnostics["recorder_fatal_code"] = fatal_code
+
+        expected = state.get("recorderGapExpectedContextFrame")
+        observed = state.get("recorderGapObservedContextFrame")
+        delta = state.get("recorderGapDeltaFrames")
+        safe_expected = (
+            expected
+            if (
+                isinstance(expected, int)
+                and not isinstance(expected, bool)
+                and 0 <= expected <= SAFE_INTEGER_MAX
+            )
+            else None
+        )
+        safe_observed = (
+            observed
+            if (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and 0 <= observed <= SAFE_INTEGER_MAX
+            )
+            else None
+        )
+        safe_delta = (
+            delta
+            if (
+                isinstance(delta, int)
+                and not isinstance(delta, bool)
+                and -SAFE_INTEGER_MAX <= delta <= SAFE_INTEGER_MAX
+            )
+            else None
+        )
+        if safe_expected is not None:
+            diagnostics[
+                "recorder_gap_expected_context_frame"
+            ] = safe_expected
+        if safe_observed is not None:
+            diagnostics[
+                "recorder_gap_observed_context_frame"
+            ] = safe_observed
+        if safe_expected is not None and safe_observed is not None:
+            diagnostics["recorder_gap_delta_frames"] = (
+                safe_observed - safe_expected
+            )
+        elif safe_delta is not None:
+            diagnostics["recorder_gap_delta_frames"] = safe_delta
+        return diagnostics
+
+    @classmethod
+    def _encoded_completion_diagnostics(
+        cls,
+        state: Mapping[str, Any],
+    ) -> str:
+        return json.dumps(
+            cls._safe_completion_diagnostics(state),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _fail_on_completion_failure(
+        cls,
+        state: Mapping[str, Any],
+    ) -> None:
+        if state.get("alert") is True or state.get("phase") == "failed":
+            encoded = cls._encoded_completion_diagnostics(state)
+            raise PreflightRunnerError(
+                f"dashboard capture failed; safe_state={encoded}"
+            )
 
     def _fail_on_alert(self, state: Mapping[str, Any]) -> None:
         if state.get("alert") is True:
@@ -1814,24 +1984,32 @@ class DashboardDriver:
             raise PreflightRunnerError("could not start the dashboard capture")
 
     def wait_for_completed(self, timeout_seconds: float) -> None:
+        latest_state: Mapping[str, Any] = {}
+
         def terminal() -> bool:
+            nonlocal latest_state
             state = self.state()
-            self._fail_on_alert(state)
+            latest_state = state
+            self._fail_on_completion_failure(state)
             phase = state.get("phase")
-            if phase == "failed":
-                raise PreflightRunnerError(
-                    "the dashboard entered its failed phase"
-                )
             return phase == "completed"
 
-        wait_for(
-            terminal,
-            timeout_seconds=timeout_seconds,
-            description="completed rendered-digital capture and queue drain",
-            interval_seconds=1,
-        )
+        try:
+            wait_for(
+                terminal,
+                timeout_seconds=timeout_seconds,
+                description=(
+                    "completed rendered-digital capture and queue drain"
+                ),
+                interval_seconds=1,
+            )
+        except WaitTimeoutError as exc:
+            encoded = self._encoded_completion_diagnostics(latest_state)
+            raise PreflightRunnerError(
+                f"{exc}; safe_state={encoded}"
+            ) from exc
         final_state = self.state()
-        self._fail_on_alert(final_state)
+        self._fail_on_completion_failure(final_state)
         if final_state.get("phase") != "completed":
             raise PreflightRunnerError(
                 "dashboard did not remain in its completed phase"
