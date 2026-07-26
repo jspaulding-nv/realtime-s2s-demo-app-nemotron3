@@ -86,6 +86,12 @@ Prerequisites:
 - `.env` contains any required local runtime settings; and
 - the selected source exists under `test_audio/`.
 
+Keep each `ASR_IMAGE`, `NMT_IMAGE`, and `TTS_IMAGE` value as the exact pinned
+tag recorded in the running container. Put the corresponding SHA-256 in the
+separate `*_IMAGE_DIGEST` variable. Replacing the image tag with an
+`@sha256:...` reference will correctly fail attestation if the existing
+container records the tagged reference.
+
 The runner loads `.env`, verifies container readiness and immutable image
 digests, creates one exact source prefix, owns only its temporary FastAPI child,
 and runs the existing unsplit one-request-per-parent schema-3 path:
@@ -200,3 +206,8 @@ If the handoff is not material, measure leading/trailing synthesized silence
 and then test a supported native TTS rate control or pitch-preserving 1.05x /
 1.10x time-scale arm. Native-language review remains required for prosody,
 intelligibility, and translation continuity before promotion.
+
+The 2026-07-26 one-minute preflight and promoted five-minute Sample 02 run
+completed without a publisher-handoff interval over 100 ms, while the no-drop
+listener queue still missed its 5/10-second objective. See
+[TTS publisher-handoff live result](PUBLISHER_HANDOFF_RESULT_2026-07-26.md).

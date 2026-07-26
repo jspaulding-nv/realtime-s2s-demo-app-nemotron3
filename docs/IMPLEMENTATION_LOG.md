@@ -1691,10 +1691,25 @@ Implementation validation passed the complete automated Python gate with 1,193
 tests and one environment-specific skip, including the 463-test backend suite,
 102-test batch module, and 37-test streaming-latency analyzer module. All 211
 frontend tests, frontend lint, and the production build passed with the
-bundled Node.js 22 runtime. The live one-minute and five-minute GPU runs remain
-pending.
+bundled Node.js 22 runtime.
 
 See [TTS publisher-handoff diagnostic](PUBLISHER_HANDOFF_DIAGNOSTIC.md).
+
+The subsequent live gate completed on the same clean commit. The 60-second
+Sample 01 preflight reconciled 116 frames; the promoted 300-second Sample 02
+run reconciled 650. Neither run had a frame-ready-to-enqueue interval over
+100 ms, and the five-minute maximum was 8.690 ms. No NMT, TTS, or output
+admission blocked.
+
+The five-minute no-drop listener schedule still failed its audience objective:
+queue p95 was 12.104 seconds, peak queue was 21.991 seconds, and 46.361 seconds
+were spent above ten seconds. Its strongest aligned 30-second window delivered
+41.657 seconds of translated media and grew the queue by 10.092 seconds. This
+rejects publisher-handoff optimization as the next intervention for the
+observed window and promotes generated-duration/burst mitigation plus semantic
+landmark measurement.
+
+See [TTS publisher-handoff live result](PUBLISHER_HANDOFF_RESULT_2026-07-26.md).
 
 ## Handoff checklist
 
@@ -1737,8 +1752,10 @@ See [TTS publisher-handoff diagnostic](PUBLISHER_HANDOFF_DIAGNOSTIC.md).
 - [x] Attribute all three formal schema-3 traces across model stages,
   publication, transport, and listener burst windows
 - [x] Instrument and validate the TTS-worker-to-publisher handoff
-- [ ] Run the unsplit one-minute publisher-handoff preflight and five-minute
-  diagnostic
+- [x] Run the unsplit one-minute publisher-handoff preflight and five-minute
+  Sample 02 diagnostic
+- [ ] Repeat publisher-handoff telemetry over complete long-form samples before
+  claiming the historical late-sample anomaly is eliminated
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
 - [x] Implement default-off composite-key post-NMT TTS subsegmentation
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries

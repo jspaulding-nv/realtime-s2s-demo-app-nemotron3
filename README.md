@@ -873,6 +873,7 @@ Detailed guides:
 - [Incremental TTS publication 60-second formal canary](docs/STREAMING_TTS_60S_CANARY_2026-07-24.md)
 - [Incremental TTS publication five-minute matched canary](docs/STREAMING_TTS_5MIN_CANARY_2026-07-24.md)
 - [TTS publisher-handoff diagnostic and promotion gate](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md)
+- [TTS publisher-handoff one-minute and five-minute live result](docs/PUBLISHER_HANDOFF_RESULT_2026-07-26.md)
 - [Schema-3 whole-parent freshness-cap simulation](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)
