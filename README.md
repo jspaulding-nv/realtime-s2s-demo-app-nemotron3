@@ -65,6 +65,12 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Browser acceptance that requires server completion as well as an empty Web Audio queue
 - Standalone hesitation-filler suppression before sequence allocation, narrow known-short-utterance overrides, fail-closed target-script validation, and one guarded punctuation-normalized NMT recovery before TTS
 - One atomic Magpie retry only for a server-side gRPC `UNKNOWN`, with privacy-safe retry telemetry and no partial-audio publication
+- A default-off, pinned Chatterbox TTS Multilingual `1.0.0` comparison profile
+  with an isolated Riva client `2.26.0` exaggeration-factor canary and a
+  separate `cfg_weight` compatibility/effect probe
+- A six-text Magpie-versus-Chatterbox mechanical gate with pinned child
+  provenance, private request/audio bindings, and phase-one-only blind-review
+  packaging
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - A privacy-safe short-segment replay tool that retains structural metadata and per-run keyed equality fingerprints, never text
 - A default-off 60-second rendered-digital browser preflight that records the
@@ -143,6 +149,13 @@ interface.
 realtime-s2s-demo-app/
 ├── docker-compose.yaml     # Pinned Nemotron ASR, NMT, and TTS services
 ├── .env.example            # Compose and application configuration template
+├── requirements-chatterbox-canary.txt # Isolated Riva client 2.26 pin
+├── chatterbox_tts_canary.py # Default-off Spanish duration/latency sweep
+├── chatterbox_cfg_weight_probe.py # Default-off cfg_weight contract/effect gate
+├── run_blinded_tts_comparison.py # Six-text mechanical/blind-review gate
+├── magpie_tts_control.py    # Matched warm Magpie streaming control
+├── tts_comparison_fixture.py # Shared versioned text identity and counts
+├── tts_multitext_corpus.py  # Sanitized fixed Spanish comparison corpus
 ├── NEMOTRON_TEST_RESULTS.md
 ├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
@@ -191,11 +204,13 @@ realtime-s2s-demo-app/
 ├── analyze_tts_duration.py # Transcript-free TTS duration/capacity model
 ├── analyze_streaming_latency.py # Source-boundary and TTS response-cadence analysis
 ├── analyze_stage_burst_attribution.py # Stage timing and listener-burst attribution
+├── synthesized_pcm_silence.py # Streaming aggregate-only low-energy PCM telemetry
+├── analyze_synthesized_silence.py # Privacy-safe low-energy aggregate report
 ├── analyze_freshness_cap.py # Parent-aware lossy queue counterfactual
 ├── analyze_semantic_event_latency.py # Source-event parent-envelope gate
 ├── freshness_trace.py      # Fail-closed schema-v3 evidence join
 ├── playback_simulation.py  # No-drop and whole-parent queue simulators
-├── run_streaming_tts_canary.sh # Matched or publisher-handoff live canary
+├── run_streaming_tts_canary.sh # Matched, handoff, or low-energy live canary
 ├── summarize_streaming_tts_canary.py # Privacy-safe matched comparison
 ├── run_long_form_experiment.py # Resumable long-form matched-trace harness
 ├── start.sh                 # Script to start both servers
@@ -211,6 +226,11 @@ realtime-s2s-demo-app/
 - An NVIDIA GPU with enough memory for all three selected profiles
 
 The selected profiles allocate approximately 26.4 GB of GPU memory in total: 6 GB for ASR, 9.5 GB for NMT, and 10.87 GB for TTS. They fit comfortably on the tested 96 GB RTX PRO 6000 Blackwell Server Edition and should fit a 48 GB RTX 6000 Ada, though peak usage should be checked during an end-to-end stream.
+
+The optional Chatterbox profile is different: NVIDIA documents 52.5 GB of GPU
+memory for that TTS container alone. It can be canaried alongside the current
+stack on the tested 96 GB Blackwell GPU with close monitoring, but it does not
+fit on a 48 GB RTX 6000 Ada.
 
 ## Quick Start
 
@@ -268,6 +288,53 @@ nvidia-smi
 ```
 
 The application connects to the NMT/S2S gRPC endpoint at `localhost:50051`. ASR and TTS are also exposed at `localhost:50052` and `localhost:50053` for direct tests.
+
+Optional: run the pinned Chatterbox TTS comparison arm on separate ports
+without changing NMT's Magpie dependency:
+
+```bash
+docker compose --profile chatterbox-canary up -d chatterbox-tts
+curl --fail http://localhost:9004/v1/health/ready
+
+python3 -m pip install \
+  --disable-pip-version-check \
+  --target .python-packages-chatterbox \
+  -r requirements-chatterbox-canary.txt
+
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$PWD/.python-packages-chatterbox" \
+  python3 -S chatterbox_tts_canary.py
+
+# Experimental contract smoke; run the matrix only if this reports accepted.
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$PWD/.python-packages-chatterbox:$PWD" \
+  python3 -S chatterbox_cfg_weight_probe.py
+
+# Balanced mode exits 3 when accepted transport does not demonstrate a
+# realtime candidate; inspect its private JSON report for the classification.
+
+# Formal six-text client-mechanics gate. Exit 2 means the promotion gate
+# was not met; no reviewer bundle is created in that case.
+PYTHONNOUSERSITE=1 PYTHONPATH="$PWD" \
+  python3 -S run_blinded_tts_comparison.py
+```
+
+Do not run an unredacted `docker compose config` with a real key in `.env`;
+Compose expands `NGC_API_KEY` into its output. See the
+[Chatterbox canary guide](docs/CHATTERBOX_TTS_CANARY.md) for isolation,
+resource checks, runtime voice discovery, metrics, quality gates, and the
+promotion order. The first repeated live comparison is documented in the
+[Chatterbox TTS result](docs/CHATTERBOX_TTS_RESULT_2026-07-26.md). The
+follow-up [`cfg_weight` result](docs/CHATTERBOX_CFG_WEIGHT_RESULT_2026-07-27.md)
+shows that the pinned NIM accepted the field, but the balanced matrix did not
+demonstrate a stable duration effect or a realtime promotion candidate. The
+[multi-text result](docs/TTS_MULTITEXT_RESULT_2026-07-27.md) confirmed an
+approximately 16% duration reduction on two independent runs, but both failed
+their predeclared stream-continuity buffer cap. Chatterbox therefore remains
+unpromoted and Magpie remains active. The subsequent
+[Magpie headless S2S control](docs/MAGPIE_HEADLESS_CONTROL_RESULT_2026-07-27.md)
+passed the one-minute no-drop 5/8/10-second listener-queue gate and records the
+remaining semantic punchline-delay evidence gap.
 
 After a host reboot, Compose's `unless-stopped` policy should restart the three
 NIM containers, but readiness must still be verified with the commands above.
@@ -845,6 +912,20 @@ CANARY_MODE=handoff CANARY_DURATION_SECONDS=60 \
 See the
 [TTS publisher-handoff diagnostic](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md).
 
+The next default-off gate measures synthesized leading, trailing, and internal
+low-energy PCM without retaining generated audio. Run the one-minute,
+schema-3 diagnostic from a clean commit:
+
+```bash
+CANARY_MODE=silence CANARY_DURATION_SECONDS=60 \
+  CANARY_INCREMENTAL_FRAME_MS=500 \
+  ./run_streaming_tts_canary.sh
+```
+
+This is an observation-only sensitivity sweep at -60, -50, and -40 dBFS; it
+does not trim audio or label low-energy speech as safely removable. See the
+[synthesized low-energy PCM diagnostic](docs/SYNTHESIZED_PCM_SILENCE_DIAGNOSTIC.md).
+
 Detailed guides:
 
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
@@ -874,6 +955,8 @@ Detailed guides:
 - [Incremental TTS publication five-minute matched canary](docs/STREAMING_TTS_5MIN_CANARY_2026-07-24.md)
 - [TTS publisher-handoff diagnostic and promotion gate](docs/PUBLISHER_HANDOFF_DIAGNOSTIC.md)
 - [TTS publisher-handoff one-minute and five-minute live result](docs/PUBLISHER_HANDOFF_RESULT_2026-07-26.md)
+- [Synthesized low-energy PCM diagnostic and promotion gate](docs/SYNTHESIZED_PCM_SILENCE_DIAGNOSTIC.md)
+- [Synthesized low-energy PCM one-minute and five-minute result](docs/SYNTHESIZED_PCM_SILENCE_RESULT_2026-07-26.md)
 - [Schema-3 whole-parent freshness-cap simulation](docs/SCHEMA3_FRESHNESS_CAP_SIMULATION_2026-07-24.md)
 - [Sample 02 post-recovery staged canary](docs/STAGED_SAMPLE_02_RECOVERY_CANARY.md)
 - [Sample 03 full-sample staged canary](docs/LONG_FORM_03_STAGED_CANARY.md)

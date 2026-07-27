@@ -1,0 +1,5 @@
+# Isolated client for the default-off Chatterbox NIM canary.
+#
+# The main application remains pinned to nvidia-riva-client 2.24.0 until
+# Magpie regression compatibility with 2.26.0 is explicitly qualified.
+nvidia-riva-client==2.26.0

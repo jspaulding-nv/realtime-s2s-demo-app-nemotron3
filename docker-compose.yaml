@@ -56,6 +56,42 @@ services:
       retries: 360
       start_period: 60s
 
+  # Default-off comparison arm. Start it explicitly with:
+  # docker compose --profile chatterbox-canary up -d chatterbox-tts
+  #
+  # It is intentionally not connected to the NMT service. The first gate is
+  # an isolated Spanish TTS duration/latency/quality canary; Magpie remains the
+  # control and the active S2S dependency until that gate passes.
+  chatterbox-tts:
+    profiles: ["chatterbox-canary"]
+    image: ${CHATTERBOX_TTS_IMAGE:-nvcr.io/nim/nvidia/chatterbox-tts-multilingual:1.0.0@sha256:fec12c0c6d0af511d66999daa3a824d176fb3bbc11a86ff071330726c4952cc6}
+    container_name: s2s-eval-chatterbox-tts
+    shm_size: 8gb
+    devices:
+      - "nvidia.com/gpu=${GPU_ID:-0}"
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY:?Set NGC_API_KEY in the shell or .env file}
+      NIM_HTTP_API_PORT: "9000"
+      NIM_GRPC_API_PORT: "50054"
+      NIM_TAGS_SELECTOR: ${CHATTERBOX_TTS_NIM_TAGS_SELECTOR:-name=chatterbox-tts-multilingual}
+    ports:
+      - "127.0.0.1:${CHATTERBOX_TTS_HTTP_PORT:-9004}:9000"
+      - "127.0.0.1:${CHATTERBOX_TTS_GRPC_PORT:-50054}:50054"
+    volumes:
+      - type: bind
+        source: ${LOCAL_NIM_CACHE:-./.cache/nim}
+        target: /opt/nim/.cache
+    # A 52.5 GB comparison arm must never return implicitly after a reboot.
+    restart: "no"
+    # A live shutdown exceeded two minutes without an OOM.
+    stop_grace_period: 5m
+    healthcheck:
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50054"]
+      interval: 10s
+      timeout: 10s
+      retries: 360
+      start_period: 60s
+
   nmt:
     image: ${NMT_IMAGE:-nvcr.io/nim/nvidia/riva-translate-1_6b:1.5.2}
     container_name: s2s-eval-riva-translate-nmt
