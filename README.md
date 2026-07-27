@@ -66,7 +66,11 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Standalone hesitation-filler suppression before sequence allocation, narrow known-short-utterance overrides, fail-closed target-script validation, and one guarded punctuation-normalized NMT recovery before TTS
 - One atomic Magpie retry only for a server-side gRPC `UNKNOWN`, with privacy-safe retry telemetry and no partial-audio publication
 - A default-off, pinned Chatterbox TTS Multilingual `1.0.0` comparison profile
-  with an isolated Riva client `2.26.0` exaggeration-factor canary
+  with an isolated Riva client `2.26.0` exaggeration-factor canary and a
+  separate `cfg_weight` compatibility/effect probe
+- A six-text Magpie-versus-Chatterbox mechanical gate with pinned child
+  provenance, private request/audio bindings, and phase-one-only blind-review
+  packaging
 - A repeatable one-minute direct ASR -> NMT -> TTS preflight tool
 - A privacy-safe short-segment replay tool that retains structural metadata and per-run keyed equality fingerprints, never text
 - A default-off 60-second rendered-digital browser preflight that records the
@@ -147,8 +151,11 @@ realtime-s2s-demo-app/
 ├── .env.example            # Compose and application configuration template
 ├── requirements-chatterbox-canary.txt # Isolated Riva client 2.26 pin
 ├── chatterbox_tts_canary.py # Default-off Spanish duration/latency sweep
+├── chatterbox_cfg_weight_probe.py # Default-off cfg_weight contract/effect gate
+├── run_blinded_tts_comparison.py # Six-text mechanical/blind-review gate
 ├── magpie_tts_control.py    # Matched warm Magpie streaming control
 ├── tts_comparison_fixture.py # Shared versioned text identity and counts
+├── tts_multitext_corpus.py  # Sanitized fixed Spanish comparison corpus
 ├── NEMOTRON_TEST_RESULTS.md
 ├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
@@ -297,6 +304,19 @@ python3 -m pip install \
 PYTHONNOUSERSITE=1 \
 PYTHONPATH="$PWD/.python-packages-chatterbox" \
   python3 -S chatterbox_tts_canary.py
+
+# Experimental contract smoke; run the matrix only if this reports accepted.
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$PWD/.python-packages-chatterbox:$PWD" \
+  python3 -S chatterbox_cfg_weight_probe.py
+
+# Balanced mode exits 3 when accepted transport does not demonstrate a
+# realtime candidate; inspect its private JSON report for the classification.
+
+# Formal six-text client-mechanics gate. Exit 2 means the promotion gate
+# was not met; no reviewer bundle is created in that case.
+PYTHONNOUSERSITE=1 PYTHONPATH="$PWD" \
+  python3 -S run_blinded_tts_comparison.py
 ```
 
 Do not run an unredacted `docker compose config` with a real key in `.env`;
@@ -304,7 +324,17 @@ Compose expands `NGC_API_KEY` into its output. See the
 [Chatterbox canary guide](docs/CHATTERBOX_TTS_CANARY.md) for isolation,
 resource checks, runtime voice discovery, metrics, quality gates, and the
 promotion order. The first repeated live comparison is documented in the
-[Chatterbox TTS result](docs/CHATTERBOX_TTS_RESULT_2026-07-26.md).
+[Chatterbox TTS result](docs/CHATTERBOX_TTS_RESULT_2026-07-26.md). The
+follow-up [`cfg_weight` result](docs/CHATTERBOX_CFG_WEIGHT_RESULT_2026-07-27.md)
+shows that the pinned NIM accepted the field, but the balanced matrix did not
+demonstrate a stable duration effect or a realtime promotion candidate. The
+[multi-text result](docs/TTS_MULTITEXT_RESULT_2026-07-27.md) confirmed an
+approximately 16% duration reduction on two independent runs, but both failed
+their predeclared stream-continuity buffer cap. Chatterbox therefore remains
+unpromoted and Magpie remains active. The subsequent
+[Magpie headless S2S control](docs/MAGPIE_HEADLESS_CONTROL_RESULT_2026-07-27.md)
+passed the one-minute no-drop 5/8/10-second listener-queue gate and records the
+remaining semantic punchline-delay evidence gap.
 
 After a host reboot, Compose's `unless-stopped` policy should restart the three
 NIM containers, but readiness must still be verified with the commands above.

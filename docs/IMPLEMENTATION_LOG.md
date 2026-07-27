@@ -1827,6 +1827,105 @@ remained healthy and GPU use returned to 32,300 MiB.
 See [Chatterbox TTS canary](CHATTERBOX_TTS_CANARY.md) and
 [Chatterbox TTS live result](CHATTERBOX_TTS_RESULT_2026-07-26.md).
 
+## 2026-07-27: Chatterbox `cfg_weight` compatibility and effect gate
+
+Added a separate default-off `cfg_weight` diagnostic without changing the
+historical exaggeration canary schema. The shared synthesis helper omits the
+key for controls and serializes it only for explicit experimental requests.
+The probe uses a discarded no-key warm-up, bracketed controls, strict pinned
+client/model provenance, active RPC and PCM bounds, safe error categories, and
+private atomic artifacts. Its report separates transport acceptance from
+demonstrated behavioral effect and realtime candidacy.
+
+The bracketed smoke passed all five measured calls around explicit values
+`0.3`, `0.5`, and `0.7`. The promoted balanced matrix then passed 40 of 40
+measured calls over exaggeration `0.5`/`0.7`, four cfg settings, and five
+rotated repeats. All four NIM services remained healthy with zero restarts and
+no OOM; post-run GPU use was 85,278 MiB with 11,973 MiB free.
+
+Transport acceptance did not become an effect claim. At exaggeration `0.5`,
+the `0.3` and `0.7` median durations were 4.170 and 4.130 seconds; at
+exaggeration `0.7`, they reversed to 4.130 and 4.170 seconds. Each difference
+was only 0.040 seconds (0.96%), directional agreement was below four of five,
+and every matrix cell retained five of five immediate-playback underruns.
+Median RTF remained approximately 1.18-1.21. The predeclared decision is
+`accepted`, `effect_not_demonstrated`, and no realtime candidate evaluation.
+
+The implementation passed 76 focused tests and the maintained `tests/` suite
+passed 882 tests with one skip. Before shutdown, all four services were
+healthy. Only Chatterbox was then stopped. Because that running container
+predated the new two-minute Compose stop grace period, it retained the prior
+ten-second limit and exited `137`; Docker reported `OOMKilled=false`. ASR, NMT,
+and Magpie remained healthy, and GPU use returned to 32,300 MiB. Subsequently
+recreated Chatterbox containers inherit the longer stop window. See
+[Chatterbox cfg_weight result](CHATTERBOX_CFG_WEIGHT_RESULT_2026-07-27.md).
+
+## 2026-07-27: Chatterbox six-text mechanical gate
+
+Added a versioned six-item neutral Spanish corpus and an orchestrator that
+keeps the pinned Magpie `2.24.0` and Chatterbox `2.26.0` clients in separate
+`python3 -S` subprocesses. Each arm receives a discarded per-fixture warm-up
+and five measured trials. The runner validates exact child schema, pinned
+model/client/voice/audio provenance, warm-up success, WAV format and duration,
+private request/report/audio bindings, and fresh ignored artifact placement.
+
+The default-off blind-review builder preselects repeats 2 and 4, rewrites
+metadata-free WAVs, counterbalances A/B within every fixture, and stores model
+keys, hashes, and phase-two reference sheets separately. It creates no review
+bundle when mechanics fail. A client-metric pass remains pending until manual
+container/GPU attestation is bound to the run.
+
+Protocol version 1 completed all 60 measured requests and found an overall
+16.04% Chatterbox duration reduction with five of six fixtures at least 5%
+shorter. It failed its 1.00-second selected-repeat continuity cap by 0.009
+seconds. That result remains failed. A fresh protocol-version-2 run applied a
+predeclared 1.25-second cap to all 30 Chatterbox trials. It again completed all
+60 measured requests, reduced overall duration by 16.60%, and won five of six
+fixtures, but one long-clause trial required 1.505 seconds of startup
+buffering. No reviewer bundle was created.
+
+The micro fixture was 23.5% longer with Chatterbox. The expressive,
+punchline-like fixture was 22.4% shorter, but Chatterbox first audio was 0.880
+seconds versus 0.131 seconds for Magpie and still required continuity
+protection. This confirms the candidate's tradeoff: lower accumulated media
+duration but a larger fixed phrase-start delay. It does not satisfy the
+synchronized live-reaction objective by itself.
+
+Both runs retained bound runtime attestations. All four services remained
+healthy with zero restarts and no OOM; the version-2 post-run GPU state was
+85,280 MiB used with 11,971 MiB free. The recreated container inherited the
+120-second stop timeout but still exited `137` after exceeding it, with
+`OOMKilled=false`. The three active services remained healthy and GPU use
+returned to 32,300 MiB. Compose now grants newly recreated Chatterbox
+containers five minutes; that longer stop is not yet verified.
+
+The added runner/corpus tests and both arm suites passed 90 focused tests. The
+maintained suite passed 903 tests with one skip. See
+[TTS multi-text result](TTS_MULTITEXT_RESULT_2026-07-27.md).
+
+## 2026-07-27: Fresh Magpie headless S2S control
+
+Returned to the active Magpie path and ran the tracked 60-second fixture
+through staged Nemotron 3 ASR, NMT, and Magpie TTS with 800 ms EOU, word
+offsets, punctuation splitting, independent bounded workers, schema-3
+incremental publication, and the registered no-drop 5/8/10-second listener
+policy.
+
+The non-formal dirty-worktree probe completed all 200 source chunks, 23
+translated parents, and 112 translated PCM frames. The queue gate passed:
+time-weighted p95 was 4.181 seconds, peak was 5.460 seconds, time above 10
+seconds was zero, and no frame was dropped, reordered, or duplicated. The
+adaptive listener tail was 6.756 seconds. Source-end-to-first-scheduled-parent
+p95 was 6.043 seconds and source-end-to-final-scheduled-parent p95 was 8.171
+seconds.
+
+Those source-parent envelopes are a conservative freshness proxy, not an exact
+translated-punchline or acoustic-audibility measurement. The next gate is a
+default-off private headless PCM and per-frame schedule ledger, hash-bound to
+the sent source PCM, followed by independent bilingual source/target sample
+marking. See
+[Magpie headless S2S control](MAGPIE_HEADLESS_CONTROL_RESULT_2026-07-27.md).
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1874,6 +1973,14 @@ See [Chatterbox TTS canary](CHATTERBOX_TTS_CANARY.md) and
   telemetry
 - [x] Pass the one-minute synthesized low-energy PCM live gate
 - [x] Promote the synthesized low-energy PCM gate to five-minute Sample 02
+- [x] Probe Chatterbox `cfg_weight` transport and repeated duration effect
+- [x] Run the six-text Chatterbox/Magpie mechanical comparison twice
+- [ ] Promote Chatterbox to native review (blocked by repeated continuity-cap
+  failures)
+- [x] Rerun the active Magpie one-minute headless S2S control after the
+  Chatterbox mechanical gate
+- [ ] Add a browser-independent private PCM/schedule-ledger semantic marker
+  gate with bilingual source/target review
 - [ ] Run a parent/frame-aligned guarded-edge capacity counterfactual
 - [ ] Repeat publisher-handoff telemetry over complete long-form samples before
   claiming the historical late-sample anomaly is eliminated
