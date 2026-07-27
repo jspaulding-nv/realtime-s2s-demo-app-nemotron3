@@ -19,7 +19,8 @@ Chatterbox is worth measuring because NVIDIA NIM exposes a per-request
 - The upstream Chatterbox project says larger exaggeration values *tend* to
   make speech faster. That is an empirical tendency, not a duration guarantee.
 - Upstream also exposes `cfg_weight`, but Chatterbox NIM `1.0.0` does not
-  document that key as supported. It is excluded from the formal first canary.
+  document that key as supported. It is excluded from the formal first canary
+  and tested only by the separate default-off compatibility/effect probe.
 
 Official references:
 
@@ -218,6 +219,67 @@ The control performs one discarded warm-up and three measured repetitions.
 It applies the same private-artifact, deadline, output-bound, cadence, and
 continuity rules. Do not put both Riva client releases in one interpreter.
 
+## Experimental `cfg_weight` probe
+
+The Chatterbox container is pinned at `1.0.0`. The Speech NIM customization
+documentation for release `26.05.0` documents `exaggeration_factor`, but not
+`cfg_weight`. The standalone probe therefore distinguishes three questions:
+
+1. Does the pinned NIM accept the key under healthy no-key controls?
+2. If accepted, does a balanced repeated matrix demonstrate a stable duration
+   effect?
+3. If an effect is demonstrated, does any cell satisfy the predeclared
+   duration, first-audio, RTF, and continuity screen?
+
+Run the bracketed contract smoke first:
+
+```bash
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$PWD/.python-packages-chatterbox:$PWD" \
+  python3 -S chatterbox_cfg_weight_probe.py
+```
+
+The runner discards one no-key warm-up, then sends:
+
+```text
+no cfg_weight -> 0.3 -> 0.5 -> 0.7 -> no cfg_weight
+```
+
+The controls omit the map key entirely; they do not send a null or empty
+value. `accepted` proves only that all weighted requests returned valid PCM
+between healthy controls. It does not prove the model applied the value.
+Deterministic `INVALID_ARGUMENT` or `UNIMPLEMENTED` responses under healthy
+controls are classified as `rejected`; mixed failures are `inconclusive`.
+
+Only after an accepted smoke, run the balanced effect matrix:
+
+```bash
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$PWD/.python-packages-chatterbox:$PWD" \
+  python3 -S chatterbox_cfg_weight_probe.py \
+    --balanced-matrix \
+    --repeats-per-cell 5
+```
+
+This rotates 40 measured requests across exaggeration factors `0.5` and `0.7`
+and `cfg_weight` omitted, `0.3`, `0.5`, and `0.7`. A stable effect requires the
+`0.3`-versus-`0.7` direction to agree in at least four of five repeats at both
+exaggeration levels, with the same direction and at least a 5% or 0.25-second
+median difference. Acceptance without that evidence is reported as
+`effect_not_demonstrated`, never as proof that the key was ignored.
+The smoke exits zero only for transport acceptance. Balanced mode exits zero
+only when it demonstrates both an effect and a realtime candidate; exit `3`
+means the balanced run completed under accepted transport but did not meet
+that promotion gate. Consumers should retain and inspect the JSON report.
+
+The ignored artifact directory uses the same private `0700`/`0600`, atomic
+publication, safe-error, deadline, PCM-limit, and no-text/no-path rules as the
+first canary. WAV files still require native review before sharing.
+
+The completed July 27 run accepted the field but did not demonstrate a stable
+effect or realtime candidate. See the
+[`cfg_weight` result](CHATTERBOX_CFG_WEIGHT_RESULT_2026-07-27.md).
+
 ## First-gate interpretation
 
 This is a duration, responsiveness, and quality comparison—not an automatic
@@ -259,12 +321,13 @@ Audience gate:
 
 ## Promotion order
 
-If the isolated sweep passes:
+If the isolated sweep shows a useful duration signal:
 
-1. Review the generated audio with native Spanish listeners.
-2. Repeat a matched Magpie-versus-Chatterbox direct TTS corpus across multiple
-   fixed texts.
-3. Upgrade the main Riva client to `2.26.0` only after a Magpie regression test.
+1. Run the matched multi-text mechanical gate.
+2. Create and complete the blinded native-Spanish review only if the
+   mechanical gate passes.
+3. Upgrade the main Riva client to `2.26.0` only after a Magpie regression
+   test.
 4. Add a separate TTS request locale/voice and validated
    `custom_configuration` to `DirectTTSClient`; keep NMT output at `es-US`.
 5. Run the one-minute staged preflight.
@@ -272,10 +335,15 @@ If the isolated sweep passes:
 7. Run all three long-form samples only after runtime, duration, and native
    listener-quality gates pass.
 
-`cfg_weight` may be sent once as an exploratory compatibility probe after the
-documented factor sweep. Record whether the server accepts, rejects, or
-silently ignores it. Do not depend on it unless NVIDIA documents the NIM
-contract or a controlled response test proves a stable effect.
+The completed multi-text run stopped at step 1 because one Chatterbox
+long-clause trial required 1.505 seconds of startup buffering, above the
+predeclared 1.25-second cap. No reviewer bundle was created, and integration
+steps remain blocked.
+
+`cfg_weight` remains outside the integration contract. The pinned NIM accepted
+the tested values, but the balanced run did not demonstrate a stable effect.
+Do not depend on it unless NVIDIA documents the Speech NIM contract and a
+future controlled response test proves a useful, repeatable result.
 
 See the
 [July 26 live Chatterbox result](CHATTERBOX_TTS_RESULT_2026-07-26.md) for the
@@ -288,4 +356,9 @@ docker compose --profile chatterbox-canary stop chatterbox-tts
 docker compose --profile chatterbox-canary rm -f chatterbox-tts
 ```
 
-These commands leave the separate ASR, NMT, and Magpie deployment unchanged.
+Compose grants newly created Chatterbox containers five minutes for a graceful
+stop. A July 27 multi-text run showed that two minutes was still insufficient:
+Docker stopped the container with exit `137`, while reporting
+`OOMKilled=false`. Recreate any container that predates the five-minute setting
+before relying on that timeout. These commands leave the separate ASR, NMT,
+and Magpie deployment unchanged.

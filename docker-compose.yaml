@@ -83,6 +83,8 @@ services:
         target: /opt/nim/.cache
     # A 52.5 GB comparison arm must never return implicitly after a reboot.
     restart: "no"
+    # A live shutdown exceeded two minutes without an OOM.
+    stop_grace_period: 5m
     healthcheck:
       test: ["CMD", "/bin/grpc_health_probe", "-addr=:50054"]
       interval: 10s
