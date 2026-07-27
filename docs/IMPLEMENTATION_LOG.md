@@ -1926,6 +1926,54 @@ the sent source PCM, followed by independent bilingual source/target sample
 marking. See
 [Magpie headless S2S control](MAGPIE_HEADLESS_CONTROL_RESULT_2026-07-27.md).
 
+## 2026-07-27: browser-independent scheduled semantic-delay gate
+
+Added an explicit, default-off private evidence path to
+`batch_latency_test.py`. It is limited to one `--file` capture, requires audio
+metadata protocol v1 plus the staged schema-3 incremental-publication path,
+and cannot be combined with the aggregate synthesized-silence diagnostic.
+Routine runs retain no source or translated PCM.
+
+The private capture binds the exact real-time-paced source PCM, source chunk
+deadlines, validated translated PCM frames, parent completions, and every
+incremental decision from the registered no-drop 5/8/10-second listener
+schedule. It independently replays that schedule before sealing. A clean run
+may publish only to a fresh child of ignored `experiment_results/`; the
+directory is mode `0700`, its two review WAVs and exact-schema ledger are mode
+`0600`, and the ledger contains hashes and numeric evidence rather than PCM,
+text, paths, endpoints, identifiers, or wall-clock time. Any capture,
+validation, sealing, or publication failure discards retained private bytes
+and never publishes a partial evidence set.
+
+Added `analyze_scheduled_semantic_delay.py` and
+`HEADLESS_SEMANTIC_DELAY_GATE.md`. The analyzer verifies the ledger, both WAV
+hashes and formats, every PCM range and frame hash, parent attribution,
+canonical listener-schedule replay, and an exact anonymous marker sidecar. It
+requires at least two independent bilingual reviewers for both the source and
+translated landmark. Each marker is mapped to a conservative one-sample
+source-to-scheduled-target interval and classified PASS, FAIL, or
+INCONCLUSIVE against a declared threshold. This proves scheduled digital
+semantic delay, not DAC output, acoustic audibility, room-reaction
+synchronization, translation quality, or reviewer independence.
+
+The fresh private 60-second Magpie capture then completed all 200 source
+chunks, 23 translated parents, and 113 translated frames. Independent
+ledger/WAV/hash validation and canonical schedule replay passed; all 23
+parents carried complete ASR source ranges. The queue gate passed with a
+4.095-second time-weighted p95, 5.563-second peak, zero time above 10 seconds,
+and no frame loss, reordering, or duplication. The scheduled listener tail was
+6.979 seconds.
+
+The private directory and file modes plus Git-ignore status were verified.
+Raw audio, hashes, paths, and reviewer records remain outside tracked
+documentation. The semantic result is still **not evaluated** because two
+independent bilingual source and translated marker reviews have not occurred.
+See
+[Headless scheduled semantic capture result](HEADLESS_SEMANTIC_CAPTURE_RESULT_2026-07-27.md).
+
+Implementation validation passed the maintained suite with 1,011 tests and one
+expected environment-dependent skip.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -1979,8 +2027,11 @@ marking. See
   failures)
 - [x] Rerun the active Magpie one-minute headless S2S control after the
   Chatterbox mechanical gate
-- [ ] Add a browser-independent private PCM/schedule-ledger semantic marker
+- [x] Add a browser-independent private PCM/schedule-ledger semantic marker
   gate with bilingual source/target review
+- [x] Run the private 60-second scheduled semantic evidence capture
+- [ ] Complete independent bilingual review and both the five-second and
+  ten-second analyses before promoting to five-minute or long-form captures
 - [ ] Run a parent/frame-aligned guarded-edge capacity counterfactual
 - [ ] Repeat publisher-handoff telemetry over complete long-form samples before
   claiming the historical late-sample anomaly is eliminated

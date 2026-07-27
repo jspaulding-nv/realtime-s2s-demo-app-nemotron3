@@ -114,9 +114,12 @@ Incremental PCM publication removed some avoidable response buffering, and the
 current observation gate can associate each output frame with a source parent.
 The repository now includes a transcript-free semantic source-event gate that
 binds a reviewed source sample to its conservative translated-parent receipt
-and projected-playback envelope. A clean live capture with reviewed markers is
-the next experiment; exact target-language landmark and physical-audibility
-measurements remain later evidence tiers.
+and projected-playback envelope. It also includes a stricter, default-off
+headless gate that hash-binds the exact source and translated PCM to every
+validated frame's deterministic listener schedule. Independent bilingual
+reviewers can mark corresponding samples and measure scheduled semantic delay
+without Chrome or an audio device. A clean live capture and review are the next
+experiment; physical audibility remains a later evidence tier.
 
 ## Architecture
 
@@ -154,12 +157,15 @@ realtime-s2s-demo-app/
 ├── chatterbox_cfg_weight_probe.py # Default-off cfg_weight contract/effect gate
 ├── run_blinded_tts_comparison.py # Six-text mechanical/blind-review gate
 ├── magpie_tts_control.py    # Matched warm Magpie streaming control
+├── private_pcm_schedule_ledger.py # Opt-in private PCM/schedule evidence
+├── analyze_scheduled_semantic_delay.py # Reviewed sample-delay gate
 ├── tts_comparison_fixture.py # Shared versioned text identity and counts
 ├── tts_multitext_corpus.py  # Sanitized fixed Spanish comparison corpus
 ├── NEMOTRON_TEST_RESULTS.md
 ├── test_audio/              # Bundled source fixtures under neutral filenames
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
 │   ├── HEADLESS_REALTIME_GATE.md
+│   ├── HEADLESS_SEMANTIC_DELAY_GATE.md
 │   ├── RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md
 │   └── SANITIZATION.md     # Public-data and evidence policy
 ├── backend/
@@ -334,7 +340,11 @@ their predeclared stream-continuity buffer cap. Chatterbox therefore remains
 unpromoted and Magpie remains active. The subsequent
 [Magpie headless S2S control](docs/MAGPIE_HEADLESS_CONTROL_RESULT_2026-07-27.md)
 passed the one-minute no-drop 5/8/10-second listener-queue gate and records the
-remaining semantic punchline-delay evidence gap.
+remaining semantic punchline-delay evidence gap. The subsequent
+[private semantic capture](docs/HEADLESS_SEMANTIC_CAPTURE_RESULT_2026-07-27.md)
+also passed its operational, privacy, hash, schedule-replay, and mechanical
+queue gates. Its semantic result remains unevaluated until independent
+bilingual reviewers add source/translated landmark markers.
 
 After a host reboot, Compose's `unless-stopped` policy should restart the three
 NIM containers, but readiness must still be verified with the commands above.
@@ -741,6 +751,16 @@ terminal mismatch. Its source-end latency uses a client-monotonic input
 sample-zero marker and is explicitly labeled non-semantic when ASR supplies
 only the `audio_processed` fallback offset.
 
+For reviewed source-to-translated scheduled semantic delay, use the explicit
+`--private-semantic-capture-dir` option with one `--file` input and metadata
+protocol v1. This retains private review WAVs and a strict schedule ledger only
+in a fresh ignored `experiment_results/` child; it is off by default and is not
+supported by `run_long_form_experiment.py`. The analyzer requires at least two
+independent bilingual reviews for both landmarks and reports separate
+five-second-objective and ten-second-ceiling results. See the
+[headless semantic-delay gate](docs/HEADLESS_SEMANTIC_DELAY_GATE.md) for the
+capture, sidecar, privacy, and claim-boundary contract.
+
 For the audience-latency gate, capture a protocol-v1 Test Dashboard CSV with
 ASR word timing enabled, bind two-reviewer anonymous source markers to the
 exact CSV SHA-256 plus the SHA-256 and padded sample count of the transmitted
@@ -933,6 +953,8 @@ Detailed guides:
 - [Observation-only parent/frame metadata protocol v1](docs/AUDIO_METADATA_OBSERVATION_V1.md)
 - [Protocol-v1 60-second formal canary](docs/AUDIO_METADATA_60S_CANARY_2026-07-25.md)
 - [Semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md)
+- [Headless scheduled semantic-delay gate](docs/HEADLESS_SEMANTIC_DELAY_GATE.md)
+- [July 27 private semantic capture result](docs/HEADLESS_SEMANTIC_CAPTURE_RESULT_2026-07-27.md)
 - [ASR final-attribution qualification result](docs/ASR_FINAL_ATTRIBUTION_GATE_2026-07-25.md)
 - [Privacy-safe ASR word-timing-shape diagnostic](docs/ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md)
 - [ASR word-timing-shape diagnostic result](docs/ASR_WORD_TIMING_SHAPE_RESULT_2026-07-25.md)
