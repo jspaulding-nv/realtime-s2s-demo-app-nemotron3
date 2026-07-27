@@ -106,6 +106,12 @@ The upstream repository also exposes `cfg_weight`, but NVIDIA's Chatterbox NIM
 configuration key. `cfg_weight` was not used in the formal result and must not
 become an integration dependency without a documented NIM contract.
 
+The separate July 27 follow-up proved that the pinned NIM accepted explicit
+`cfg_weight` values `0.3`, `0.5`, and `0.7`, but its balanced 40-request matrix
+did not demonstrate a stable duration effect or realtime promotion candidate.
+See
+[`CHATTERBOX_CFG_WEIGHT_RESULT_2026-07-27.md`](CHATTERBOX_CFG_WEIGHT_RESULT_2026-07-27.md).
+
 ## Quality and audience risk
 
 Audio quality has not passed native Spanish review. Reviewers must check

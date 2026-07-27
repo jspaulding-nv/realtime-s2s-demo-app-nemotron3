@@ -892,6 +892,7 @@ def synthesize_factor(
     voice: str,
     sample_rate_hz: int,
     exaggeration_factor: float,
+    cfg_weight: Optional[float] = None,
     output_path: Optional[Path],
     rpc_timeout_seconds: float,
     max_audio_duration_seconds: float,
@@ -910,6 +911,18 @@ def synthesize_factor(
     if max_audio_bytes <= 0:
         raise ValueError("maximum audio duration produces a zero-byte limit")
 
+    custom_configuration = {
+        "exaggeration_factor": f"{exaggeration_factor:g}"
+    }
+    if cfg_weight is not None:
+        if (
+            not isinstance(cfg_weight, (int, float))
+            or isinstance(cfg_weight, bool)
+            or not math.isfinite(cfg_weight)
+        ):
+            raise ValueError("cfg_weight must be finite when provided")
+        custom_configuration["cfg_weight"] = f"{cfg_weight:g}"
+
     started = clock()
     responses = service.synthesize_online(
         text=text,
@@ -917,9 +930,7 @@ def synthesize_factor(
         language_code=tts_locale,
         encoding=riva_client_module.AudioEncoding.LINEAR_PCM,
         sample_rate_hz=sample_rate_hz,
-        custom_configuration={
-            "exaggeration_factor": f"{exaggeration_factor:g}"
-        },
+        custom_configuration=custom_configuration,
     )
     if not callable(getattr(responses, "cancel", None)):
         raise RuntimeError(
