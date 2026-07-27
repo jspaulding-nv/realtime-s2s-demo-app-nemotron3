@@ -59,6 +59,10 @@ See the [sanitization policy](docs/SANITIZATION.md) and
   source-offset freshness, and observation-only shadow-policy replay
 - A fail-closed, transcript-free semantic source-event analyzer that binds
   reviewed source samples to conservative translated-parent playback envelopes
+- A single-file offline bilingual review assistant and fail-closed coordinator
+  that verify frozen audio/ledger hashes, retain independent first-pass
+  observations, and create the analyzer sidecar only after explicit
+  reconciliation
 - Direct Nemotron ASR, Riva NMT, and Magpie TTS adapters with strict validation
 - A bounded ordered staged orchestrator that overlaps NMT and TTS, drains exactly, and records per-stage telemetry
 - Default-off staged `/ws/translate` integration with ordered PCM sends and retained sequence telemetry
@@ -118,8 +122,9 @@ and projected-playback envelope. It also includes a stricter, default-off
 headless gate that hash-binds the exact source and translated PCM to every
 validated frame's deterministic listener schedule. Independent bilingual
 reviewers can mark corresponding samples and measure scheduled semantic delay
-without Chrome or an audio device. A clean live capture and review are the next
-experiment; physical audibility remains a later evidence tier.
+without making a browser part of the deployed S2S path. The clean live capture
+is complete; independent bilingual review is the next experiment. Physical
+audibility remains a later evidence tier.
 
 ## Architecture
 
@@ -159,6 +164,8 @@ realtime-s2s-demo-app/
 ├── magpie_tts_control.py    # Matched warm Magpie streaming control
 ├── private_pcm_schedule_ledger.py # Opt-in private PCM/schedule evidence
 ├── analyze_scheduled_semantic_delay.py # Reviewed sample-delay gate
+├── semantic_review_workflow.py # Prepare, compare, reconcile, and analyze reviews
+├── semantic_review_assistant.html # Offline bilingual marker/review assistant
 ├── tts_comparison_fixture.py # Shared versioned text identity and counts
 ├── tts_multitext_corpus.py  # Sanitized fixed Spanish comparison corpus
 ├── NEMOTRON_TEST_RESULTS.md
@@ -166,6 +173,7 @@ realtime-s2s-demo-app/
 ├── docs/                   # Playback, metrics, experiment, and staged-pipeline guides
 │   ├── HEADLESS_REALTIME_GATE.md
 │   ├── HEADLESS_SEMANTIC_DELAY_GATE.md
+│   ├── SEMANTIC_REVIEW_ASSISTANT.md
 │   ├── RENDERED_DIGITAL_COMMON_CLOCK_PREFLIGHT.md
 │   └── SANITIZATION.md     # Public-data and evidence policy
 ├── backend/
@@ -759,7 +767,11 @@ supported by `run_long_form_experiment.py`. The analyzer requires at least two
 independent bilingual reviews for both landmarks and reports separate
 five-second-objective and ten-second-ceiling results. See the
 [headless semantic-delay gate](docs/HEADLESS_SEMANTIC_DELAY_GATE.md) for the
-capture, sidecar, privacy, and claim-boundary contract.
+capture, sidecar, privacy, and claim-boundary contract. The
+[offline semantic review assistant](docs/SEMANTIC_REVIEW_ASSISTANT.md) gives
+each reviewer local audio controls and exports a hash-bound anonymous
+observation; its coordinator keeps first passes separate and requires an
+explicit canonical marker for every reconciled event.
 
 For the audience-latency gate, capture a protocol-v1 Test Dashboard CSV with
 ASR word timing enabled, bind two-reviewer anonymous source markers to the
@@ -954,6 +966,7 @@ Detailed guides:
 - [Protocol-v1 60-second formal canary](docs/AUDIO_METADATA_60S_CANARY_2026-07-25.md)
 - [Semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md)
 - [Headless scheduled semantic-delay gate](docs/HEADLESS_SEMANTIC_DELAY_GATE.md)
+- [Offline bilingual semantic review assistant](docs/SEMANTIC_REVIEW_ASSISTANT.md)
 - [July 27 private semantic capture result](docs/HEADLESS_SEMANTIC_CAPTURE_RESULT_2026-07-27.md)
 - [ASR final-attribution qualification result](docs/ASR_FINAL_ATTRIBUTION_GATE_2026-07-25.md)
 - [Privacy-safe ASR word-timing-shape diagnostic](docs/ASR_WORD_TIMING_SHAPE_DIAGNOSTIC.md)

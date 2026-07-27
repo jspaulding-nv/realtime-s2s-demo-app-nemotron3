@@ -158,6 +158,14 @@ translated-frame continuity, schedule mapping, and marker ranges.
 
 ## Independent bilingual review
 
+Use the
+[offline semantic review assistant](SEMANTIC_REVIEW_ASSISTANT.md) for the
+recommended workflow. It gives each reviewer a local, single-file listening
+interface, verifies the frozen assignment, ledger, WAV, and PCM bindings before
+enabling export, and keeps independent observations separate until explicit
+reconciliation. The browser is review tooling only; it is not part of the
+deployed S2S path.
+
 Select several anonymous semantic moments, including short reaction or
 punchline-like landmarks near the beginning, middle, and end. Define the
 landmark rule before review—for example, the onset of the source word that
@@ -180,9 +188,11 @@ Use this procedure:
    translated landmarks.
 4. Compare results only after all first passes are locked. Reviewers may then
    replay a boundary and reconcile one canonical sample index.
-5. Omit an event if the reviewers cannot agree that the source and translated
-   landmarks express the same semantic moment or cannot reconcile a canonical
-   boundary. Do not average unrelated or ambiguous landmarks.
+5. Require an explicit, supported canonical boundary for every event in the
+   frozen assignment. If any event cannot be reconciled, do not omit it or
+   publish a partial sidecar; formal analysis remains unavailable/inconclusive
+   until the assignment is fully resolved. Do not average unrelated or
+   ambiguous landmarks.
 6. Record separately how many reviewers independently completed and accepted
    the source and translated boundaries.
 
@@ -199,7 +209,11 @@ not assume the source and translated files have different or identical rates.
 
 ## Reviewer sidecar schema
 
-Create `reviewer-markers.json` as UTF-8 JSON with exactly these top-level and
+The review coordinator creates `reviewer-markers.json` only after validating
+at least two independent observations and receiving explicit reconciled sample
+indices. The schema below remains the analyzer contract and is included for
+auditability; do not hand-edit reviewer observations or use automatic averages
+to manufacture this sidecar. It is UTF-8 JSON with exactly these top-level and
 event keys. The top-level event array is named `events`:
 
 ```json

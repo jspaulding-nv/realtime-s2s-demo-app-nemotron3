@@ -1974,6 +1974,50 @@ See
 Implementation validation passed the maintained suite with 1,011 tests and one
 expected environment-dependent skip.
 
+## 2026-07-27: offline bilingual semantic review kit
+
+Completed:
+
+- Added a single-file offline review assistant and a fail-closed coordinator
+  with `prepare`, `compare`, `reconcile`, and `analyze` commands.
+- `prepare` creates one five-file reviewer packet bound to the frozen schedule
+  ledger and source/translated PCM by exact hashes, sample counts, and format.
+  The page verifies those bindings locally before enabling review; it has no
+  upload, network, identity, transcript, translation-text, or free-text field.
+- At least two bilingual reviewers complete anonymous blind first passes.
+  Structured output records semantic equivalence, boundary confidence,
+  translation quality, intelligibility, naturalness, and fixed issue flags.
+- Reconciliation requires explicit canonical source and translated sample
+  indices supported by sufficient accepted, confident observations. The
+  workflow never averages or infers semantic landmarks.
+- Successful reconciliation writes the exact analyzer marker sidecar plus
+  aggregate structured feedback without reviewer identity or free text.
+  `analyze` then runs the five-second objective and ten-second ceiling from the
+  same immutable evidence.
+- The workflow rejects duplicate JSON keys, evidence drift, mixed packets,
+  unsafe paths or links, improper permissions, duplicate review artifacts or
+  session identifiers, and clobbering of existing outputs. Private directories
+  remain mode `0700` and files mode `0600`.
+
+The reviewer packet was prepared from the existing 60-second capture without
+changing its frozen ledger or audio. This interface is qualified for the
+60-second control; a validated zoomed-window workflow is still required before
+precise review of 30–40-minute captures.
+
+No reviewer observations, reconciled marker sidecar, or semantic-delay reports
+exist yet. The semantic result remains **not evaluated** until at least two
+independent bilingual reviews are completed and reconciled.
+
+A local-file browser smoke loaded and bound the exact packet inputs, exercised
+the omission fail-closed control, and exported a schema-valid anonymous
+observation without a network dependency. This verified reviewer mechanics
+only; it did not evaluate audio quality, semantic equivalence, or delay.
+
+Focused review-assistant and coordinator validation passed 58 tests. The
+maintained repository suite passed 1,069 tests with one expected
+environment-dependent skip; the backend suite separately passed 462 tests
+with one expected environment-dependent skip.
+
 ## Handoff checklist
 
 - [x] Frontend lint passed on the adaptive working branch
@@ -2030,6 +2074,9 @@ expected environment-dependent skip.
 - [x] Add a browser-independent private PCM/schedule-ledger semantic marker
   gate with bilingual source/target review
 - [x] Run the private 60-second scheduled semantic evidence capture
+- [x] Implement and validate the offline five-file bilingual review packet and
+  blind compare/reconcile/analyze workflow
+- [x] Pilot the exact packet in a current browser before reviewer distribution
 - [ ] Complete independent bilingual review and both the five-second and
   ten-second analyses before promoting to five-minute or long-form captures
 - [ ] Run a parent/frame-aligned guarded-edge capacity counterfactual

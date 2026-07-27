@@ -96,6 +96,20 @@ Both one-minute runs preserved every frame, remained below the ten-second
 queue ceiling, and produced similar queue and parent-envelope behavior. Two
 runs do not establish a long-form bound.
 
+## Review packet status
+
+The offline five-file reviewer packet is prepared for this frozen capture. Its
+assignment binds the exact ledger and source/translated PCM, and every reviewer
+receives the same files. The local review page verifies those bindings before
+exporting an anonymous structured observation; it is reviewer tooling only and
+does not make a browser part of the deployed S2S path.
+
+No human observation, canonical marker sidecar, or five-second or ten-second
+analysis exists yet. Packet readiness does not change the semantic verdict:
+the result remains **not evaluated**. The current whole-stream interface is
+qualified for this 60-second control; long-form review requires a separately
+validated zoomed-window workflow.
+
 ## Required review before a semantic result
 
 At least two independent bilingual reviewers must mark the same anonymous
@@ -117,6 +131,7 @@ claim still requires a same-clock acoustic or digital-loopback experiment.
 ## Verification
 
 The implementation and evidence contracts passed the maintained repository
-suite: 1,011 tests passed and one expected environment-dependent test was
-skipped. See the
+suite: 1,069 tests passed and one expected environment-dependent test was
+skipped. The backend suite separately passed 462 tests with one expected
+environment-dependent skip. See the
 [headless semantic-delay runbook](HEADLESS_SEMANTIC_DELAY_GATE.md).
