@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one non-formal 60-second or five-minute tail-freshness shadow probe.
+"""Run one non-formal tail-freshness shadow probe.
 
 The runner builds the current frontend tree, starts only its own FastAPI and
 Vite preview children, drives the Test Dashboard through local headless Chrome,
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -63,6 +64,20 @@ FIVE_MINUTE_SOURCE_SHA256 = (
 FIVE_MINUTE_WAV_SHA256 = (
     "78e04698bf76502bc1ae23c5dac8391de0f60a51dc13aae9f042532a24df44d4"
 )
+LONG_FORM_SOURCES = {
+    1: (
+        REPOSITORY_ROOT / "test_audio" / "long-form-01.mp3",
+        "3824d3a7997213d787407e51a7594af2c94052435d7709d1cc659049188f8bdf",
+    ),
+    2: (
+        REPOSITORY_ROOT / "test_audio" / "long-form-02.mp3",
+        "89ba3916ad3caefbf7121a4aa7950a38df03b32a3d7389e7a5fd94ecd0c58806",
+    ),
+    3: (
+        REPOSITORY_ROOT / "test_audio" / "long-form-03.mp3",
+        "1c15abdcc8424b50e619bd3de4c00e47d921ea5e2f05a00ca4c6f479d89fbd66",
+    ),
+}
 
 EXACT_RUNTIME_OVERRIDES = {
     "S2S_PIPELINE_MODE": "staged",
@@ -230,7 +245,10 @@ def _new_output_directory(
 ) -> Path:
     if requested is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        label = "5min" if profile == "five-minute" else "60s"
+        label = {
+            "five-minute": "5min",
+            "60-second": "60s",
+        }.get(profile, profile)
         requested = (
             REPOSITORY_ROOT
             / "experiment_results"
@@ -263,9 +281,86 @@ def _find_ffmpeg() -> Path:
     return candidate
 
 
+def _transcode_to_pcm_wav(
+    source: Path,
+    destination: Path,
+    *,
+    limit_seconds: Optional[int] = None,
+) -> float:
+    command = [
+        str(_find_ffmpeg()),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+    ]
+    if limit_seconds is not None:
+        command.extend(("-t", str(limit_seconds)))
+    command.extend(
+        (
+            "-i",
+            str(source),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(destination),
+        )
+    )
+    completed = subprocess.run(
+        command,
+        cwd=str(REPOSITORY_ROOT),
+        stdin=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        raise PreflightRunnerError(
+            f"could not create registered PCM fixture from {source.name}"
+        )
+    try:
+        with wave.open(str(destination), "rb") as wav_file:
+            if (
+                wav_file.getnchannels() != 1
+                or wav_file.getsampwidth() != 2
+                or wav_file.getframerate() != 16000
+            ):
+                raise PreflightRunnerError(
+                    "generated WAV does not satisfy the 16 kHz mono PCM contract"
+                )
+            frame_count = wav_file.getnframes()
+    except (EOFError, wave.Error) as exc:
+        raise PreflightRunnerError("generated WAV is invalid") from exc
+    if frame_count <= 0:
+        raise PreflightRunnerError("generated WAV contains no audio frames")
+    return frame_count / 16000.0
+
+
 def _prepare_audio(
     args: argparse.Namespace, output_dir: Path
-) -> tuple[Path, int, str]:
+) -> tuple[Path, float, str]:
+    if args.long_form_sample is not None:
+        if args.audio is not None or args.five_minute:
+            raise PreflightRunnerError(
+                "--long-form-sample cannot be combined with --audio or --five-minute"
+            )
+        source, expected_source_sha256 = LONG_FORM_SOURCES[
+            args.long_form_sample
+        ]
+        source = source.resolve(strict=True)
+        if sha256_file(source) != expected_source_sha256:
+            raise PreflightRunnerError(
+                "tracked long-form source does not match its registered hash"
+            )
+        audio_path = output_dir / (
+            f"long-form-{args.long_form_sample:02d}-source.wav"
+        )
+        duration_seconds = _transcode_to_pcm_wav(source, audio_path)
+        return audio_path, duration_seconds, sha256_file(audio_path)
+
     if not args.five_minute:
         audio_path = (args.audio or DEFAULT_AUDIO).expanduser().resolve(
             strict=True
@@ -274,7 +369,7 @@ def _prepare_audio(
             raise PreflightRunnerError(
                 "audio input is not the registered exact 60-second fixture"
             )
-        return audio_path, 60, PREFLIGHT_FILE_SHA256
+        return audio_path, 60.0, PREFLIGHT_FILE_SHA256
 
     if args.audio is not None:
         raise PreflightRunnerError(
@@ -286,40 +381,14 @@ def _prepare_audio(
             "tracked five-minute source does not match its registered hash"
         )
     audio_path = output_dir / "five-minute-source.wav"
-    completed = subprocess.run(
-        [
-            str(_find_ffmpeg()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-t",
-            "300",
-            "-i",
-            str(source),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            str(audio_path),
-        ],
-        cwd=str(REPOSITORY_ROOT),
-        stdin=subprocess.DEVNULL,
-        check=False,
-        capture_output=True,
-        timeout=120,
+    duration_seconds = _transcode_to_pcm_wav(
+        source, audio_path, limit_seconds=300
     )
-    if completed.returncode != 0:
-        raise PreflightRunnerError(
-            "could not create the registered five-minute WAV fixture"
-        )
     if sha256_file(audio_path) != FIVE_MINUTE_WAV_SHA256:
         raise PreflightRunnerError(
             "generated five-minute WAV does not match retained-trace input"
         )
-    return audio_path, 300, FIVE_MINUTE_WAV_SHA256
+    return audio_path, duration_seconds, FIVE_MINUTE_WAV_SHA256
 
 
 def _write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -542,7 +611,10 @@ def _safe_model_record(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _run(args: argparse.Namespace) -> Path:
     state = inspect_repository(REPOSITORY_ROOT)
-    profile = "five-minute" if args.five_minute else "60-second"
+    if args.long_form_sample is not None:
+        profile = f"long-form-{args.long_form_sample:02d}"
+    else:
+        profile = "five-minute" if args.five_minute else "60-second"
     output_dir = _new_output_directory(
         args.output_dir,
         profile=profile,
@@ -691,8 +763,8 @@ def _run(args: argparse.Namespace) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one non-formal, observation-only 60-second or five-minute "
-            "live tail freshness shadow probe"
+            "Run one non-formal, observation-only live tail freshness "
+            "shadow probe"
         )
     )
     parser.add_argument(
@@ -706,6 +778,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "generate and run the hash-bound 300-second prefix of the tracked "
             "long-form-01 fixture"
+        ),
+    )
+    parser.add_argument(
+        "--long-form-sample",
+        type=int,
+        choices=tuple(LONG_FORM_SOURCES),
+        help=(
+            "run one complete registered long-form fixture by numeric ID; "
+            "cannot be combined with --audio or --five-minute"
         ),
     )
     parser.add_argument("--env-file", type=Path, default=REPOSITORY_ROOT / ".env")

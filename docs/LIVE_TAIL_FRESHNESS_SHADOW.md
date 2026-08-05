@@ -114,6 +114,25 @@ python3 run_live_tail_shadow_preflight.py \
   --npm /path/to/node-v22.12.0-linux-x64/bin/npm
 ```
 
+After the 100 ms five-minute profile passes, run all three complete registered
+fixtures sequentially with the checkpointed batch wrapper:
+
+```bash
+python3 run_live_tail_shadow_long_form.py \
+  --npm /path/to/node-v22.12.0-linux-x64/bin/npm
+```
+
+Resume an interrupted batch without overwriting completed evidence:
+
+```bash
+python3 run_live_tail_shadow_long_form.py \
+  --resume-dir experiment_results/<batch-directory> \
+  --npm /path/to/node-v22.12.0-linux-x64/bin/npm
+```
+
+See the [complete three-sample runbook](LONG_FORM_TAIL_SHADOW_RUNBOOK.md) for
+the fixed contract, per-sample checkpoint behavior, and claim boundaries.
+
 Outputs go to a fresh ignored
 `experiment_results/live-tail-shadow-probe-<UTC>/` directory. The runner fixes
 the exact 800 ms EOU, schema-3 500 ms incremental publication, adaptive
