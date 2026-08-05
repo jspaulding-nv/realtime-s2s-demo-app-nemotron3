@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -78,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("test_results_staged/staged-smoke-report.json"),
     )
+    parser.add_argument(
+        "--private-stage-trace",
+        action="store_true",
+        help=(
+            "retain source/translated text and exact PCM hashes in the JSON "
+            "report; use only with owner-private ignored outputs"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -129,6 +138,9 @@ def _resolved_config() -> StagedPipelineConfig:
             staged_pipeline_config.tts_subsegment_min_chars
         ),
         close_timeout_s=staged_pipeline_config.close_timeout_s,
+        segment_punctuation_min_chars=(
+            staged_pipeline_config.segment_punctuation_min_chars
+        ),
     )
 
 
@@ -230,6 +242,14 @@ async def run(args: argparse.Namespace) -> int:
                     "sequence_id": source.sequence_id,
                     "reason": source.reason.value,
                 }
+                if args.private_stage_trace:
+                    # SynthesizedStreamCompletion.to_dict() intentionally
+                    # excludes text for routine telemetry. This explicit,
+                    # default-off diagnostic restores the in-memory stage
+                    # record only in the caller-selected private report.
+                    report["private_stage_text"] = (
+                        completion.translation.to_dict()
+                    )
                 segment_reports.append(report)
                 continue
             synthesized = (
@@ -393,6 +413,28 @@ async def run(args: argparse.Namespace) -> int:
         "segments": segment_reports,
         "telemetry": [event.to_dict() for event in telemetry],
     }
+    if args.private_stage_trace:
+        with wave.open(str(audio_path), "rb") as source_handle:
+            source_frames = source_handle.readframes(feed.frames_sent)
+        report["private_stage_trace"] = {
+            "schema_version": 1,
+            "enabled": True,
+            "source_pcm_sha256": hashlib.sha256(source_frames).hexdigest(),
+            "source_pcm_sample_count": feed.frames_sent,
+            "translated_pcm_sha256": hashlib.sha256(bytes(pcm)).hexdigest(),
+            "translated_pcm_sample_count": (
+                len(pcm)
+                // audio_config.channels
+                // audio_config.bytes_per_sample
+            ),
+            "privacy": {
+                "contains_transcript_or_translation_text": True,
+                "contains_audio_hashes": True,
+                "contains_input_path": True,
+                "contains_service_endpoints": True,
+                "private_diagnostic_artifact": True,
+            },
+        }
     args.pcm_output.parent.mkdir(parents=True, exist_ok=True)
     args.pcm_output.write_bytes(bytes(pcm))
     args.json_output.parent.mkdir(parents=True, exist_ok=True)

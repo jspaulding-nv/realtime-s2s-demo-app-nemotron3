@@ -15,7 +15,12 @@ from typing import Literal, Sequence
 
 
 PlaybackMode = Literal["normal", "catch-up", "urgent", "over-limit"]
-FreshnessStrategy = Literal["oldest_first", "jump_to_latest_complete"]
+FreshnessStrategy = Literal[
+    "oldest_first",
+    "jump_to_latest_complete",
+    "oldest_frame_first",
+    "truncate_parent_tail",
+]
 
 
 @dataclass(frozen=True)
@@ -1010,6 +1015,14 @@ def simulate_parent_freshness_cap(
     when they arrived; compaction shifts only their start and end times.
     ``jump_to_latest_complete`` evicts all eligible parents older than the
     newest complete parent and intentionally retains that freshest parent.
+    ``oldest_frame_first`` is a more destructive frame-boundary
+    counterfactual: it evicts the oldest not-yet-audible frame regardless of
+    parent completion. It can therefore cut through spoken content and exists
+    only to quantify what a hard bound would cost.
+    ``truncate_parent_tail`` chooses the oldest not-yet-audible frame, removes
+    that frame and every later scheduled frame in the same parent, then
+    suppresses future frames through the parent's completion marker. This
+    permits at most one retained-prefix/truncated-suffix transition per parent.
     Protected or incomplete audio can therefore leave a residual breach; the
     result reports this explicitly instead of claiming a cap that whole-parent
     eviction cannot guarantee.
@@ -1028,10 +1041,16 @@ def simulate_parent_freshness_cap(
         raise ValueError(
             "cancellation_guard_seconds must be finite and non-negative"
         )
-    if strategy not in ("oldest_first", "jump_to_latest_complete"):
+    if strategy not in (
+        "oldest_first",
+        "jump_to_latest_complete",
+        "oldest_frame_first",
+        "truncate_parent_tail",
+    ):
         raise ValueError(
-            "strategy must be 'oldest_first' or "
-            "'jump_to_latest_complete'"
+            "strategy must be 'oldest_first', "
+            "'jump_to_latest_complete', 'oldest_frame_first', or "
+            "'truncate_parent_tail'"
         )
     if not isinstance(adaptive, bool):
         raise ValueError("adaptive must be a boolean")
@@ -1039,7 +1058,7 @@ def simulate_parent_freshness_cap(
     parent_order = _validate_parent_audio_frames(frames)
     states: list[_MutableFreshnessFrame] = []
     complete_parent_ids: set[int] = set()
-    dropped_parent_ids: set[int] = set()
+    suppressed_parent_ids: set[int] = set()
     dropped_states: list[_MutableFreshnessFrame] = []
     decisions: list[FreshnessCapDecision] = []
     evictions: list[FreshnessEviction] = []
@@ -1063,22 +1082,138 @@ def simulate_parent_freshness_cap(
         queue_before = _freshness_queue_depth(
             states, frame.arrival_seconds
         )
-        eligible = _eligible_complete_parents(
-            states,
-            complete_parent_ids=complete_parent_ids,
-            at_seconds=frame.arrival_seconds,
-            cancellation_guard_seconds=cancellation_guard_seconds,
-            parent_order=parent_order,
+        suppressed_arrival = (
+            strategy == "truncate_parent_tail"
+            and frame.parent_sequence_id in suppressed_parent_ids
         )
+        if suppressed_arrival:
+            eligible = (frame.parent_sequence_id,)
+        elif strategy in {"oldest_frame_first", "truncate_parent_tail"}:
+            eligible = tuple(
+                dict.fromkeys(
+                    state.frame.parent_sequence_id
+                    for state in states
+                    if state.start_seconds
+                    > (
+                        frame.arrival_seconds
+                        + cancellation_guard_seconds
+                        + _FRESHNESS_TIME_EPSILON
+                    )
+                )
+            )
+        else:
+            eligible = _eligible_complete_parents(
+                states,
+                complete_parent_ids=complete_parent_ids,
+                at_seconds=frame.arrival_seconds,
+                cancellation_guard_seconds=cancellation_guard_seconds,
+                parent_order=parent_order,
+            )
         dropped_now: list[int] = []
         event_dropped_states: list[_MutableFreshnessFrame] = []
 
-        if (
+        if suppressed_arrival:
+            suppressed_state = states.pop()
+            if suppressed_state.frame is not frame:
+                raise RuntimeError(
+                    "suppressed tail frame was not the newest schedule state"
+                )
+            event_dropped_states.append(suppressed_state)
+            dropped_now.append(frame.parent_sequence_id)
+        elif (
             queue_before
             > hard_cap_seconds + _FRESHNESS_TIME_EPSILON
             and eligible
         ):
-            if strategy == "oldest_first":
+            if strategy == "truncate_parent_tail":
+                while (
+                    _freshness_queue_depth(states, frame.arrival_seconds)
+                    > hard_cap_seconds + _FRESHNESS_TIME_EPSILON
+                ):
+                    victim = next(
+                        (
+                            state
+                            for state in states
+                            if state.start_seconds
+                            > (
+                                frame.arrival_seconds
+                                + cancellation_guard_seconds
+                                + _FRESHNESS_TIME_EPSILON
+                            )
+                        ),
+                        None,
+                    )
+                    if victim is None:
+                        break
+                    parent_sequence_id = victim.frame.parent_sequence_id
+                    eligible_parent_states = [
+                        state
+                        for state in states
+                        if state.frame.parent_sequence_id
+                        == parent_sequence_id
+                        and state.start_seconds
+                        > (
+                            frame.arrival_seconds
+                            + cancellation_guard_seconds
+                            + _FRESHNESS_TIME_EPSILON
+                        )
+                    ]
+                    if not eligible_parent_states:
+                        break
+                    removed: list[_MutableFreshnessFrame] = []
+                    # Remove the latest available suffix first. Stop as soon
+                    # as the cap is restored so the maximum buffered prefix
+                    # survives. If more relief is needed, the outer loop
+                    # advances to the next oldest eligible parent.
+                    for suffix_state in reversed(eligible_parent_states):
+                        states.remove(suffix_state)
+                        removed.append(suffix_state)
+                        _reschedule_freshness_future(
+                            states,
+                            at_seconds=frame.arrival_seconds,
+                        )
+                        if (
+                            _freshness_queue_depth(
+                                states, frame.arrival_seconds
+                            )
+                            <= hard_cap_seconds + _FRESHNESS_TIME_EPSILON
+                        ):
+                            break
+                    event_dropped_states.extend(reversed(removed))
+                    if parent_sequence_id not in dropped_now:
+                        dropped_now.append(parent_sequence_id)
+                    if parent_sequence_id not in complete_parent_ids:
+                        suppressed_parent_ids.add(parent_sequence_id)
+            elif strategy == "oldest_frame_first":
+                while (
+                    _freshness_queue_depth(states, frame.arrival_seconds)
+                    > hard_cap_seconds + _FRESHNESS_TIME_EPSILON
+                ):
+                    victim = next(
+                        (
+                            state
+                            for state in states
+                            if state.start_seconds
+                            > (
+                                frame.arrival_seconds
+                                + cancellation_guard_seconds
+                                + _FRESHNESS_TIME_EPSILON
+                            )
+                        ),
+                        None,
+                    )
+                    if victim is None:
+                        break
+                    states.remove(victim)
+                    event_dropped_states.append(victim)
+                    parent_sequence_id = victim.frame.parent_sequence_id
+                    if parent_sequence_id not in dropped_now:
+                        dropped_now.append(parent_sequence_id)
+                    _reschedule_freshness_future(
+                        states,
+                        at_seconds=frame.arrival_seconds,
+                    )
+            elif strategy == "oldest_first":
                 for parent_sequence_id in eligible:
                     removed = _remove_parent_states(
                         states, parent_sequence_id
@@ -1115,7 +1250,6 @@ def simulate_parent_freshness_cap(
 
         queue_after = _freshness_queue_depth(states, frame.arrival_seconds)
         if dropped_now:
-            dropped_parent_ids.update(dropped_now)
             dropped_states.extend(event_dropped_states)
             evictions.append(
                 FreshnessEviction(
@@ -1156,18 +1290,30 @@ def simulate_parent_freshness_cap(
                 residual_over_cap_seconds=residual_over_cap,
             )
         )
+        if frame.audio_frame_id + 1 == frame.parent_frame_count:
+            suppressed_parent_ids.discard(frame.parent_sequence_id)
 
     schedule = tuple(_to_freshness_scheduled_frame(state) for state in states)
     dropped_frames = tuple(state.frame for state in dropped_states)
+    retained_parent_id_set = {
+        frame.parent_sequence_id for frame in schedule
+    }
+    dropped_parent_id_set = {
+        frame.parent_sequence_id for frame in dropped_frames
+    }
+    fully_dropped_parent_ids = dropped_parent_id_set - retained_parent_id_set
+    partially_dropped_parent_ids = (
+        dropped_parent_id_set & retained_parent_id_set
+    )
     retained_parent_ids = tuple(
         parent_sequence_id
         for parent_sequence_id in parent_order
-        if parent_sequence_id not in dropped_parent_ids
+        if parent_sequence_id in retained_parent_id_set
     )
     ordered_dropped_parent_ids = tuple(
         parent_sequence_id
         for parent_sequence_id in parent_order
-        if parent_sequence_id in dropped_parent_ids
+        if parent_sequence_id in fully_dropped_parent_ids
     )
 
     total_source_duration = sum(frame.duration_seconds for frame in frames)
@@ -1272,7 +1418,7 @@ def simulate_parent_freshness_cap(
         max_dropped_duration_per_discontinuity,
     ) = _dropped_parent_run_metrics(
         parent_order=parent_order,
-        dropped_parent_ids=dropped_parent_ids,
+        dropped_parent_ids=fully_dropped_parent_ids,
         source_duration_by_parent=source_duration_by_parent,
     )
 
@@ -1288,7 +1434,7 @@ def simulate_parent_freshness_cap(
         parents_received=len(parent_order),
         parents_retained=len(retained_parent_ids),
         parents_dropped=len(ordered_dropped_parent_ids),
-        parents_partially_dropped=0,
+        parents_partially_dropped=len(partially_dropped_parent_ids),
         retained_parent_sequence_ids=retained_parent_ids,
         dropped_parent_sequence_ids=ordered_dropped_parent_ids,
         total_source_duration_seconds=total_source_duration,

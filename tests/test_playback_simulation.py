@@ -576,6 +576,124 @@ def test_jump_strategy_reports_residual_when_latest_parent_alone_exceeds_cap():
     assert result.summary.parents_dropped == 0
 
 
+def test_oldest_frame_first_hard_bounds_by_partially_dropping_parent():
+    frames = [
+        _parent_frame(
+            0,
+            0.0,
+            0.5,
+            audio_frame_id=0,
+            parent_frame_count=2,
+        ),
+        _parent_frame(
+            0,
+            0.1,
+            0.5,
+            audio_frame_id=1,
+            parent_frame_count=2,
+        ),
+    ]
+
+    result = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=0.2,
+        hard_cap_seconds=0.7,
+        strategy="oldest_frame_first",
+    )
+
+    assert result.summary.hard_cap_achieved
+    assert result.summary.frames_dropped == 1
+    assert result.summary.parents_dropped == 0
+    assert result.summary.parents_partially_dropped == 1
+    assert result.summary.parents_retained == 1
+    assert result.summary.retained_source_percent == 50.0
+    assert [frame.audio_frame_id for frame in result.schedule] == [0]
+    assert [frame.audio_frame_id for frame in result.dropped_frames] == [1]
+    assert result.decisions[-1].dropped_parent_sequence_ids == (0,)
+    assert result.summary.peak_queue_depth_seconds <= 0.7
+
+
+def test_oldest_frame_first_reports_guarded_residual_breach():
+    frames = [
+        _parent_frame(
+            0,
+            0.0,
+            0.5,
+            audio_frame_id=0,
+            parent_frame_count=2,
+        ),
+        _parent_frame(
+            0,
+            0.1,
+            0.5,
+            audio_frame_id=1,
+            parent_frame_count=2,
+        ),
+    ]
+
+    result = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=0.2,
+        hard_cap_seconds=0.7,
+        strategy="oldest_frame_first",
+        cancellation_guard_seconds=0.4,
+    )
+
+    assert not result.summary.hard_cap_achieved
+    assert result.summary.frames_dropped == 0
+    assert result.summary.residual_breach_events == 1
+
+
+def test_tail_truncation_suppresses_future_frames_as_one_suffix():
+    frames = [
+        _parent_frame(
+            0,
+            index * 0.1,
+            0.5,
+            audio_frame_id=index,
+            parent_frame_count=4,
+        )
+        for index in range(4)
+    ]
+
+    result = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=0.4,
+        hard_cap_seconds=1.2,
+        strategy="truncate_parent_tail",
+    )
+
+    assert result.summary.hard_cap_achieved
+    assert result.summary.parents_partially_dropped == 1
+    assert result.summary.parents_dropped == 0
+    assert [frame.audio_frame_id for frame in result.schedule] == [0, 1]
+    assert [frame.audio_frame_id for frame in result.dropped_frames] == [2, 3]
+    assert result.decisions[2].dropped_parent_sequence_ids == (0,)
+    assert result.decisions[3].dropped_parent_sequence_ids == (0,)
+    assert result.summary.peak_queue_depth_seconds <= 1.2
+
+
+def test_tail_truncation_whole_drops_unstarted_complete_parent():
+    frames = [
+        _parent_frame(0, 0.0, 2.0),
+        _parent_frame(1, 0.1, 2.0),
+        _parent_frame(2, 0.2, 2.0),
+    ]
+
+    result = simulate_parent_freshness_cap(
+        frames,
+        input_end_seconds=0.3,
+        hard_cap_seconds=3.9,
+        strategy="truncate_parent_tail",
+    )
+
+    assert result.summary.hard_cap_achieved
+    assert result.summary.parents_dropped == 1
+    assert result.summary.parents_partially_dropped == 0
+    assert result.summary.dropped_parent_sequence_ids == (1,)
+    assert [frame.parent_sequence_id for frame in result.schedule] == [0, 2]
+
+
 @pytest.mark.parametrize(
     ("frames", "error"),
     [

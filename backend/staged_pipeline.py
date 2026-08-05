@@ -803,6 +803,9 @@ class StagedPipelineSession:
             max_chars=self.config.segment_max_chars,
             max_age_ms=self.config.segment_max_age_ms,
             outcome_sink=segmenter_outcomes.append,
+            punctuation_min_chars=(
+                self.config.segment_punctuation_min_chars
+            ),
         )
         poll_s = min(0.1, self.config.segment_max_age_ms / 1_000)
         while True:

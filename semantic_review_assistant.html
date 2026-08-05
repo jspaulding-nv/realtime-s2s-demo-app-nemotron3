@@ -1,0 +1,2416 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; connect-src 'none'; img-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+  >
+  <title>Private bilingual semantic review</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #52606d;
+      --paper: #ffffff;
+      --canvas: #f3f6f8;
+      --line: #cbd5df;
+      --blue: #125ea5;
+      --blue-dark: #0b477d;
+      --blue-soft: #e8f2fb;
+      --green: #176b3a;
+      --green-soft: #e7f5ec;
+      --amber: #865900;
+      --amber-soft: #fff5d9;
+      --red: #a12525;
+      --red-soft: #fdecec;
+      --focus: #ffbf47;
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #edf2f5;
+      line-height: 1.5;
+    }
+
+    main {
+      width: min(1160px, calc(100% - 2rem));
+      margin: 2rem auto 5rem;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.2;
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 0.45rem;
+      font-size: clamp(1.75rem, 4vw, 2.5rem);
+    }
+
+    h2 {
+      font-size: 1.35rem;
+    }
+
+    h3 {
+      font-size: 1.1rem;
+    }
+
+    p {
+      margin: 0.65rem 0;
+    }
+
+    .lede {
+      color: var(--muted);
+      max-width: 78ch;
+      font-size: 1.05rem;
+    }
+
+    .panel {
+      padding: clamp(1rem, 3vw, 1.75rem);
+      margin-top: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: 0.75rem;
+      background: var(--paper);
+      box-shadow: 0 2px 8px rgb(23 33 43 / 8%);
+    }
+
+    .notice {
+      border-left: 0.4rem solid var(--blue);
+      background: var(--blue-soft);
+    }
+
+    .notice strong {
+      display: block;
+      margin-bottom: 0.2rem;
+    }
+
+    .file-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
+      gap: 0.85rem;
+      margin-top: 1rem;
+    }
+
+    .file-picker {
+      display: grid;
+      gap: 0.4rem;
+      padding: 0.85rem;
+      border: 1px solid var(--line);
+      border-radius: 0.55rem;
+      background: var(--canvas);
+      font-weight: 650;
+    }
+
+    input[type="file"] {
+      width: 100%;
+      font: inherit;
+      font-weight: 400;
+    }
+
+    button,
+    select,
+    input[type="number"] {
+      min-height: 2.6rem;
+      border: 1px solid #8c9aa8;
+      border-radius: 0.35rem;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+    }
+
+    button {
+      padding: 0.55rem 0.9rem;
+      border-color: var(--blue);
+      color: #fff;
+      background: var(--blue);
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:hover:not(:disabled) {
+      background: var(--blue-dark);
+    }
+
+    button:disabled {
+      border-color: #9ba7b2;
+      background: #9ba7b2;
+      cursor: not-allowed;
+      opacity: 0.78;
+    }
+
+    button.secondary {
+      color: var(--blue-dark);
+      background: #fff;
+    }
+
+    button.secondary:hover:not(:disabled) {
+      background: var(--blue-soft);
+    }
+
+    button.nudge {
+      min-width: 3.2rem;
+      min-height: 2.25rem;
+      padding: 0.3rem 0.55rem;
+      color: var(--blue-dark);
+      background: #fff;
+      font-size: 0.9rem;
+    }
+
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible,
+    canvas:focus-visible,
+    audio:focus-visible {
+      outline: 0.22rem solid var(--focus);
+      outline-offset: 0.12rem;
+    }
+
+    .status {
+      min-height: 3.2rem;
+      padding: 0.8rem 0.9rem;
+      margin-top: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 0.45rem;
+      color: var(--muted);
+      background: var(--canvas);
+      white-space: pre-line;
+    }
+
+    .status[data-kind="working"] {
+      border-color: #d5a731;
+      color: var(--amber);
+      background: var(--amber-soft);
+    }
+
+    .status[data-kind="success"] {
+      border-color: #65a97e;
+      color: var(--green);
+      background: var(--green-soft);
+    }
+
+    .status[data-kind="error"] {
+      border-color: #d38a8a;
+      color: var(--red);
+      background: var(--red-soft);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .rule-box {
+      padding: 1rem;
+      margin: 1rem 0;
+      border: 2px solid var(--blue);
+      border-radius: 0.55rem;
+      background: var(--blue-soft);
+    }
+
+    .rule-code {
+      display: inline-block;
+      padding: 0.15rem 0.35rem;
+      border-radius: 0.2rem;
+      background: #fff;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.88rem;
+      overflow-wrap: anywhere;
+    }
+
+    .instruction-list {
+      padding-left: 1.35rem;
+    }
+
+    .instruction-list li + li {
+      margin-top: 0.45rem;
+    }
+
+    .session {
+      padding: 0.65rem 0.85rem;
+      border: 1px solid var(--line);
+      border-radius: 0.45rem;
+      background: var(--canvas);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .audio-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .audio-panel {
+      min-width: 0;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 0.55rem;
+      background: var(--canvas);
+    }
+
+    audio {
+      width: 100%;
+      margin: 0.3rem 0 0.7rem;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 160px;
+      border: 1px solid #788897;
+      border-radius: 0.35rem;
+      background: #fff;
+      cursor: crosshair;
+      touch-action: manipulation;
+    }
+
+    .position {
+      margin-top: 0.55rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .event-list {
+      display: grid;
+      gap: 1rem;
+      margin-top: 1.2rem;
+    }
+
+    .event-card {
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 0.65rem;
+      background: #fff;
+    }
+
+    .event-card[data-active="true"] {
+      border: 2px solid var(--blue);
+      box-shadow: 0 0 0 0.18rem rgb(18 94 165 / 12%);
+    }
+
+    .event-heading {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .event-heading h3 {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    .window-summary {
+      padding: 0.6rem 0.75rem;
+      border-radius: 0.4rem;
+      color: var(--blue-dark);
+      background: var(--blue-soft);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .marker-grid,
+    .rating-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.9rem;
+      margin-top: 0.9rem;
+    }
+
+    .field {
+      display: grid;
+      gap: 0.35rem;
+      min-width: 0;
+    }
+
+    .field > label,
+    .field > .field-label {
+      font-weight: 700;
+    }
+
+    input[type="number"],
+    select {
+      width: 100%;
+      padding: 0.45rem 0.55rem;
+    }
+
+    .marker-actions,
+    .nudge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+    }
+
+    .marker-actions {
+      margin-top: 0.45rem;
+    }
+
+    fieldset {
+      min-width: 0;
+      padding: 0;
+      margin: 0;
+      border: 0;
+    }
+
+    .issues {
+      margin-top: 1rem;
+    }
+
+    .issues legend {
+      margin-bottom: 0.45rem;
+      font-weight: 700;
+    }
+
+    .issue-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 0.5rem 0.9rem;
+    }
+
+    .check-label {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.55rem;
+      padding: 0.45rem;
+      border-radius: 0.3rem;
+    }
+
+    .check-label:hover {
+      background: var(--canvas);
+    }
+
+    input[type="checkbox"] {
+      flex: 0 0 auto;
+      width: 1.2rem;
+      height: 1.2rem;
+      margin-top: 0.12rem;
+    }
+
+    .export-panel {
+      border-top: 0.35rem solid var(--green);
+    }
+
+    .attestation {
+      padding: 0.85rem;
+      border: 1px solid #86ad95;
+      border-radius: 0.45rem;
+      background: var(--green-soft);
+    }
+
+    .export-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.8rem;
+      margin-top: 1rem;
+    }
+
+    #download-observation {
+      min-width: 15rem;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .rating-rubric {
+      padding: 0.75rem 0.9rem;
+      margin: 0.8rem 0;
+      border: 1px solid var(--line);
+      border-radius: 0.45rem;
+      background: var(--canvas);
+    }
+
+    .rating-rubric summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .rating-rubric ul {
+      margin-bottom: 0;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    @media (max-width: 620px) {
+      main {
+        width: min(100% - 1rem, 1160px);
+        margin-top: 0.5rem;
+      }
+
+      .panel {
+        border-radius: 0.45rem;
+      }
+
+      canvas {
+        height: 130px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Private bilingual semantic review</h1>
+      <p class="lede">
+        Mark the same meaning boundary in the source and translated audio.
+        This browser page is review tooling only; it is not a deployed
+        speech-to-speech dependency.
+      </p>
+    </header>
+
+    <section class="panel notice" aria-labelledby="privacy-heading">
+      <h2 id="privacy-heading">Private, offline review</h2>
+      <strong>Selected files never leave this device.</strong>
+      <p>
+        Processing, waveform drawing, validation, and observation creation all
+        happen in this page. The page collects no reviewer identity and offers
+        no free-text entry.
+      </p>
+    </section>
+
+    <section class="panel" aria-labelledby="load-heading">
+      <h2 id="load-heading">1. Load the four assigned files</h2>
+      <p>
+        Choose each file from the same coordinator-validated review bundle.
+        Review controls remain locked until the assignment schema, exact
+        ledger identity, PCM contracts, sample counts, and complete WAV hashes
+        and formats all match.
+      </p>
+
+      <div class="file-grid">
+        <label class="file-picker" for="assignment-file">
+          review-assignment.json
+          <input id="assignment-file" type="file" accept=".json,application/json">
+        </label>
+        <label class="file-picker" for="ledger-file">
+          schedule-ledger.json
+          <input id="ledger-file" type="file" accept=".json,application/json">
+        </label>
+        <label class="file-picker" for="source-file">
+          source-review.wav
+          <input id="source-file" type="file" accept=".wav,audio/wav,audio/x-wav">
+        </label>
+        <label class="file-picker" for="translated-file">
+          translated-review.wav
+          <input id="translated-file" type="file" accept=".wav,audio/wav,audio/x-wav">
+        </label>
+      </div>
+
+      <div
+        id="load-status"
+        class="status"
+        role="status"
+        aria-live="polite"
+        data-kind="idle"
+      >Choose all four files to begin local validation.</div>
+    </section>
+
+    <section id="review-area" class="hidden" aria-labelledby="review-heading">
+      <section class="panel" aria-labelledby="review-heading">
+        <h2 id="review-heading">2. Complete an independent first pass</h2>
+        <div class="rule-box">
+          <strong>Fixed landmark rule</strong>
+          <p>
+            Mark the first PCM sample at the onset of the source word that
+            completes the idea, then mark the first PCM sample at the onset of
+            the corresponding translated word.
+          </p>
+          <span id="landmark-rule" class="rule-code"></span>
+        </div>
+
+        <ol class="instruction-list">
+          <li>
+            Work independently and keep this first pass blind until its
+            observation has been downloaded.
+          </li>
+          <li>
+            Judge the meaning and audible boundary yourself. Do not substitute
+            a pause, frame edge, schedule event, or convenient timestamp.
+          </li>
+          <li>
+            The source marker must stay inside its assigned source window.
+            The translated marker must identify the corresponding landmark,
+            wherever it occurs in the translated recording.
+          </li>
+          <li>
+            Use <strong>uncertain</strong> or <strong>rejected</strong> when
+            semantic correspondence is unclear; never force acceptance.
+          </li>
+          <li>
+            If the translated speech omits the idea and no corresponding word
+            onset exists, mark the nearest audible candidate or the surrounding
+            phrase where it was expected. Choose <strong>rejected</strong>,
+            flag <strong>omission</strong> (and
+            <strong>boundary ambiguous</strong> when applicable), and set
+            translated-boundary confidence to 1. That location is diagnostic
+            only and cannot support reconciliation.
+          </li>
+        </ol>
+
+        <p><strong>Anonymous reviewer session</strong></p>
+        <div id="session-id" class="session"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="audio-heading">
+        <h2 id="audio-heading">3. Listen and position the playheads</h2>
+        <p>
+          Click or tap either waveform to seek. The displays use zero-based
+          PCM sample indices.
+        </p>
+
+        <div class="audio-grid">
+          <section class="audio-panel" aria-labelledby="source-audio-heading">
+            <h3 id="source-audio-heading">Source audio</h3>
+            <audio id="source-audio" controls preload="metadata"></audio>
+            <canvas
+              id="source-waveform"
+              width="1000"
+              height="160"
+              tabindex="0"
+              role="slider"
+              aria-label="Source waveform seek control"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            ></canvas>
+            <div id="source-position" class="position">0.000 s · sample 0</div>
+          </section>
+
+          <section class="audio-panel" aria-labelledby="translated-audio-heading">
+            <h3 id="translated-audio-heading">Translated audio</h3>
+            <audio id="translated-audio" controls preload="metadata"></audio>
+            <canvas
+              id="translated-waveform"
+              width="1000"
+              height="160"
+              tabindex="0"
+              role="slider"
+              aria-label="Translated waveform seek control"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            ></canvas>
+            <div id="translated-position" class="position">0.000 s · sample 0</div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="events-heading">
+        <h2 id="events-heading">4. Review every assigned event</h2>
+        <p>
+          Select an event to highlight its source window. Set each marker from
+          the matching playhead, or enter an exact sample and use the nudge
+          buttons.
+        </p>
+        <p>
+          For every boundary-confidence and listening-quality scale,
+          <strong>1 is lowest and 5 is highest</strong>.
+        </p>
+        <details class="rating-rubric" open>
+          <summary>Shared 1/3/5 rating anchors</summary>
+          <ul>
+            <li>
+              <strong>Boundary confidence:</strong> 1 = guess; 3 = identifiable
+              with some onset ambiguity; 5 = precise, repeatable onset.
+            </li>
+            <li>
+              <strong>Translation quality:</strong> 1 = meaning is wrong or
+              substantially missing; 3 = core meaning is understandable with
+              notable flaws; 5 = meaning is fully preserved.
+            </li>
+            <li>
+              <strong>Intelligibility:</strong> 1 = difficult to understand;
+              3 = generally understandable with effort; 5 = immediately clear.
+            </li>
+            <li>
+              <strong>Naturalness:</strong> 1 = strongly unnatural; 3 =
+              noticeably synthetic or uneven; 5 = natural and appropriate.
+            </li>
+          </ul>
+          <p class="small">Use 2 or 4 when the judgment falls between anchors.</p>
+        </details>
+        <div id="event-list" class="event-list"></div>
+      </section>
+
+      <section class="panel export-panel" aria-labelledby="export-heading">
+        <h2 id="export-heading">5. Attest and download</h2>
+        <label class="check-label attestation" for="independence-check">
+          <input id="independence-check" type="checkbox">
+          <span>
+            I completed this first pass independently and did not view,
+            discuss, copy, average, or reconcile another reviewer’s marker
+            choices.
+          </span>
+        </label>
+
+        <div class="export-actions">
+          <button id="download-observation" type="button" disabled>
+            Revalidate and download observation
+          </button>
+          <span class="small">
+            The downloaded JSON is anonymous and contains no free text.
+          </span>
+        </div>
+
+        <div
+          id="export-status"
+          class="status"
+          role="status"
+          aria-live="polite"
+          data-kind="idle"
+        >Complete every event and the independence attestation.</div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+  "use strict";
+
+  (() => {
+    const ASSIGNMENT_KEYS = [
+      "schema_version",
+      "assignment_type",
+      "schedule_ledger_sha256",
+      "source_pcm_sha256",
+      "source_pcm_sample_count",
+      "source_sample_rate_hz",
+      "translated_pcm_sha256",
+      "translated_pcm_sample_count",
+      "translated_sample_rate_hz",
+      "minimum_independent_reviewers",
+      "minimum_boundary_confidence",
+      "landmark_rule",
+      "events",
+      "privacy"
+    ];
+    const ASSIGNMENT_EVENT_KEYS = [
+      "event_id",
+      "source_window_start_sample",
+      "source_window_end_sample_exclusive"
+    ];
+    const ASSIGNMENT_PRIVACY_KEYS = [
+      "contains_audio",
+      "contains_transcript_or_translation_text",
+      "contains_reviewer_identity",
+      "contains_file_path_or_uri",
+      "contains_wall_clock_timestamp",
+      "private_review_artifact"
+    ];
+    const LEDGER_KEYS = [
+      "schema_version",
+      "report_type",
+      "capture",
+      "source_pcm",
+      "translated_pcm",
+      "policy",
+      "source_chunks",
+      "frames",
+      "parents",
+      "privacy"
+    ];
+    const LEDGER_PCM_KEYS = [
+      "sample_rate_hz",
+      "channels",
+      "bytes_per_sample",
+      "sample_count",
+      "audio_bytes",
+      "pcm_sha256",
+      "review_wav_sha256"
+    ];
+    const OBSERVATION_KEYS = [
+      "schema_version",
+      "observation_type",
+      "assignment_sha256",
+      "schedule_ledger_sha256",
+      "source_pcm_sha256",
+      "source_pcm_sample_count",
+      "translated_pcm_sha256",
+      "translated_pcm_sample_count",
+      "reviewer_session_id",
+      "independence_attestation",
+      "events",
+      "privacy"
+    ];
+    const OBSERVATION_EVENT_KEYS = [
+      "event_id",
+      "source_sample_index",
+      "translated_sample_index",
+      "semantic_equivalence",
+      "source_boundary_confidence",
+      "translated_boundary_confidence",
+      "translation_quality_rating",
+      "intelligibility_rating",
+      "naturalness_rating",
+      "issue_flags"
+    ];
+    const OBSERVATION_PRIVACY_KEYS = [
+      "contains_audio",
+      "contains_transcript_or_translation_text",
+      "contains_reviewer_identity",
+      "contains_file_path_or_uri",
+      "contains_wall_clock_timestamp",
+      "private_review_artifact",
+      "contains_free_text"
+    ];
+    const ISSUE_FLAGS = [
+      "meaning_mismatch",
+      "omission",
+      "addition",
+      "pronunciation",
+      "unnatural_prosody",
+      "too_fast",
+      "too_slow",
+      "boundary_ambiguous"
+    ];
+    const ISSUE_LABELS = {
+      meaning_mismatch: "Meaning mismatch",
+      omission: "Omission",
+      addition: "Addition",
+      pronunciation: "Pronunciation",
+      unnatural_prosody: "Unnatural prosody",
+      too_fast: "Too fast",
+      too_slow: "Too slow",
+      boundary_ambiguous: "Boundary ambiguous"
+    };
+    const LANDMARK_RULE =
+      "source_idea_completion_word_onset_to_corresponding_translated_word_onset_v1";
+    const UUID_V4 =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const LOWER_SHA256 = /^[0-9a-f]{64}$/;
+    const EVENT_ID = /^event-[0-9]{3}$/;
+    const MAX_JSON_BYTES = 64 * 1024 * 1024;
+    const MAX_WAV_BYTES = 1024 * 1024 * 1024;
+
+    const assignmentInput = document.getElementById("assignment-file");
+    const ledgerInput = document.getElementById("ledger-file");
+    const sourceInput = document.getElementById("source-file");
+    const translatedInput = document.getElementById("translated-file");
+    const loadStatus = document.getElementById("load-status");
+    const reviewArea = document.getElementById("review-area");
+    const landmarkRule = document.getElementById("landmark-rule");
+    const sessionOutput = document.getElementById("session-id");
+    const sourceAudio = document.getElementById("source-audio");
+    const translatedAudio = document.getElementById("translated-audio");
+    const sourceCanvas = document.getElementById("source-waveform");
+    const translatedCanvas = document.getElementById("translated-waveform");
+    const sourcePosition = document.getElementById("source-position");
+    const translatedPosition = document.getElementById("translated-position");
+    const eventList = document.getElementById("event-list");
+    const independenceCheck = document.getElementById("independence-check");
+    const downloadButton = document.getElementById("download-observation");
+    const exportStatus = document.getElementById("export-status");
+
+    const reviewerSessionId = createReviewerSessionId();
+    sessionOutput.textContent = reviewerSessionId;
+
+    let validationGeneration = 0;
+    let validatedBundle = null;
+    let activeEventIndex = 0;
+    let sourceObjectUrl = null;
+    let translatedObjectUrl = null;
+    let sourceBaseCanvas = null;
+    let translatedBaseCanvas = null;
+
+    const fileInputs = [
+      assignmentInput,
+      ledgerInput,
+      sourceInput,
+      translatedInput
+    ];
+    for (const input of fileInputs) {
+      input.addEventListener("change", handleFileSelection);
+    }
+
+    sourceAudio.addEventListener("timeupdate", () => updatePlayhead("source"));
+    sourceAudio.addEventListener("seeked", () => updatePlayhead("source"));
+    translatedAudio.addEventListener(
+      "timeupdate",
+      () => updatePlayhead("translated")
+    );
+    translatedAudio.addEventListener(
+      "seeked",
+      () => updatePlayhead("translated")
+    );
+    sourceCanvas.addEventListener(
+      "pointerdown",
+      (event) => seekFromPointer("source", event)
+    );
+    translatedCanvas.addEventListener(
+      "pointerdown",
+      (event) => seekFromPointer("translated", event)
+    );
+    sourceCanvas.addEventListener(
+      "keydown",
+      (event) => seekFromKeyboard("source", event)
+    );
+    translatedCanvas.addEventListener(
+      "keydown",
+      (event) => seekFromKeyboard("translated", event)
+    );
+    independenceCheck.addEventListener("change", updateExportReadiness);
+    downloadButton.addEventListener("click", downloadObservation);
+
+    function setStatus(element, kind, message) {
+      element.dataset.kind = kind;
+      element.textContent = message;
+    }
+
+    function isPlainObject(value) {
+      return (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.getPrototypeOf(value) === Object.prototype
+      );
+    }
+
+    function requireExactKeys(value, expected, context) {
+      if (!isPlainObject(value)) {
+        throw new Error(`${context} must be an object.`);
+      }
+      const actual = Object.keys(value).sort();
+      const wanted = [...expected].sort();
+      if (
+        actual.length !== wanted.length ||
+        actual.some((key, index) => key !== wanted[index])
+      ) {
+        throw new Error(`${context} does not use the exact required schema.`);
+      }
+    }
+
+    function requirePlainInteger(value, minimum, context) {
+      if (!Number.isSafeInteger(value) || value < minimum) {
+        throw new Error(`${context} must be an integer of at least ${minimum}.`);
+      }
+      return value;
+    }
+
+    function requireLiteral(actual, expected, context) {
+      if (actual !== expected) {
+        throw new Error(`${context} must equal ${JSON.stringify(expected)}.`);
+      }
+    }
+
+    function requireSha256(value, context) {
+      if (typeof value !== "string" || !LOWER_SHA256.test(value)) {
+        throw new Error(`${context} must be a lowercase SHA-256 value.`);
+      }
+    }
+
+    function createReviewerSessionId() {
+      if (!globalThis.crypto || !globalThis.crypto.getRandomValues) {
+        throw new Error("Secure random generation is unavailable.");
+      }
+      const bytes = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (byte) =>
+        byte.toString(16).padStart(2, "0")
+      ).join("");
+      const value = [
+        hex.slice(0, 8),
+        hex.slice(8, 12),
+        hex.slice(12, 16),
+        hex.slice(16, 20),
+        hex.slice(20)
+      ].join("-");
+      if (!UUID_V4.test(value)) {
+        throw new Error("Secure anonymous session creation failed.");
+      }
+      return value;
+    }
+
+    async function sha256Hex(bytes) {
+      if (!globalThis.crypto || !globalThis.crypto.subtle) {
+        throw new Error(
+          "Web Crypto SHA-256 is unavailable in this browser context."
+        );
+      }
+      const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(digest), (byte) =>
+        byte.toString(16).padStart(2, "0")
+      ).join("");
+    }
+
+    async function readBounded(file, maximum, context) {
+      if (!file) {
+        throw new Error(`${context} was not selected.`);
+      }
+      if (file.size < 1 || file.size > maximum) {
+        throw new Error(
+          `${context} must be between 1 and ${maximum} bytes.`
+        );
+      }
+      return file.arrayBuffer();
+    }
+
+    function rejectDuplicateJsonKeys(text, context) {
+      let index = 0;
+
+      function fail(message) {
+        throw new Error(`${context} ${message}`);
+      }
+
+      function skipWhitespace() {
+        while (index < text.length && /\s/.test(text[index])) {
+          index += 1;
+        }
+      }
+
+      function parseString() {
+        if (text[index] !== '"') {
+          fail("contains an invalid object key.");
+        }
+        const start = index;
+        index += 1;
+        while (index < text.length) {
+          if (text[index] === '"') {
+            index += 1;
+            try {
+              return JSON.parse(text.slice(start, index));
+            } catch (_error) {
+              fail("contains an invalid JSON string.");
+            }
+          }
+          if (text[index] === "\\") {
+            index += 1;
+            if (index >= text.length) {
+              fail("contains an unterminated JSON escape.");
+            }
+            if (text[index] === "u") {
+              index += 4;
+            }
+          }
+          index += 1;
+        }
+        fail("contains an unterminated JSON string.");
+      }
+
+      function parseValue() {
+        skipWhitespace();
+        if (index >= text.length) {
+          fail("contains an incomplete JSON value.");
+        }
+        if (text[index] === "{") {
+          parseObject();
+          return;
+        }
+        if (text[index] === "[") {
+          parseArray();
+          return;
+        }
+        if (text[index] === '"') {
+          parseString();
+          return;
+        }
+        const start = index;
+        while (
+          index < text.length &&
+          !/[\s,\]}]/.test(text[index])
+        ) {
+          index += 1;
+        }
+        if (index === start) {
+          fail("contains an invalid JSON value.");
+        }
+      }
+
+      function parseObject() {
+        index += 1;
+        skipWhitespace();
+        if (text[index] === "}") {
+          index += 1;
+          return;
+        }
+        const keys = new Set();
+        while (index < text.length) {
+          skipWhitespace();
+          const key = parseString();
+          if (keys.has(key)) {
+            fail("contains a duplicate object key.");
+          }
+          keys.add(key);
+          skipWhitespace();
+          if (text[index] !== ":") {
+            fail("contains an object key without a value.");
+          }
+          index += 1;
+          parseValue();
+          skipWhitespace();
+          if (text[index] === "}") {
+            index += 1;
+            return;
+          }
+          if (text[index] !== ",") {
+            fail("contains an invalid object separator.");
+          }
+          index += 1;
+        }
+        fail("contains an unterminated object.");
+      }
+
+      function parseArray() {
+        index += 1;
+        skipWhitespace();
+        if (text[index] === "]") {
+          index += 1;
+          return;
+        }
+        while (index < text.length) {
+          parseValue();
+          skipWhitespace();
+          if (text[index] === "]") {
+            index += 1;
+            return;
+          }
+          if (text[index] !== ",") {
+            fail("contains an invalid array separator.");
+          }
+          index += 1;
+        }
+        fail("contains an unterminated array.");
+      }
+
+      parseValue();
+      skipWhitespace();
+      if (index !== text.length) {
+        fail("contains trailing data.");
+      }
+    }
+
+    function decodeJson(bytes, context) {
+      let decoded;
+      try {
+        decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch (_error) {
+        throw new Error(`${context} must be valid UTF-8.`);
+      }
+      try {
+        rejectDuplicateJsonKeys(decoded, context);
+        return JSON.parse(decoded);
+      } catch (_error) {
+        if (
+          _error instanceof Error &&
+          _error.message.startsWith(`${context} `)
+        ) {
+          throw _error;
+        }
+        throw new Error(`${context} must contain one valid JSON value.`);
+      }
+    }
+
+    function validateAssignment(value) {
+      requireExactKeys(value, ASSIGNMENT_KEYS, "Review assignment");
+      requireLiteral(value.schema_version, 1, "Assignment schema_version");
+      requireLiteral(
+        value.assignment_type,
+        "private_semantic_review_assignment",
+        "Assignment assignment_type"
+      );
+      requireSha256(
+        value.schedule_ledger_sha256,
+        "Assignment schedule_ledger_sha256"
+      );
+      requireSha256(value.source_pcm_sha256, "Assignment source_pcm_sha256");
+      requireSha256(
+        value.translated_pcm_sha256,
+        "Assignment translated_pcm_sha256"
+      );
+      requirePlainInteger(
+        value.source_pcm_sample_count,
+        1,
+        "Assignment source_pcm_sample_count"
+      );
+      requirePlainInteger(
+        value.translated_pcm_sample_count,
+        1,
+        "Assignment translated_pcm_sample_count"
+      );
+      requirePlainInteger(
+        value.source_sample_rate_hz,
+        1,
+        "Assignment source_sample_rate_hz"
+      );
+      requirePlainInteger(
+        value.translated_sample_rate_hz,
+        1,
+        "Assignment translated_sample_rate_hz"
+      );
+      requireLiteral(
+        value.minimum_independent_reviewers,
+        2,
+        "Assignment minimum_independent_reviewers"
+      );
+      requireLiteral(
+        value.minimum_boundary_confidence,
+        3,
+        "Assignment minimum_boundary_confidence"
+      );
+      requireLiteral(
+        value.landmark_rule,
+        LANDMARK_RULE,
+        "Assignment landmark_rule"
+      );
+      validateAssignmentPrivacy(value.privacy);
+
+      if (!Array.isArray(value.events) || value.events.length < 3) {
+        throw new Error("Assignment events must contain at least three events.");
+      }
+      const eventIds = new Set();
+      let previousEventId = null;
+      let previousWindowEnd = -1;
+      for (const [index, event] of value.events.entries()) {
+        const context = `Assignment events[${index}]`;
+        requireExactKeys(event, ASSIGNMENT_EVENT_KEYS, context);
+        if (typeof event.event_id !== "string" || !EVENT_ID.test(event.event_id)) {
+          throw new Error(`${context}.event_id must use event-NNN form.`);
+        }
+        if (eventIds.has(event.event_id)) {
+          throw new Error("Assignment event IDs must be unique.");
+        }
+        if (previousEventId !== null && event.event_id <= previousEventId) {
+          throw new Error(
+            "Assignment events must be in strictly increasing event-ID order."
+          );
+        }
+        eventIds.add(event.event_id);
+        const start = requirePlainInteger(
+          event.source_window_start_sample,
+          0,
+          `${context}.source_window_start_sample`
+        );
+        const end = requirePlainInteger(
+          event.source_window_end_sample_exclusive,
+          1,
+          `${context}.source_window_end_sample_exclusive`
+        );
+        if (end <= start || end > value.source_pcm_sample_count) {
+          throw new Error(
+            `${context} must define a non-empty in-bounds source window.`
+          );
+        }
+        if (start < previousWindowEnd) {
+          throw new Error(
+            "Assignment source windows must be ordered and non-overlapping."
+          );
+        }
+        previousEventId = event.event_id;
+        previousWindowEnd = end;
+      }
+    }
+
+    function validateAssignmentPrivacy(value) {
+      requireExactKeys(value, ASSIGNMENT_PRIVACY_KEYS, "Assignment privacy");
+      requireLiteral(value.contains_audio, false, "privacy.contains_audio");
+      requireLiteral(
+        value.contains_transcript_or_translation_text,
+        false,
+        "privacy.contains_transcript_or_translation_text"
+      );
+      requireLiteral(
+        value.contains_reviewer_identity,
+        false,
+        "privacy.contains_reviewer_identity"
+      );
+      requireLiteral(
+        value.contains_file_path_or_uri,
+        false,
+        "privacy.contains_file_path_or_uri"
+      );
+      requireLiteral(
+        value.contains_wall_clock_timestamp,
+        false,
+        "privacy.contains_wall_clock_timestamp"
+      );
+      requireLiteral(
+        value.private_review_artifact,
+        true,
+        "privacy.private_review_artifact"
+      );
+    }
+
+    function validateLedger(value) {
+      requireExactKeys(value, LEDGER_KEYS, "Schedule ledger");
+      requireLiteral(value.schema_version, 1, "Ledger schema_version");
+      requireLiteral(
+        value.report_type,
+        "private_pcm_schedule_ledger",
+        "Ledger report_type"
+      );
+      validateLedgerPcm(value.source_pcm, "Ledger source_pcm");
+      validateLedgerPcm(value.translated_pcm, "Ledger translated_pcm");
+    }
+
+    function validateLedgerPcm(value, context) {
+      requireExactKeys(value, LEDGER_PCM_KEYS, context);
+      requirePlainInteger(value.sample_rate_hz, 1, `${context}.sample_rate_hz`);
+      requireLiteral(value.channels, 1, `${context}.channels`);
+      requireLiteral(value.bytes_per_sample, 2, `${context}.bytes_per_sample`);
+      const sampleCount = requirePlainInteger(
+        value.sample_count,
+        1,
+        `${context}.sample_count`
+      );
+      const audioBytes = requirePlainInteger(
+        value.audio_bytes,
+        2,
+        `${context}.audio_bytes`
+      );
+      if (audioBytes !== sampleCount * 2) {
+        throw new Error(`${context} audio byte and sample counts disagree.`);
+      }
+      requireSha256(value.pcm_sha256, `${context}.pcm_sha256`);
+      requireSha256(value.review_wav_sha256, `${context}.review_wav_sha256`);
+    }
+
+    function bindAssignmentToLedger(assignment, ledger, ledgerHash) {
+      const comparisons = [
+        [
+          assignment.schedule_ledger_sha256,
+          ledgerHash,
+          "assignment ledger hash"
+        ],
+        [
+          assignment.source_pcm_sha256,
+          ledger.source_pcm.pcm_sha256,
+          "source PCM hash"
+        ],
+        [
+          assignment.source_pcm_sample_count,
+          ledger.source_pcm.sample_count,
+          "source sample count"
+        ],
+        [
+          assignment.source_sample_rate_hz,
+          ledger.source_pcm.sample_rate_hz,
+          "source sample rate"
+        ],
+        [
+          assignment.translated_pcm_sha256,
+          ledger.translated_pcm.pcm_sha256,
+          "translated PCM hash"
+        ],
+        [
+          assignment.translated_pcm_sample_count,
+          ledger.translated_pcm.sample_count,
+          "translated sample count"
+        ],
+        [
+          assignment.translated_sample_rate_hz,
+          ledger.translated_pcm.sample_rate_hz,
+          "translated sample rate"
+        ]
+      ];
+      for (const [left, right, context] of comparisons) {
+        if (left !== right) {
+          throw new Error(`The ${context} does not match across inputs.`);
+        }
+      }
+    }
+
+    function ascii(view, offset, length) {
+      let result = "";
+      for (let index = 0; index < length; index += 1) {
+        result += String.fromCharCode(view.getUint8(offset + index));
+      }
+      return result;
+    }
+
+    function parsePcm16MonoWav(buffer, context) {
+      if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 44) {
+        throw new Error(`${context} is too short to be a PCM WAV.`);
+      }
+      const view = new DataView(buffer);
+      if (
+        ascii(view, 0, 4) !== "RIFF" ||
+        ascii(view, 8, 4) !== "WAVE"
+      ) {
+        throw new Error(`${context} must be a RIFF/WAVE file.`);
+      }
+      const riffBytes = view.getUint32(4, true) + 8;
+      if (riffBytes !== buffer.byteLength) {
+        throw new Error(`${context} RIFF length does not match its bytes.`);
+      }
+
+      let offset = 12;
+      let format = null;
+      let data = null;
+      while (offset < buffer.byteLength) {
+        if (offset + 8 > buffer.byteLength) {
+          throw new Error(`${context} has a truncated RIFF chunk header.`);
+        }
+        const chunkId = ascii(view, offset, 4);
+        const chunkSize = view.getUint32(offset + 4, true);
+        const payloadOffset = offset + 8;
+        const payloadEnd = payloadOffset + chunkSize;
+        if (payloadEnd > buffer.byteLength) {
+          throw new Error(`${context} has a RIFF chunk outside the file.`);
+        }
+        if (chunkId === "fmt ") {
+          if (format !== null || chunkSize < 16) {
+            throw new Error(`${context} must have one valid fmt chunk.`);
+          }
+          format = {
+            audioFormat: view.getUint16(payloadOffset, true),
+            channels: view.getUint16(payloadOffset + 2, true),
+            sampleRateHz: view.getUint32(payloadOffset + 4, true),
+            byteRate: view.getUint32(payloadOffset + 8, true),
+            blockAlign: view.getUint16(payloadOffset + 12, true),
+            bitsPerSample: view.getUint16(payloadOffset + 14, true)
+          };
+        } else if (chunkId === "data") {
+          if (data !== null || chunkSize === 0 || chunkSize % 2 !== 0) {
+            throw new Error(`${context} must have one non-empty PCM data chunk.`);
+          }
+          data = { offset: payloadOffset, byteLength: chunkSize };
+        }
+        offset = payloadEnd + (chunkSize % 2);
+      }
+      if (offset !== buffer.byteLength || format === null || data === null) {
+        throw new Error(`${context} has an incomplete RIFF structure.`);
+      }
+      if (
+        format.audioFormat !== 1 ||
+        format.channels !== 1 ||
+        format.bitsPerSample !== 16 ||
+        format.blockAlign !== 2 ||
+        format.sampleRateHz < 1 ||
+        format.byteRate !== format.sampleRateHz * 2
+      ) {
+        throw new Error(
+          `${context} must be mono, uncompressed, little-endian PCM16.`
+        );
+      }
+      return {
+        buffer,
+        dataOffset: data.offset,
+        dataByteLength: data.byteLength,
+        sampleCount: data.byteLength / 2,
+        sampleRateHz: format.sampleRateHz,
+        samples: new Int16Array(
+          buffer,
+          data.offset,
+          data.byteLength / 2
+        )
+      };
+    }
+
+    async function validateWav(buffer, contract, context) {
+      const parsed = parsePcm16MonoWav(buffer, context);
+      const [wavHash, pcmHash] = await Promise.all([
+        sha256Hex(buffer),
+        sha256Hex(
+          buffer.slice(
+            parsed.dataOffset,
+            parsed.dataOffset + parsed.dataByteLength
+          )
+        )
+      ]);
+      if (wavHash !== contract.review_wav_sha256) {
+        throw new Error(`${context} full-file SHA-256 does not match the ledger.`);
+      }
+      if (pcmHash !== contract.pcm_sha256) {
+        throw new Error(`${context} PCM SHA-256 does not match the ledger.`);
+      }
+      if (
+        parsed.sampleCount !== contract.sample_count ||
+        parsed.sampleRateHz !== contract.sample_rate_hz
+      ) {
+        throw new Error(`${context} PCM count or sample rate does not match.`);
+      }
+      return parsed;
+    }
+
+    async function loadAndValidate(
+      selected,
+      generation,
+      showLoadProgress = true
+    ) {
+      if (showLoadProgress) {
+        setStatus(
+          loadStatus,
+          "working",
+          "Reading and hashing the assignment and ledger locally…"
+        );
+      }
+      const [assignmentBytes, ledgerBytes] = await Promise.all([
+        readBounded(
+          selected.assignment,
+          MAX_JSON_BYTES,
+          "review-assignment.json"
+        ),
+        readBounded(
+          selected.ledger,
+          MAX_JSON_BYTES,
+          "schedule-ledger.json"
+        )
+      ]);
+      if (generation !== validationGeneration) {
+        throw new Error("File selection changed during validation.");
+      }
+      const assignment = decodeJson(
+        assignmentBytes,
+        "review-assignment.json"
+      );
+      const ledger = decodeJson(ledgerBytes, "schedule-ledger.json");
+      validateAssignment(assignment);
+      validateLedger(ledger);
+      const [assignmentHash, ledgerHash] = await Promise.all([
+        sha256Hex(assignmentBytes),
+        sha256Hex(ledgerBytes)
+      ]);
+      bindAssignmentToLedger(assignment, ledger, ledgerHash);
+
+      if (showLoadProgress) {
+        setStatus(
+          loadStatus,
+          "working",
+          "Ledger binding passed. Parsing and hashing both complete WAV and PCM payloads locally…"
+        );
+      }
+      const [sourceBytes, translatedBytes] = await Promise.all([
+        readBounded(selected.source, MAX_WAV_BYTES, "source-review.wav"),
+        readBounded(
+          selected.translated,
+          MAX_WAV_BYTES,
+          "translated-review.wav"
+        )
+      ]);
+      if (generation !== validationGeneration) {
+        throw new Error("File selection changed during validation.");
+      }
+      const [sourceWav, translatedWav] = await Promise.all([
+        validateWav(sourceBytes, ledger.source_pcm, "source-review.wav"),
+        validateWav(
+          translatedBytes,
+          ledger.translated_pcm,
+          "translated-review.wav"
+        )
+      ]);
+      bindAssignmentToLedger(assignment, ledger, ledgerHash);
+      return {
+        assignment,
+        assignmentHash,
+        ledger,
+        ledgerHash,
+        sourceWav,
+        translatedWav,
+        selected
+      };
+    }
+
+    function selectedFiles() {
+      return {
+        assignment: assignmentInput.files[0] || null,
+        ledger: ledgerInput.files[0] || null,
+        source: sourceInput.files[0] || null,
+        translated: translatedInput.files[0] || null
+      };
+    }
+
+    function allFilesSelected(selected) {
+      return Object.values(selected).every((value) => value !== null);
+    }
+
+    function lockReview() {
+      validatedBundle = null;
+      reviewArea.classList.add("hidden");
+      downloadButton.disabled = true;
+      independenceCheck.checked = false;
+      eventList.replaceChildren();
+      clearAudio();
+    }
+
+    async function handleFileSelection() {
+      validationGeneration += 1;
+      const generation = validationGeneration;
+      lockReview();
+      const selected = selectedFiles();
+      if (!allFilesSelected(selected)) {
+        setStatus(
+          loadStatus,
+          "idle",
+          "Choose all four files to begin local validation."
+        );
+        return;
+      }
+      try {
+        const bundle = await loadAndValidate(selected, generation);
+        if (generation !== validationGeneration) {
+          return;
+        }
+        validatedBundle = bundle;
+        initializeReview(bundle);
+        setStatus(
+          loadStatus,
+          "success",
+          "All four files passed local binding and PCM validation. Review controls are unlocked."
+        );
+      } catch (error) {
+        if (generation !== validationGeneration) {
+          return;
+        }
+        lockReview();
+        setStatus(
+          loadStatus,
+          "error",
+          `Validation failed: ${safeErrorMessage(error)}`
+        );
+      }
+    }
+
+    function safeErrorMessage(error) {
+      return error instanceof Error ? error.message : "Unknown local error.";
+    }
+
+    function clearAudio() {
+      sourceAudio.pause();
+      translatedAudio.pause();
+      sourceAudio.removeAttribute("src");
+      translatedAudio.removeAttribute("src");
+      sourceAudio.load();
+      translatedAudio.load();
+      if (sourceObjectUrl !== null) {
+        URL.revokeObjectURL(sourceObjectUrl);
+        sourceObjectUrl = null;
+      }
+      if (translatedObjectUrl !== null) {
+        URL.revokeObjectURL(translatedObjectUrl);
+        translatedObjectUrl = null;
+      }
+      sourceBaseCanvas = null;
+      translatedBaseCanvas = null;
+    }
+
+    function initializeReview(bundle) {
+      landmarkRule.textContent = bundle.assignment.landmark_rule;
+      activeEventIndex = 0;
+      buildEventCards(bundle.assignment);
+
+      sourceObjectUrl = URL.createObjectURL(bundle.selected.source);
+      translatedObjectUrl = URL.createObjectURL(bundle.selected.translated);
+      sourceAudio.src = sourceObjectUrl;
+      translatedAudio.src = translatedObjectUrl;
+
+      sourceBaseCanvas = document.createElement("canvas");
+      sourceBaseCanvas.width = sourceCanvas.width;
+      sourceBaseCanvas.height = sourceCanvas.height;
+      translatedBaseCanvas = document.createElement("canvas");
+      translatedBaseCanvas.width = translatedCanvas.width;
+      translatedBaseCanvas.height = translatedCanvas.height;
+      renderStaticWaveforms();
+      updatePlayhead("source");
+      updatePlayhead("translated");
+      setStatus(
+        exportStatus,
+        "idle",
+        "Complete every event and the independence attestation."
+      );
+      reviewArea.classList.remove("hidden");
+    }
+
+    function createRatingOptions(label) {
+      const fragment = document.createDocumentFragment();
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = `Choose ${label}`;
+      fragment.append(empty);
+      for (let value = 1; value <= 5; value += 1) {
+        fragment.append(createOption(String(value), String(value)));
+      }
+      return fragment;
+    }
+
+    function createOption(value, text) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      return option;
+    }
+
+    function enforceOmissionFormContract(card) {
+      const omission = card.querySelector(
+        '[data-issue-flag="omission"]'
+      );
+      if (!omission || !omission.checked) {
+        return;
+      }
+      const equivalence = card.querySelector(
+        '[data-field="semantic_equivalence"]'
+      );
+      const translatedConfidence = card.querySelector(
+        '[data-field="translated_boundary_confidence"]'
+      );
+      equivalence.value = "rejected";
+      translatedConfidence.value = "1";
+    }
+
+    function handleEventFormChange(event) {
+      const card = event.currentTarget.closest(".event-card");
+      if (card) {
+        enforceOmissionFormContract(card);
+      }
+      updateExportReadiness();
+    }
+
+    function addSelect(container, eventIndex, key, label, options) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "field";
+      const id = `event-${eventIndex}-${key}`;
+      const labelElement = document.createElement("label");
+      labelElement.htmlFor = id;
+      labelElement.textContent = label;
+      const select = document.createElement("select");
+      select.id = id;
+      select.dataset.field = key;
+      select.dataset.eventIndex = String(eventIndex);
+      select.required = true;
+      if (options) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "Choose one";
+        select.append(empty);
+        for (const [value, text] of options) {
+          select.append(createOption(value, text));
+        }
+      } else {
+        select.append(createRatingOptions("1–5"));
+      }
+      select.addEventListener("change", handleEventFormChange);
+      wrapper.append(labelElement, select);
+      container.append(wrapper);
+    }
+
+    function buildEventCards(assignment) {
+      eventList.replaceChildren();
+      for (const [eventIndex, event] of assignment.events.entries()) {
+        const card = document.createElement("article");
+        card.className = "event-card";
+        card.dataset.eventIndex = String(eventIndex);
+        card.dataset.active = String(eventIndex === activeEventIndex);
+
+        const heading = document.createElement("div");
+        heading.className = "event-heading";
+        const title = document.createElement("h3");
+        title.textContent = event.event_id;
+        const focus = document.createElement("button");
+        focus.type = "button";
+        focus.className = "secondary";
+        focus.textContent =
+          eventIndex === activeEventIndex ? "Selected event" : "Select event";
+        focus.dataset.action = "select-event";
+        focus.dataset.eventIndex = String(eventIndex);
+        focus.addEventListener("click", () => selectEvent(eventIndex));
+        heading.append(title, focus);
+
+        const windowSummary = document.createElement("div");
+        windowSummary.className = "window-summary";
+        windowSummary.textContent =
+          `Assigned source window: samples ` +
+          `${event.source_window_start_sample.toLocaleString("en-US")}–` +
+          `${(event.source_window_end_sample_exclusive - 1).toLocaleString("en-US")} ` +
+          `(end-exclusive ${event.source_window_end_sample_exclusive.toLocaleString("en-US")})`;
+
+        const markerGrid = document.createElement("div");
+        markerGrid.className = "marker-grid";
+        markerGrid.append(
+          buildMarkerField("source", eventIndex, event, assignment),
+          buildMarkerField("translated", eventIndex, event, assignment)
+        );
+
+        const ratingGrid = document.createElement("div");
+        ratingGrid.className = "rating-grid";
+        addSelect(
+          ratingGrid,
+          eventIndex,
+          "semantic_equivalence",
+          "Semantic equivalence",
+          [
+            ["accepted", "Accepted"],
+            ["uncertain", "Uncertain"],
+            ["rejected", "Rejected"]
+          ]
+        );
+        addSelect(
+          ratingGrid,
+          eventIndex,
+          "source_boundary_confidence",
+          "Source boundary confidence (1–5)"
+        );
+        addSelect(
+          ratingGrid,
+          eventIndex,
+          "translated_boundary_confidence",
+          "Translated boundary confidence (1–5)"
+        );
+        addSelect(
+          ratingGrid,
+          eventIndex,
+          "translation_quality_rating",
+          "Translation quality (1–5)"
+        );
+        addSelect(
+          ratingGrid,
+          eventIndex,
+          "intelligibility_rating",
+          "Intelligibility (1–5)"
+        );
+        addSelect(
+          ratingGrid,
+          eventIndex,
+          "naturalness_rating",
+          "Naturalness (1–5)"
+        );
+
+        const issues = document.createElement("fieldset");
+        issues.className = "issues";
+        const legend = document.createElement("legend");
+        legend.textContent = "Optional issue flags";
+        const issueGrid = document.createElement("div");
+        issueGrid.className = "issue-grid";
+        for (const flag of ISSUE_FLAGS) {
+          const label = document.createElement("label");
+          label.className = "check-label";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.dataset.issueFlag = flag;
+          checkbox.dataset.eventIndex = String(eventIndex);
+          checkbox.addEventListener("change", handleEventFormChange);
+          const text = document.createElement("span");
+          text.textContent = ISSUE_LABELS[flag];
+          label.append(checkbox, text);
+          issueGrid.append(label);
+        }
+        issues.append(legend, issueGrid);
+
+        card.append(
+          heading,
+          windowSummary,
+          markerGrid,
+          ratingGrid,
+          issues
+        );
+        eventList.append(card);
+      }
+    }
+
+    function buildMarkerField(kind, eventIndex, event, assignment) {
+      const isSource = kind === "source";
+      const wrapper = document.createElement("section");
+      wrapper.className = "field";
+      const label = document.createElement("label");
+      const id = `event-${eventIndex}-${kind}-sample`;
+      label.htmlFor = id;
+      label.textContent = isSource
+        ? "Source marker sample"
+        : "Translated marker sample";
+      const input = document.createElement("input");
+      input.id = id;
+      input.type = "number";
+      input.step = "1";
+      input.inputMode = "numeric";
+      input.dataset.field = `${kind}_sample_index`;
+      input.dataset.eventIndex = String(eventIndex);
+      input.min = String(
+        isSource ? event.source_window_start_sample : 0
+      );
+      input.max = String(
+        isSource
+          ? event.source_window_end_sample_exclusive - 1
+          : assignment.translated_pcm_sample_count - 1
+      );
+      input.required = true;
+      input.addEventListener("input", updateExportReadiness);
+
+      const markerActions = document.createElement("div");
+      markerActions.className = "marker-actions";
+      const setButton = document.createElement("button");
+      setButton.type = "button";
+      setButton.textContent = isSource
+        ? "Set from source playhead"
+        : "Set from translated playhead";
+      setButton.dataset.action = `set-${kind}`;
+      setButton.dataset.eventIndex = String(eventIndex);
+      setButton.addEventListener("click", () => {
+        selectEvent(eventIndex, false);
+        setMarkerFromPlayhead(kind, eventIndex);
+      });
+      markerActions.append(setButton);
+
+      const nudgeLabel = document.createElement("span");
+      nudgeLabel.className = "field-label small";
+      nudgeLabel.textContent = "Nudge samples";
+      const nudgeRow = document.createElement("div");
+      nudgeRow.className = "nudge-row";
+      for (const amount of [-10, -1, 1, 10]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "nudge";
+        button.textContent = amount > 0 ? `+${amount}` : String(amount);
+        button.setAttribute(
+          "aria-label",
+          `${isSource ? "Source" : "Translated"} marker ${button.textContent} samples`
+        );
+        button.addEventListener("click", () =>
+          nudgeMarker(input, amount, eventIndex)
+        );
+        nudgeRow.append(button);
+      }
+      wrapper.append(label, input, markerActions, nudgeLabel, nudgeRow);
+      return wrapper;
+    }
+
+    function selectEvent(eventIndex, seekToWindow = true) {
+      if (
+        !validatedBundle ||
+        eventIndex < 0 ||
+        eventIndex >= validatedBundle.assignment.events.length
+      ) {
+        return;
+      }
+      activeEventIndex = eventIndex;
+      for (const card of eventList.querySelectorAll(".event-card")) {
+        const selected = Number(card.dataset.eventIndex) === eventIndex;
+        card.dataset.active = String(selected);
+        const button = card.querySelector('[data-action="select-event"]');
+        button.textContent = selected ? "Selected event" : "Select event";
+      }
+      renderStaticWaveforms();
+      updatePlayhead("source");
+      if (seekToWindow) {
+        const event = validatedBundle.assignment.events[eventIndex];
+        const center =
+          (event.source_window_start_sample +
+            event.source_window_end_sample_exclusive) /
+          2;
+        sourceAudio.currentTime =
+          center / validatedBundle.assignment.source_sample_rate_hz;
+      }
+    }
+
+    function nudgeMarker(input, amount, eventIndex) {
+      selectEvent(eventIndex, false);
+      const minimum = Number(input.min);
+      const maximum = Number(input.max);
+      const current = input.value === "" ? minimum : Number(input.value);
+      const next = Math.min(maximum, Math.max(minimum, current + amount));
+      input.value = String(Math.trunc(next));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    function setMarkerFromPlayhead(kind, eventIndex) {
+      if (!validatedBundle) {
+        return;
+      }
+      const isSource = kind === "source";
+      const audio = isSource ? sourceAudio : translatedAudio;
+      const rate = isSource
+        ? validatedBundle.assignment.source_sample_rate_hz
+        : validatedBundle.assignment.translated_sample_rate_hz;
+      const input = document.querySelector(
+        `[data-event-index="${eventIndex}"][data-field="${kind}_sample_index"]`
+      );
+      const maximum = isSource
+        ? validatedBundle.assignment.source_pcm_sample_count - 1
+        : validatedBundle.assignment.translated_pcm_sample_count - 1;
+      const raw = Math.floor(Math.max(0, audio.currentTime) * rate);
+      input.value = String(Math.min(maximum, Math.max(0, raw)));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    function renderStaticWaveforms() {
+      if (!validatedBundle || !sourceBaseCanvas || !translatedBaseCanvas) {
+        return;
+      }
+      drawWaveformBase(
+        sourceBaseCanvas,
+        validatedBundle.sourceWav.samples,
+        validatedBundle.assignment.events,
+        activeEventIndex
+      );
+      drawWaveformBase(
+        translatedBaseCanvas,
+        validatedBundle.translatedWav.samples,
+        [],
+        -1
+      );
+    }
+
+    function drawWaveformBase(canvas, samples, windows, selectedIndex) {
+      const context = canvas.getContext("2d", { alpha: false });
+      const width = canvas.width;
+      const height = canvas.height;
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, width, height);
+
+      for (const [index, event] of windows.entries()) {
+        const startX =
+          (event.source_window_start_sample / samples.length) * width;
+        const endX =
+          (event.source_window_end_sample_exclusive / samples.length) * width;
+        context.fillStyle =
+          index === selectedIndex
+            ? "rgba(18, 94, 165, 0.28)"
+            : "rgba(18, 94, 165, 0.10)";
+        context.fillRect(
+          startX,
+          0,
+          Math.max(1, endX - startX),
+          height
+        );
+      }
+
+      context.strokeStyle = "#d7dee5";
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(0, height / 2 + 0.5);
+      context.lineTo(width, height / 2 + 0.5);
+      context.stroke();
+
+      context.strokeStyle = "#244f73";
+      context.lineWidth = 1;
+      context.beginPath();
+      for (let x = 0; x < width; x += 1) {
+        const start = Math.floor((x * samples.length) / width);
+        const end = Math.max(
+          start + 1,
+          Math.floor(((x + 1) * samples.length) / width)
+        );
+        let minimum = 32767;
+        let maximum = -32768;
+        for (let index = start; index < end; index += 1) {
+          const sample = samples[index];
+          if (sample < minimum) {
+            minimum = sample;
+          }
+          if (sample > maximum) {
+            maximum = sample;
+          }
+        }
+        const top = height / 2 - (maximum / 32768) * (height * 0.46);
+        const bottom = height / 2 - (minimum / 32768) * (height * 0.46);
+        context.moveTo(x + 0.5, top);
+        context.lineTo(x + 0.5, bottom);
+      }
+      context.stroke();
+    }
+
+    function drawPlayhead(canvas, base, ratio) {
+      if (!base) {
+        return;
+      }
+      const context = canvas.getContext("2d", { alpha: false });
+      context.drawImage(base, 0, 0);
+      const x = Math.max(0, Math.min(canvas.width - 1, ratio * canvas.width));
+      context.strokeStyle = "#a12525";
+      context.lineWidth = 2;
+      context.beginPath();
+      context.moveTo(x, 0);
+      context.lineTo(x, canvas.height);
+      context.stroke();
+    }
+
+    function currentSample(kind) {
+      if (!validatedBundle) {
+        return 0;
+      }
+      const isSource = kind === "source";
+      const audio = isSource ? sourceAudio : translatedAudio;
+      const count = isSource
+        ? validatedBundle.assignment.source_pcm_sample_count
+        : validatedBundle.assignment.translated_pcm_sample_count;
+      const rate = isSource
+        ? validatedBundle.assignment.source_sample_rate_hz
+        : validatedBundle.assignment.translated_sample_rate_hz;
+      return Math.min(
+        count - 1,
+        Math.max(0, Math.floor(Math.max(0, audio.currentTime) * rate))
+      );
+    }
+
+    function updatePlayhead(kind) {
+      if (!validatedBundle) {
+        return;
+      }
+      const isSource = kind === "source";
+      const audio = isSource ? sourceAudio : translatedAudio;
+      const canvas = isSource ? sourceCanvas : translatedCanvas;
+      const base = isSource ? sourceBaseCanvas : translatedBaseCanvas;
+      const output = isSource ? sourcePosition : translatedPosition;
+      const count = isSource
+        ? validatedBundle.assignment.source_pcm_sample_count
+        : validatedBundle.assignment.translated_pcm_sample_count;
+      const sample = currentSample(kind);
+      const time = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+      const ratio = count > 1 ? sample / (count - 1) : 0;
+      output.textContent =
+        `${time.toFixed(3)} s · sample ${sample.toLocaleString("en-US")}`;
+      canvas.setAttribute("aria-valuenow", String(Math.round(ratio * 100)));
+      canvas.setAttribute(
+        "aria-valuetext",
+        `${time.toFixed(3)} seconds, sample ${sample}`
+      );
+      drawPlayhead(canvas, base, ratio);
+    }
+
+    function seekToRatio(kind, ratio) {
+      if (!validatedBundle) {
+        return;
+      }
+      const safeRatio = Math.min(1, Math.max(0, ratio));
+      const isSource = kind === "source";
+      const audio = isSource ? sourceAudio : translatedAudio;
+      const count = isSource
+        ? validatedBundle.assignment.source_pcm_sample_count
+        : validatedBundle.assignment.translated_pcm_sample_count;
+      const rate = isSource
+        ? validatedBundle.assignment.source_sample_rate_hz
+        : validatedBundle.assignment.translated_sample_rate_hz;
+      const sample = Math.min(count - 1, Math.floor(safeRatio * count));
+      audio.currentTime = sample / rate;
+      updatePlayhead(kind);
+    }
+
+    function seekFromPointer(kind, event) {
+      const canvas = kind === "source" ? sourceCanvas : translatedCanvas;
+      const rectangle = canvas.getBoundingClientRect();
+      seekToRatio(kind, (event.clientX - rectangle.left) / rectangle.width);
+    }
+
+    function seekFromKeyboard(kind, event) {
+      if (!validatedBundle) {
+        return;
+      }
+      const isSource = kind === "source";
+      const audio = isSource ? sourceAudio : translatedAudio;
+      const rate = isSource
+        ? validatedBundle.assignment.source_sample_rate_hz
+        : validatedBundle.assignment.translated_sample_rate_hz;
+      const count = isSource
+        ? validatedBundle.assignment.source_pcm_sample_count
+        : validatedBundle.assignment.translated_pcm_sample_count;
+      let delta = 0;
+      if (event.key === "ArrowLeft") {
+        delta = -100;
+      } else if (event.key === "ArrowRight") {
+        delta = 100;
+      } else if (event.key === "Home") {
+        seekToRatio(kind, 0);
+        event.preventDefault();
+        return;
+      } else if (event.key === "End") {
+        seekToRatio(kind, 1);
+        event.preventDefault();
+        return;
+      } else {
+        return;
+      }
+      const sample = Math.min(
+        count - 1,
+        Math.max(0, currentSample(kind) + delta)
+      );
+      audio.currentTime = sample / rate;
+      updatePlayhead(kind);
+      event.preventDefault();
+    }
+
+    function parseFormInteger(element, minimum, maximum, context) {
+      if (!/^(0|[1-9][0-9]*)$/.test(element.value)) {
+        throw new Error(`${context} must be a whole sample index.`);
+      }
+      const value = Number(element.value);
+      if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(
+          `${context} must be between ${minimum} and ${maximum}.`
+        );
+      }
+      return value;
+    }
+
+    function parseRating(card, key, context) {
+      const element = card.querySelector(`[data-field="${key}"]`);
+      if (!/^[1-5]$/.test(element.value)) {
+        throw new Error(`${context} requires every 1–5 rating.`);
+      }
+      return Number(element.value);
+    }
+
+    function requireOmissionContract(
+      issueFlags,
+      equivalence,
+      translatedBoundaryConfidence,
+      context
+    ) {
+      if (
+        issueFlags.includes("omission") &&
+        (
+          equivalence !== "rejected" ||
+          translatedBoundaryConfidence !== 1
+        )
+      ) {
+        throw new Error(
+          `${context} omission must be rejected with translated-boundary confidence 1.`
+        );
+      }
+    }
+
+    function collectEvents(assignment) {
+      const observations = [];
+      for (const [index, assigned] of assignment.events.entries()) {
+        const card = eventList.querySelector(
+          `.event-card[data-event-index="${index}"]`
+        );
+        if (!card) {
+          throw new Error("The review form no longer matches the assignment.");
+        }
+        const context = assigned.event_id;
+        const sourceElement = card.querySelector(
+          '[data-field="source_sample_index"]'
+        );
+        const translatedElement = card.querySelector(
+          '[data-field="translated_sample_index"]'
+        );
+        const sourceSample = parseFormInteger(
+          sourceElement,
+          assigned.source_window_start_sample,
+          assigned.source_window_end_sample_exclusive - 1,
+          `${context} source marker`
+        );
+        const translatedSample = parseFormInteger(
+          translatedElement,
+          0,
+          assignment.translated_pcm_sample_count - 1,
+          `${context} translated marker`
+        );
+        const equivalence = card.querySelector(
+          '[data-field="semantic_equivalence"]'
+        ).value;
+        if (!["accepted", "uncertain", "rejected"].includes(equivalence)) {
+          throw new Error(`${context} requires semantic equivalence.`);
+        }
+        const issueFlags = Array.from(
+          card.querySelectorAll("[data-issue-flag]:checked"),
+          (checkbox) => checkbox.dataset.issueFlag
+        ).sort();
+        if (
+          new Set(issueFlags).size !== issueFlags.length ||
+          issueFlags.some((flag) => !ISSUE_FLAGS.includes(flag))
+        ) {
+          throw new Error(`${context} has an invalid issue flag.`);
+        }
+        const translatedBoundaryConfidence = parseRating(
+          card,
+          "translated_boundary_confidence",
+          context
+        );
+        requireOmissionContract(
+          issueFlags,
+          equivalence,
+          translatedBoundaryConfidence,
+          context
+        );
+        const observation = {
+          event_id: assigned.event_id,
+          source_sample_index: sourceSample,
+          translated_sample_index: translatedSample,
+          semantic_equivalence: equivalence,
+          source_boundary_confidence: parseRating(
+            card,
+            "source_boundary_confidence",
+            context
+          ),
+          translated_boundary_confidence: translatedBoundaryConfidence,
+          translation_quality_rating: parseRating(
+            card,
+            "translation_quality_rating",
+            context
+          ),
+          intelligibility_rating: parseRating(
+            card,
+            "intelligibility_rating",
+            context
+          ),
+          naturalness_rating: parseRating(
+            card,
+            "naturalness_rating",
+            context
+          ),
+          issue_flags: issueFlags
+        };
+        requireExactKeys(
+          observation,
+          OBSERVATION_EVENT_KEYS,
+          `${context} observation`
+        );
+        observations.push(observation);
+      }
+      return observations;
+    }
+
+    function makeObservation(bundle) {
+      if (!independenceCheck.checked) {
+        throw new Error("The independence attestation is required.");
+      }
+      if (!UUID_V4.test(reviewerSessionId)) {
+        throw new Error("The anonymous reviewer session is invalid.");
+      }
+      const observation = {
+        schema_version: 1,
+        observation_type: "private_semantic_reviewer_observation",
+        assignment_sha256: bundle.assignmentHash,
+        schedule_ledger_sha256: bundle.ledgerHash,
+        source_pcm_sha256: bundle.assignment.source_pcm_sha256,
+        source_pcm_sample_count: bundle.assignment.source_pcm_sample_count,
+        translated_pcm_sha256: bundle.assignment.translated_pcm_sha256,
+        translated_pcm_sample_count:
+          bundle.assignment.translated_pcm_sample_count,
+        reviewer_session_id: reviewerSessionId,
+        independence_attestation: true,
+        events: collectEvents(bundle.assignment),
+        privacy: {
+          contains_audio: false,
+          contains_transcript_or_translation_text: false,
+          contains_reviewer_identity: false,
+          contains_file_path_or_uri: false,
+          contains_wall_clock_timestamp: false,
+          private_review_artifact: true,
+          contains_free_text: false
+        }
+      };
+      requireExactKeys(observation, OBSERVATION_KEYS, "Observation");
+      requireExactKeys(
+        observation.privacy,
+        OBSERVATION_PRIVACY_KEYS,
+        "Observation privacy"
+      );
+      return observation;
+    }
+
+    function updateExportReadiness(announce = true) {
+      if (!validatedBundle) {
+        downloadButton.disabled = true;
+        return;
+      }
+      try {
+        makeObservation(validatedBundle);
+        downloadButton.disabled = false;
+        if (announce) {
+          setStatus(
+            exportStatus,
+            "success",
+            "All required answers are complete. Download will re-read and revalidate all four files before creating JSON."
+          );
+        }
+      } catch (error) {
+        downloadButton.disabled = true;
+        if (announce) {
+          setStatus(exportStatus, "idle", safeErrorMessage(error));
+        }
+      }
+    }
+
+    function sameValidatedBinding(first, second) {
+      return (
+        first.assignmentHash === second.assignmentHash &&
+        first.ledgerHash === second.ledgerHash &&
+        first.sourceWav.sampleCount === second.sourceWav.sampleCount &&
+        first.translatedWav.sampleCount === second.translatedWav.sampleCount
+      );
+    }
+
+    async function downloadObservation() {
+      if (!validatedBundle) {
+        return;
+      }
+      const originalBundle = validatedBundle;
+      const selected = selectedFiles();
+      if (!allFilesSelected(selected)) {
+        updateExportReadiness();
+        return;
+      }
+      validationGeneration += 1;
+      const generation = validationGeneration;
+      downloadButton.disabled = true;
+      setStatus(
+        exportStatus,
+        "working",
+        "Re-reading and revalidating every selected byte before download…"
+      );
+      try {
+        const freshBundle = await loadAndValidate(
+          selected,
+          generation,
+          false
+        );
+        if (
+          generation !== validationGeneration ||
+          !sameValidatedBinding(originalBundle, freshBundle)
+        ) {
+          throw new Error(
+            "The selected evidence changed after the review was unlocked."
+          );
+        }
+        const observation = makeObservation(freshBundle);
+        const bytes = JSON.stringify(observation, null, 2) + "\n";
+        const blob = new Blob([bytes], { type: "application/json" });
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = objectUrl;
+        anchor.download = `anonymous-review-${reviewerSessionId}.json`;
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(objectUrl);
+        setStatus(
+          exportStatus,
+          "success",
+          "Fresh validation passed. Anonymous observation downloaded."
+        );
+      } catch (error) {
+        setStatus(
+          exportStatus,
+          "error",
+          `Download blocked: ${safeErrorMessage(error)}`
+        );
+      } finally {
+        updateExportReadiness(false);
+      }
+    }
+  })();
+  </script>
+</body>
+</html>

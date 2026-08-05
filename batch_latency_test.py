@@ -46,6 +46,7 @@ from headless_playback_scheduler import (
     HeadlessPlaybackScheduler,
     validate_headless_playback_report,
 )
+from private_pcm_schedule_ledger import PrivatePcmScheduleCapture
 from synthesized_pcm_silence import (
     StreamingPcmSilenceDiagnostic,
     SynthesizedPcmSilenceError,
@@ -4755,13 +4756,14 @@ async def _send_pcm_chunks_at_end_boundaries(
 # ---------------------------------------------------------------------------
 # Core test runner
 # ---------------------------------------------------------------------------
-async def run_test(
+async def _run_test_impl(
     audio_path: str,
     backend_url: str,
     *,
     audio_metadata_protocol_version: int | None = None,
     audio_frame_sink: ValidatedAudioFrameSink | None = None,
     measure_synthesized_pcm_silence: bool = False,
+    private_semantic_capture: PrivatePcmScheduleCapture | None = None,
 ) -> TestResult:
     """Run a single latency test against one audio file.
 
@@ -4773,6 +4775,11 @@ async def run_test(
     ``measure_synthesized_pcm_silence`` enables a first-party, aggregate-only
     low-energy PCM diagnostic. Raw samples are inspected only after protocol
     validation and are never exposed through ``audio_frame_sink`` or retained.
+
+    ``private_semantic_capture`` is an explicit, default-off evidence sink.
+    It retains the exact sent and validated translated PCM in memory until a
+    clean capture is sealed; the batch runner alone publishes it to a fresh
+    owner-private ignored directory.
     """
 
     if (
@@ -4805,6 +4812,33 @@ async def run_test(
         raise ValueError(
             "synthesized PCM silence diagnostic requires audio metadata "
             "protocol version 1"
+        )
+    if (
+        private_semantic_capture is not None
+        and not isinstance(
+            private_semantic_capture,
+            PrivatePcmScheduleCapture,
+        )
+    ):
+        raise TypeError(
+            "private_semantic_capture must be a "
+            "PrivatePcmScheduleCapture"
+        )
+    if (
+        private_semantic_capture is not None
+        and audio_metadata_protocol_version is None
+    ):
+        raise ValueError(
+            "private semantic capture requires audio metadata protocol "
+            "version 1"
+        )
+    if (
+        private_semantic_capture is not None
+        and measure_synthesized_pcm_silence
+    ):
+        raise ValueError(
+            "private semantic capture cannot be combined with the "
+            "synthesized PCM silence diagnostic"
         )
     headless_scheduler = (
         HeadlessPlaybackScheduler()
@@ -4878,6 +4912,18 @@ async def run_test(
                 "synthesized PCM silence diagnostic requires the staged "
                 "schema-3 incremental-publication path"
             )
+    if private_semantic_capture is not None:
+        staged_config = result.backend_config.get("stagedConfig")
+        if (
+            result.pipeline_mode != "staged"
+            or not isinstance(staged_config, dict)
+            or staged_config.get("telemetrySchemaVersion") != 3
+            or staged_config.get("ttsIncrementalPublishEnabled") is not True
+        ):
+            raise RuntimeError(
+                "private semantic capture requires the staged schema-3 "
+                "incremental-publication path"
+            )
     silence_diagnostic = (
         StreamingPcmSilenceDiagnostic()
         if measure_synthesized_pcm_silence
@@ -4885,6 +4931,13 @@ async def run_test(
     )
     silence_processing_durations_ms: list[float] = []
     pcm_bytes = pcm.tobytes()
+    if private_semantic_capture is not None:
+        private_semantic_capture.bind_source_pcm(
+            pcm_bytes,
+            sample_rate_hz=SAMPLE_RATE,
+            channels=1,
+            bytes_per_sample=BYTES_PER_SAMPLE,
+        )
     total_chunks = (len(pcm_bytes) + CHUNK_BYTES - 1) // CHUNK_BYTES
 
     # -- Start backend timing session ---------------------------------------
@@ -5048,6 +5101,10 @@ async def run_test(
                     "min_emission_minus_deadline_ms": None,
                     "max_emission_minus_deadline_ms": None,
                 }
+                if private_semantic_capture is not None:
+                    private_semantic_capture.record_source_anchor(
+                        sample_zero - client_clock_origin
+                    )
 
             def record_successful_send(
                 idx: int,
@@ -5086,6 +5143,26 @@ async def run_test(
                         ),
                     }
                 )
+                if private_semantic_capture is not None:
+                    byte_start = idx * CHUNK_BYTES
+                    byte_end = min(
+                        byte_start + CHUNK_BYTES,
+                        len(pcm_bytes),
+                    )
+                    private_semantic_capture.record_source_chunk(
+                        chunk_index=idx,
+                        sample_start=byte_start // BYTES_PER_SAMPLE,
+                        sample_end_exclusive=(
+                            byte_end // BYTES_PER_SAMPLE
+                        ),
+                        audio_bytes=byte_end - byte_start,
+                        deadline_seconds=(
+                            _deadline - client_clock_origin
+                        ),
+                        emitted_seconds=(
+                            send_timestamp - client_clock_origin
+                        ),
+                    )
 
             async def send_chunk(
                 idx: int,
@@ -5277,11 +5354,43 @@ async def run_test(
                                     "sourceEndMs"
                                 ],
                             )
+                            schedule_decision = None
                             try:
                                 if headless_scheduler is not None:
-                                    headless_scheduler.accept(
-                                        validated_frame
+                                    schedule_decision = (
+                                        headless_scheduler.accept(
+                                            validated_frame
+                                        )
                                     )
+                            except Exception as exc:
+                                server_error = (
+                                    "headless playback scheduler failed: "
+                                    f"{type(exc).__name__}"
+                                )
+                                stream_abort.set()
+                                terminal_received.set()
+                                return
+                            if private_semantic_capture is not None:
+                                try:
+                                    if schedule_decision is None:
+                                        raise RuntimeError(
+                                            "missing schedule decision"
+                                        )
+                                    private_semantic_capture.accept_frame(
+                                        metadata=paired_metadata,
+                                        pcm=raw,
+                                        schedule=schedule_decision,
+                                    )
+                                except Exception as exc:
+                                    private_semantic_capture.abort()
+                                    server_error = (
+                                        "private semantic capture failed: "
+                                        f"{type(exc).__name__}"
+                                    )
+                                    stream_abort.set()
+                                    terminal_received.set()
+                                    return
+                            try:
                                 if audio_frame_sink is not None:
                                     audio_frame_sink(validated_frame)
                             except Exception as exc:
@@ -5363,6 +5472,28 @@ async def run_test(
                             and normalized_metadata["type"]
                             == "audio_parent_complete"
                         ):
+                            if private_semantic_capture is not None:
+                                try:
+                                    private_semantic_capture.complete_parent(
+                                        metadata=normalized_metadata,
+                                        received_seconds=(
+                                            float(
+                                                receive_event[
+                                                    "timestamp_ms"
+                                                ]
+                                            )
+                                            / 1000.0
+                                        ),
+                                    )
+                                except Exception as exc:
+                                    private_semantic_capture.abort()
+                                    server_error = (
+                                        "private semantic capture failed: "
+                                        f"{type(exc).__name__}"
+                                    )
+                                    stream_abort.set()
+                                    terminal_received.set()
+                                    return
                             if silence_diagnostic is not None:
                                 try:
                                     silence_diagnostic.complete_parent(
@@ -5689,7 +5820,60 @@ async def run_test(
     # output-duration expansion, yielding the listener-visible tail.
     compute_playback_metrics(result)
 
+    if private_semantic_capture is not None:
+        capture_errors = validate_capture_result(result)
+        if capture_errors:
+            private_semantic_capture.abort()
+        else:
+            try:
+                private_semantic_capture.seal(
+                    input_end_seconds=(
+                        result.input_end_timestamp_ms / 1000.0
+                    ),
+                    terminal_completed=result.translation_completed,
+                    headless_report=result.headless_playback_report,
+                )
+            except Exception as exc:
+                private_semantic_capture.abort()
+                raise RuntimeError(
+                    "private semantic capture finalization failed: "
+                    f"{type(exc).__name__}"
+                ) from exc
+
     return result
+
+
+async def run_test(
+    audio_path: str,
+    backend_url: str,
+    *,
+    audio_metadata_protocol_version: int | None = None,
+    audio_frame_sink: ValidatedAudioFrameSink | None = None,
+    measure_synthesized_pcm_silence: bool = False,
+    private_semantic_capture: PrivatePcmScheduleCapture | None = None,
+) -> TestResult:
+    """Run one capture and discard retained private PCM on every exception."""
+
+    try:
+        return await _run_test_impl(
+            audio_path,
+            backend_url,
+            audio_metadata_protocol_version=(
+                audio_metadata_protocol_version
+            ),
+            audio_frame_sink=audio_frame_sink,
+            measure_synthesized_pcm_silence=(
+                measure_synthesized_pcm_silence
+            ),
+            private_semantic_capture=private_semantic_capture,
+        )
+    except BaseException:
+        if private_semantic_capture is not None:
+            try:
+                private_semantic_capture.abort()
+            except Exception:
+                pass
+        raise
 
 
 async def fetch_backend_export(
@@ -6051,9 +6235,37 @@ async def run_batch(
     *,
     audio_metadata_protocol_version: int | None = None,
     measure_synthesized_pcm_silence: bool = False,
+    private_semantic_capture_dir: Path | None = None,
 ) -> bool:
     """Run tests on a list of audio files sequentially."""
     total = len(files)
+    if private_semantic_capture_dir is not None:
+        if not isinstance(private_semantic_capture_dir, Path):
+            raise TypeError(
+                "private_semantic_capture_dir must be a pathlib.Path"
+            )
+        if total != 1:
+            raise ValueError(
+                "private semantic capture requires exactly one input file"
+            )
+        if (
+            audio_metadata_protocol_version
+            != AUDIO_METADATA_PROTOCOL_VERSION
+        ):
+            raise ValueError(
+                "private semantic capture requires audio metadata "
+                "protocol version 1"
+            )
+        if measure_synthesized_pcm_silence:
+            raise ValueError(
+                "private semantic capture cannot be combined with the "
+                "synthesized PCM silence diagnostic"
+            )
+        private_semantic_capture_dir = (
+            _resolve_private_semantic_capture_dir(
+                private_semantic_capture_dir
+            )
+        )
     all_captures_passed = total > 0
     captures_written = 0
     for i, fpath in enumerate(files, 1):
@@ -6064,10 +6276,16 @@ async def run_batch(
             all_captures_passed = False
             continue
 
+        private_capture = (
+            PrivatePcmScheduleCapture()
+            if private_semantic_capture_dir is not None
+            else None
+        )
         try:
             if (
                 audio_metadata_protocol_version is None
                 and not measure_synthesized_pcm_silence
+                and private_capture is None
             ):
                 result = await run_test(fpath, backend_url)
             else:
@@ -6080,8 +6298,14 @@ async def run_batch(
                     measure_synthesized_pcm_silence=(
                         measure_synthesized_pcm_silence
                     ),
+                    private_semantic_capture=private_capture,
                 )
         except Exception as e:
+            if private_capture is not None:
+                try:
+                    private_capture.abort()
+                except Exception:
+                    pass
             print(f"\nERROR: {e}")
             all_captures_passed = False
             continue
@@ -6100,16 +6324,45 @@ async def run_batch(
             generate_summary(result, summary_path)
             captures_written += 1
         except Exception as exc:
+            if private_capture is not None:
+                try:
+                    private_capture.abort()
+                except Exception:
+                    pass
             print(f"Artifact generation FAILED: {exc}")
             all_captures_passed = False
             continue
 
         capture_errors = validate_capture_result(result)
         if capture_errors:
+            if private_capture is not None:
+                try:
+                    private_capture.abort()
+                except Exception:
+                    pass
             all_captures_passed = False
             print("Capture validation FAILED:")
             for error in capture_errors:
                 print(f"  - {error}")
+        elif private_capture is not None:
+            try:
+                private_capture.write_new(
+                    private_semantic_capture_dir
+                )
+                print(
+                    "Private semantic evidence written to the requested "
+                    "owner-private directory."
+                )
+            except Exception as exc:
+                try:
+                    private_capture.abort()
+                except Exception:
+                    pass
+                print(
+                    "Private semantic artifact publication FAILED: "
+                    f"{type(exc).__name__}"
+                )
+                all_captures_passed = False
 
         print(
             f"Summary: avg_drift={result.avg_drift:.1f}s, "
@@ -6124,6 +6377,43 @@ async def run_batch(
             f"post_input_responses={result.post_input_responses}"
         )
     return all_captures_passed and captures_written == total
+
+
+def _resolve_private_semantic_capture_dir(requested: Path) -> Path:
+    """Resolve a fresh private path beneath this checkout's ignored root."""
+
+    if not isinstance(requested, Path):
+        raise TypeError("private capture directory must be a pathlib.Path")
+    repository_root = Path(__file__).resolve().parent
+    ignored_root = (repository_root / "experiment_results").resolve(
+        strict=False
+    )
+    candidate = requested.expanduser()
+    if not candidate.is_absolute():
+        candidate = repository_root / candidate
+    if candidate.is_symlink():
+        raise ValueError(
+            "private capture directory must not be a symbolic link"
+        )
+    candidate = candidate.resolve(strict=False)
+    try:
+        relative = candidate.relative_to(ignored_root)
+    except ValueError as exc:
+        raise ValueError(
+            "private capture directory must be a child of the ignored "
+            "experiment_results directory"
+        ) from exc
+    if not relative.parts:
+        raise ValueError(
+            "private capture directory must be a fresh child of "
+            "experiment_results"
+        )
+    if candidate.exists() or candidate.is_symlink():
+        raise ValueError(
+            "private capture directory already exists; choose a fresh "
+            "attempt directory"
+        )
+    return candidate
 
 
 def main():
@@ -6162,6 +6452,15 @@ def main():
             "dBFS; requires --audio-metadata-protocol-v1 and staged schema 3"
         ),
     )
+    parser.add_argument(
+        "--private-semantic-capture-dir",
+        type=Path,
+        help=(
+            "explicitly retain source/translated PCM and a schedule ledger "
+            "in one fresh child of ignored experiment_results; requires "
+            "--file and --audio-metadata-protocol-v1"
+        ),
+    )
     args = parser.parse_args()
     if (
         args.measure_synthesized_pcm_silence
@@ -6171,6 +6470,30 @@ def main():
             "--measure-synthesized-pcm-silence requires "
             "--audio-metadata-protocol-v1"
         )
+    if args.private_semantic_capture_dir is not None:
+        if not args.audio_metadata_protocol_v1:
+            parser.error(
+                "--private-semantic-capture-dir requires "
+                "--audio-metadata-protocol-v1"
+            )
+        if args.preflight or not args.file:
+            parser.error(
+                "--private-semantic-capture-dir requires exactly one "
+                "--file input and cannot be used with --preflight"
+            )
+        if args.measure_synthesized_pcm_silence:
+            parser.error(
+                "--private-semantic-capture-dir cannot be combined with "
+                "--measure-synthesized-pcm-silence"
+            )
+        try:
+            args.private_semantic_capture_dir = (
+                _resolve_private_semantic_capture_dir(
+                    args.private_semantic_capture_dir
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
     metadata_version = (
         AUDIO_METADATA_PROTOCOL_VERSION
         if args.audio_metadata_protocol_v1
@@ -6201,6 +6524,9 @@ def main():
                 audio_metadata_protocol_version=metadata_version,
                 measure_synthesized_pcm_silence=(
                     args.measure_synthesized_pcm_silence
+                ),
+                private_semantic_capture_dir=(
+                    args.private_semantic_capture_dir
                 ),
             ),
         )

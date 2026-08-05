@@ -144,6 +144,9 @@ async def get_config():
             ),
             "segmentMaxChars": staged_pipeline_config.segment_max_chars,
             "segmentMaxAgeMs": staged_pipeline_config.segment_max_age_ms,
+            "segmentPunctuationMinChars": (
+                staged_pipeline_config.segment_punctuation_min_chars
+            ),
             "asrEventQueueMaxSize": (
                 staged_pipeline_config.asr_event_queue_maxsize
             ),

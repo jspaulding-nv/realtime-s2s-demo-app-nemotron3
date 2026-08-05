@@ -91,6 +91,7 @@ class PunctuationSegmenter:
         max_age_ms: float = 2_000,
         abbreviations: Optional[Iterable[str]] = None,
         outcome_sink: Optional[Callable[[SegmenterOutcome], None]] = None,
+        punctuation_min_chars: int = 0,
     ) -> None:
         if (
             not isinstance(max_chars, int)
@@ -104,6 +105,14 @@ class PunctuationSegmenter:
             raise ValueError("max_age_ms must be positive")
         if outcome_sink is not None and not callable(outcome_sink):
             raise ValueError("outcome_sink must be callable")
+        if (
+            not isinstance(punctuation_min_chars, int)
+            or isinstance(punctuation_min_chars, bool)
+            or punctuation_min_chars < 0
+        ):
+            raise ValueError("punctuation_min_chars must be a non-negative integer")
+        if punctuation_min_chars > max_chars:
+            raise ValueError("punctuation_min_chars cannot exceed max_chars")
 
         configured = set(DEFAULT_ABBREVIATIONS)
         if abbreviations is not None:
@@ -111,6 +120,7 @@ class PunctuationSegmenter:
 
         self.max_chars = max_chars
         self.max_age_ms = float(max_age_ms)
+        self.punctuation_min_chars = punctuation_min_chars
         self.abbreviations: Set[str] = configured
         self._outcome_sink = outcome_sink
         self._pieces: Deque[_BufferedPiece] = deque()
@@ -298,6 +308,7 @@ class PunctuationSegmenter:
         return emitted
 
     def _first_terminal_boundary(self, text: str) -> Optional[int]:
+        first_boundary: Optional[int] = None
         for index, character in enumerate(text):
             if character not in TERMINAL_PUNCTUATION:
                 continue
@@ -312,7 +323,25 @@ class PunctuationSegmenter:
 
             if end < len(text) and not text[end].isspace() and character == ".":
                 continue
+            if first_boundary is None:
+                first_boundary = end
+            has_buffered_tail = bool(text[end:].strip())
+            if (
+                self.punctuation_min_chars > 0
+                and end < self.punctuation_min_chars
+                and has_buffered_tail
+            ):
+                # Nemotron can punctuate disfluent fragments such as
+                # "and." while already returning the rest of the thought in
+                # the same final. Keep scanning so NMT receives useful
+                # context. A genuinely standalone "No." still emits now.
+                continue
             return end
+        if (
+            first_boundary is not None
+            and not text[first_boundary:].strip()
+        ):
+            return first_boundary
         return None
 
     def _period_is_protected(self, text: str, index: int) -> bool:

@@ -117,6 +117,13 @@ class StagedPipelineConfig:
             "4",
         )
     )
+    # Default-off source-side quality canary. When positive, punctuation
+    # boundaries shorter than this value are coalesced only when more text is
+    # already present in the same ASR final/buffer. Standalone short speech is
+    # still emitted immediately.
+    segment_punctuation_min_chars: int = int(
+        os.getenv("STAGED_SEGMENT_PUNCTUATION_MIN_CHARS", "0")
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipeline_mode, str):
@@ -173,6 +180,18 @@ class StagedPipelineConfig:
             raise ValueError(
                 "tts_incremental_atomic_fallback_max_chars must be a "
                 "non-negative integer"
+            )
+        if (
+            not isinstance(self.segment_punctuation_min_chars, int)
+            or isinstance(self.segment_punctuation_min_chars, bool)
+            or self.segment_punctuation_min_chars < 0
+        ):
+            raise ValueError(
+                "segment_punctuation_min_chars must be a non-negative integer"
+            )
+        if self.segment_punctuation_min_chars > self.segment_max_chars:
+            raise ValueError(
+                "segment_punctuation_min_chars cannot exceed segment_max_chars"
             )
         if (
             not isinstance(self.tts_subsegment_max_chars, int)
