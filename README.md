@@ -48,7 +48,8 @@ See the [sanitization policy](docs/SANITIZATION.md) and
 - Default-off, per-frame TTS publisher-handoff timing that decomposes worker,
   event-loop, output-capacity, dequeue, and WebSocket-send intervals without
   changing PCM publication
-- A fail-closed schema-v3 trace joiner and lossy whole-parent freshness simulator at 5-, 8-, and 10-second queue caps
+- A fail-closed schema-v3 trace joiner with whole-parent, raw-frame, and
+  single-tail truncation freshness simulations at 5-, 8-, and 10-second caps
 - A privacy-safe TTS duration analyzer that sizes post-NMT subsegment experiments from character counts and PCM duration
 - A default-off atomic TTS response-cadence diagnostic and source-boundary latency analyzer
 - Default-off schema-v3 incremental TTS publication with 500 ms PCM framing,
@@ -221,6 +222,8 @@ realtime-s2s-demo-app/
 ├── synthesized_pcm_silence.py # Streaming aggregate-only low-energy PCM telemetry
 ├── analyze_synthesized_silence.py # Privacy-safe low-energy aggregate report
 ├── analyze_freshness_cap.py # Parent-aware lossy queue counterfactual
+├── analyze_frame_freshness_cap.py # Frame/single-tail hard-cap counterfactual
+├── analyze_live_tail_shadow.py # Independent live-shadow evidence replay
 ├── analyze_semantic_event_latency.py # Source-event parent-envelope gate
 ├── freshness_trace.py      # Fail-closed schema-v3 evidence join
 ├── playback_simulation.py  # No-drop and whole-parent queue simulators
@@ -354,6 +357,30 @@ also passed its operational, privacy, hash, schedule-replay, and mechanical
 queue gates. Its semantic result remains unevaluated until independent
 bilingual reviewers add source/translated landmark markers.
 
+One later quick bilingual quality observation is documented separately from
+that formal landmark gate. The follow-up
+[private stage-quality result](docs/PRIVATE_STAGE_QUALITY_RESULT_2026-08-04.md)
+found that the worst-rated pair was boundary-confounded and that automatic
+punctuation produced overly small NMT units. The accompanying
+[private isolation runbook](docs/PRIVATE_STAGE_QUALITY_ISOLATION.md) adds a
+default-off text-bearing trace, content-aligned source excerpts, and a matched
+minimum-context segmentation canary. Raw text, audio, and reviewer evidence
+remain ignored and private.
+
+With reviewer-dependent gates paused, the next objective overload experiment
+used the retained validated five-minute schema-3 trace. The
+[frame-boundary freshness result](docs/FRAME_FRESHNESS_CAP_RESULT_2026-08-04.md)
+proved that a 10-second queue can be enforced only by dropping approximately
+9.1% of translated audio in that trace; all affected parents contained
+internal or fragmented gaps. The frame policy is offline-only and unpromoted.
+The follow-up
+[single-tail result](docs/PARENT_TAIL_CAP_RESULT_2026-08-04.md) enforced a
+10-second queue cap while retaining 90.49% of translated audio. All nine
+affected parents lost only one trailing suffix, with no internal or fragmented
+gaps. This is the preferred objective overload shape, but it remains an
+offline, intentionally lossy counterfactual. The next gate is observation-only
+live shadow scheduling, not audible truncation.
+
 After a host reboot, Compose's `unless-stopped` policy should restart the three
 NIM containers, but readiness must still be verified with the commands above.
 The FastAPI backend is not part of this Compose project and does not restart
@@ -419,6 +446,57 @@ Navigate to http://localhost:5173 in your browser.
 4. Click the button again to stop
 
 **Important:** Use headphones to prevent audio feedback!
+
+### Optional: observation-only live tail-freshness shadow
+
+The Test Dashboard at `http://localhost:5173/#/test` also includes a
+default-off **Observation-only 10-second tail-freshness shadow**. It causally
+projects the single-tail overload policy from protocol-v1 parent/frame
+arrivals, displays numeric loss/capacity metrics, and exports a private JSON
+artifact alongside the normal timing CSV. It never cancels, reschedules, or
+changes audible playback.
+
+Validate the JSON with an independent Python replay:
+
+```bash
+python3 analyze_live_tail_shadow.py \
+  --evidence-json \
+    experiment_results/live-tail-shadow/tail-freshness-shadow-<timestamp>.json
+```
+
+To build the current production frontend and automate the complete tracked
+60-second engineering probe against already-running pinned Riva services:
+
+```bash
+python3 run_live_tail_shadow_preflight.py \
+  --npm /path/to/node-v22.12.0-linux-x64/bin/npm
+```
+
+After that passes, run the hash-bound five-minute overload gate with:
+
+```bash
+python3 run_live_tail_shadow_preflight.py \
+  --five-minute \
+  --incremental-frame-ms 100 \
+  --npm /path/to/node-v22.12.0-linux-x64/bin/npm
+```
+
+The automation deliberately labels dirty-checkout runs non-formal, keeps
+rendered PCM capture off, cleans up only the application/browser processes it
+starts, and independently validates the exported shadow JSON. The first live
+engineering result is documented in
+[the 60-second result](docs/LIVE_TAIL_FRESHNESS_SHADOW_60S_RESULT_2026-08-05.md).
+The current 500 ms five-minute profile is documented in
+[the five-minute result](docs/LIVE_TAIL_FRESHNESS_SHADOW_5MIN_RESULT_2026-08-05.md).
+The matched
+[100 ms/500 ms comparison](docs/LIVE_TAIL_FRESHNESS_SHADOW_FRAME_COMPARISON_2026-08-05.md)
+selects 100 ms for the next observation-only long-form gate; it does not change
+the deployment default or enable audible cancellation.
+
+See the
+[live tail-freshness shadow runbook](docs/LIVE_TAIL_FRESHNESS_SHADOW.md) for
+the 60-second, five-minute, and three-sample promotion order. A cap pass is
+still not an end-to-end semantic-delay or listening-quality result.
 
 ### Optional: rendered-digital common-clock preflight
 
@@ -510,6 +588,7 @@ RIVA_ASR_WORD_TIMES=0
 RIVA_VERBOSE_CHUNKS=0
 STAGED_SEGMENT_MAX_CHARS=240
 STAGED_SEGMENT_MAX_AGE_MS=2000
+STAGED_SEGMENT_PUNCTUATION_MIN_CHARS=0
 STAGED_ASR_EVENT_QUEUE_MAXSIZE=32
 STAGED_NMT_QUEUE_MAXSIZE=4
 STAGED_TTS_QUEUE_MAXSIZE=4
@@ -667,6 +746,8 @@ It does not start or require Chrome, Vite, Web Audio, a microphone, or an
 output sound device. See the
 [headless gate runbook](docs/HEADLESS_REALTIME_GATE.md) for the staged
 protocol-v1 environment, readiness checks, metrics, and claim boundaries.
+The browser-only tail-freshness shadow is a separate observation gate and is
+not enabled by `run_long_form_experiment.py`.
 
 The harness performs its health checks and one-minute preflight, then streams
 Sample 01, Sample 02, and Sample 03 sequentially at real-time pace. Use a dry run to
@@ -963,6 +1044,10 @@ Detailed guides:
 - [Adaptive playback controller](docs/ADAPTIVE_PLAYBACK.md)
 - [Audience-latency metric definitions](docs/AUDIENCE_LATENCY_METRICS.md)
 - [Observation-only parent/frame metadata protocol v1](docs/AUDIO_METADATA_OBSERVATION_V1.md)
+- [Observation-only live tail-freshness shadow](docs/LIVE_TAIL_FRESHNESS_SHADOW.md)
+- [Live tail-freshness shadow 60-second result](docs/LIVE_TAIL_FRESHNESS_SHADOW_60S_RESULT_2026-08-05.md)
+- [Live tail-freshness shadow five-minute result](docs/LIVE_TAIL_FRESHNESS_SHADOW_5MIN_RESULT_2026-08-05.md)
+- [Live tail-freshness shadow 100 ms/500 ms comparison](docs/LIVE_TAIL_FRESHNESS_SHADOW_FRAME_COMPARISON_2026-08-05.md)
 - [Protocol-v1 60-second formal canary](docs/AUDIO_METADATA_60S_CANARY_2026-07-25.md)
 - [Semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md)
 - [Headless scheduled semantic-delay gate](docs/HEADLESS_SEMANTIC_DELAY_GATE.md)

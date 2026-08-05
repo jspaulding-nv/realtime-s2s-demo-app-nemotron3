@@ -36,6 +36,54 @@ def test_multiple_sentences_get_independent_ordered_segment_ids():
     assert all(item.contributing_final_ids == (7,) for item in emitted)
 
 
+def test_minimum_context_coalesces_short_boundary_with_buffered_tail():
+    segmenter = PunctuationSegmenter(punctuation_min_chars=20)
+
+    emitted = segmenter.push_final(
+        final(7, "and. and even. well, the first verse", at=100)
+    )
+
+    assert emitted == []
+    emitted = segmenter.emit_due(2_100)
+    assert [item.text for item in emitted] == [
+        "and. and even. well, the first verse"
+    ]
+    assert emitted[0].reason is EmissionReason.AGE
+
+
+def test_minimum_context_uses_later_boundary_when_available():
+    segmenter = PunctuationSegmenter(punctuation_min_chars=20)
+
+    emitted = segmenter.push_final(
+        final(8, "because uh. as we began looking at this, uh. More.", at=100)
+    )
+
+    assert [item.text for item in emitted] == [
+        "because uh. as we began looking at this, uh.",
+        "More.",
+    ]
+
+
+def test_minimum_context_preserves_standalone_short_utterance_latency():
+    segmenter = PunctuationSegmenter(punctuation_min_chars=20)
+
+    emitted = segmenter.push_final(final(0, "No.", at=100))
+
+    assert [item.text for item in emitted] == ["No."]
+    assert emitted[0].reason is EmissionReason.PUNCTUATION
+
+
+@pytest.mark.parametrize("value", [-1, True, 2.5, "20"])
+def test_minimum_context_must_be_nonnegative_integer(value):
+    with pytest.raises(ValueError, match="punctuation_min_chars"):
+        PunctuationSegmenter(punctuation_min_chars=value)
+
+
+def test_minimum_context_cannot_exceed_maximum():
+    with pytest.raises(ValueError, match="cannot exceed"):
+        PunctuationSegmenter(max_chars=10, punctuation_min_chars=11)
+
+
 def test_same_final_discards_isolated_filler_before_allocating_sequence_id():
     outcomes = []
     segmenter = PunctuationSegmenter(outcome_sink=outcomes.append)

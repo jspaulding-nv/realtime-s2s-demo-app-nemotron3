@@ -39,6 +39,13 @@ import {
   summarizePlaybackQueue,
   type PlaybackQueueSample,
 } from '../utils/playbackPolicy';
+import {
+  serializeTailFreshnessShadowEvidence,
+  TailFreshnessShadowError,
+  TailFreshnessShadowScheduler,
+  type TailFreshnessShadowEvidence,
+  type TailFreshnessShadowSummary,
+} from '../utils/tailFreshnessShadow';
 import type { AudioConfig, SessionStatus } from '../types/messages';
 
 type TestPhase =
@@ -55,6 +62,29 @@ const DRAIN_MIN_SEC = 10;
 const DRAIN_IDLE_SEC = 5;
 const DRAIN_MAX_SEC = 300;
 
+const EMPTY_TAIL_SHADOW_SUMMARY: TailFreshnessShadowSummary = {
+  framesReceived: 0,
+  framesRetained: 0,
+  framesDropped: 0,
+  parentsReceived: 0,
+  parentsTruncated: 0,
+  parentsFullyDropped: 0,
+  totalSourceDurationSeconds: 0,
+  retainedSourceDurationSeconds: 0,
+  droppedSourceDurationSeconds: 0,
+  retainedSourcePercent: 0,
+  lastDecisionQueueSeconds: 0,
+  peakQueueBeforeTruncationSeconds: 0,
+  peakQueueAfterTruncationSeconds: 0,
+  truncationTriggerCount: 0,
+  suppressedArrivalCount: 0,
+  residualBreachEvents: 0,
+  peakResidualOverCapSeconds: 0,
+  maxDroppedParentSuffixSeconds: 0,
+  hardCapAchieved: true,
+  singleTailContractHolds: true,
+};
+
 export function TestDashboard() {
   const [phase, setPhase] = useState<TestPhase>('idle');
   const [failureMessage, setFailureMessage] = useState('');
@@ -64,6 +94,15 @@ export function TestDashboard() {
     setServerTerminalState,
   ] = useState<ServerTerminalState>('pending');
   const [adaptivePlaybackEnabled, setAdaptivePlaybackEnabled] = useState(true);
+  const [tailFreshnessShadowEnabled, setTailFreshnessShadowEnabled] = (
+    useState(false)
+  );
+  const [tailFreshnessShadowStatus, setTailFreshnessShadowStatus] = useState<
+    'off' | 'ready' | 'running' | 'complete' | 'invalid'
+  >('off');
+  const [tailFreshnessShadowSummary, setTailFreshnessShadowSummary] = (
+    useState<TailFreshnessShadowSummary>(EMPTY_TAIL_SHADOW_SUMMARY)
+  );
   const [
     renderedDigitalCaptureEnabled,
     setRenderedDigitalCaptureEnabled,
@@ -97,6 +136,14 @@ export function TestDashboard() {
   const startInProgressRef = useRef(false);
   const driftDataRef = useRef<DriftDataPoint[]>([]);
   const queueSamplesRef = useRef<PlaybackQueueSample[]>([]);
+  const tailFreshnessShadowEnabledRef = useRef(false);
+  const tailFreshnessShadowRef = useRef<
+    TailFreshnessShadowScheduler | null
+  >(null);
+  const tailFreshnessShadowEvidenceRef = useRef<
+    TailFreshnessShadowEvidence | null
+  >(null);
+  const tailFreshnessShadowErrorRef = useRef<string | null>(null);
   const renderedDigitalCaptureEnabledRef = useRef(false);
   const renderedDigitalCaptureResultRef = useRef<
   RenderedDigitalCaptureResult | null
@@ -134,7 +181,33 @@ export function TestDashboard() {
     sampleRate: 16000,
     initialMuted: true,
     adaptivePlayback: adaptivePlaybackEnabled,
-    onSchedule: (event) => trackerRef.current.logPlaybackScheduled(event),
+    onSchedule: (event) => {
+      trackerRef.current.logPlaybackScheduled(event);
+      const shadow = tailFreshnessShadowRef.current;
+      if (!tailFreshnessShadowEnabledRef.current || shadow === null) return;
+      try {
+        if (!event.audioFrame) {
+          throw new TailFreshnessShadowError(
+            'scheduled PCM lacks protocol-v1 frame metadata',
+          );
+        }
+        shadow.observeFrame({
+          observation: event.audioFrame,
+          schedulePerformanceMs: event.schedulePerformanceMs,
+          audioContextTimeAtScheduleSeconds: (
+            event.audioContextTimeAtScheduleSeconds
+          ),
+          audioBytes: event.audioBytes,
+          sourceDurationSeconds: event.sourceDurationSeconds,
+        });
+      } catch (error) {
+        const message = error instanceof Error
+          ? error.message
+          : 'tail-freshness shadow evidence failed';
+        tailFreshnessShadowErrorRef.current = message;
+        setTailFreshnessShadowStatus('invalid');
+      }
+    },
     onClockSample: (event) => (
       trackerRef.current.logPlaybackClockSample(event)
     ),
@@ -167,6 +240,14 @@ export function TestDashboard() {
       renderedDigitalCaptureEnabled
     );
   }, [renderedDigitalCaptureEnabled]);
+  useEffect(() => {
+    tailFreshnessShadowEnabledRef.current = tailFreshnessShadowEnabled;
+    if (phaseRef.current === 'idle') {
+      setTailFreshnessShadowStatus(
+        tailFreshnessShadowEnabled ? 'ready' : 'off',
+      );
+    }
+  }, [tailFreshnessShadowEnabled]);
   useEffect(() => { driftDataRef.current = driftData; }, [driftData]);
 
   // Store stable function refs to avoid closure issues
@@ -281,6 +362,18 @@ export function TestDashboard() {
     },
     onAudioParentComplete: (observation) => {
       trackerRef.current.logAudioParentComplete(observation);
+      const shadow = tailFreshnessShadowRef.current;
+      if (tailFreshnessShadowEnabledRef.current && shadow !== null) {
+        try {
+          shadow.observeParentComplete(observation);
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : 'tail-freshness parent evidence failed';
+          tailFreshnessShadowErrorRef.current = message;
+          setTailFreshnessShadowStatus('invalid');
+        }
+      }
       lastReceiveChangeRef.current = performance.now();
     },
   });
@@ -405,6 +498,22 @@ export function TestDashboard() {
     };
     queueSamplesRef.current.push(queueSample);
     const queueSummary = summarizePlaybackQueue(queueSamplesRef.current);
+    if (
+      tailFreshnessShadowEnabledRef.current
+      && tailFreshnessShadowRef.current !== null
+      && tailFreshnessShadowErrorRef.current === null
+    ) {
+      try {
+        setTailFreshnessShadowSummary(
+          tailFreshnessShadowRef.current.getSummary(),
+        );
+      } catch (error) {
+        tailFreshnessShadowErrorRef.current = error instanceof Error
+          ? error.message
+          : 'tail-freshness shadow summary failed';
+        setTailFreshnessShadowStatus('invalid');
+      }
+    }
     trackerRef.current.logPlaybackQueueSample(
       playbackMetrics.queueDepthSeconds,
       playbackMetrics.playbackRate,
@@ -478,6 +587,13 @@ export function TestDashboard() {
       received: [],
       scheduled: [],
     };
+    tailFreshnessShadowRef.current = null;
+    tailFreshnessShadowEvidenceRef.current = null;
+    tailFreshnessShadowErrorRef.current = null;
+    setTailFreshnessShadowSummary(EMPTY_TAIL_SHADOW_SUMMARY);
+    setTailFreshnessShadowStatus(
+      tailFreshnessShadowEnabledRef.current ? 'ready' : 'off',
+    );
 
     if (
       renderedDigitalCaptureEnabled
@@ -534,6 +650,18 @@ export function TestDashboard() {
       metrics.clearEvents();
       trackerRef.current.startTest({ adaptivePlaybackEnabled });
 
+      if (tailFreshnessShadowEnabled) {
+        const shadow = new TailFreshnessShadowScheduler({
+          hardCapSeconds: DEFAULT_PLAYBACK_POLICY.limitQueueSeconds,
+          cancellationGuardSeconds: 0.1,
+          adaptivePlayback: adaptivePlaybackEnabled,
+          playbackPolicy: DEFAULT_PLAYBACK_POLICY,
+        });
+        shadow.begin();
+        tailFreshnessShadowRef.current = shadow;
+        setTailFreshnessShadowStatus('running');
+      }
+
       if (renderedDigitalCaptureEnabled) {
         inputPlaybackRef.current.start(
           renderedDigitalCaptureRef.current.createPlaybackRouting(0),
@@ -577,6 +705,7 @@ export function TestDashboard() {
     metrics,
     adaptivePlaybackEnabled,
     renderedDigitalCaptureEnabled,
+    tailFreshnessShadowEnabled,
   ]);
 
   // -- Once WS connects, start stream + file source --
@@ -701,6 +830,31 @@ export function TestDashboard() {
     );
     runCleanupStep('WebSocket disconnect', () => wsRef.current.disconnect());
     runCleanupStep('metrics disconnect', () => metrics.disconnect());
+    if (tailFreshnessShadowEnabledRef.current) {
+      const shadow = tailFreshnessShadowRef.current;
+      const priorError = tailFreshnessShadowErrorRef.current;
+      if (shadow === null || priorError !== null) {
+        terminalPhase = 'failed';
+        terminalMessage = priorError
+          ? `Tail-freshness shadow evidence failed: ${priorError}`
+          : 'Tail-freshness shadow evidence was not initialized.';
+        setTailFreshnessShadowStatus('invalid');
+      } else {
+        try {
+          const evidence = shadow.finish();
+          tailFreshnessShadowEvidenceRef.current = evidence;
+          setTailFreshnessShadowSummary(evidence.summary);
+          setTailFreshnessShadowStatus('complete');
+        } catch (error) {
+          terminalPhase = 'failed';
+          terminalMessage = error instanceof Error
+            ? `Tail-freshness shadow evidence failed: ${error.message}`
+            : 'Tail-freshness shadow evidence could not be finalized.';
+          tailFreshnessShadowErrorRef.current = terminalMessage;
+          setTailFreshnessShadowStatus('invalid');
+        }
+      }
+    }
     runCleanupStep('input playback stop', () => inputPlaybackRef.current.stop());
     runCleanupStep('output playback stop', () => outputPlaybackRef.current.stop());
 
@@ -841,6 +995,21 @@ export function TestDashboard() {
 
     if (!renderedDigitalCaptureEnabledRef.current) {
       exportTimingDataAsCSV(clientEvents, backendEvents);
+      if (tailFreshnessShadowEnabledRef.current) {
+        const evidence = tailFreshnessShadowEvidenceRef.current;
+        if (!evidence) {
+          setFailureMessage(
+            'Evidence export failed: tail-freshness shadow result is missing.',
+          );
+          return;
+        }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        downloadPrivateArtifact(
+          serializeTailFreshnessShadowEvidence(evidence),
+          'application/json',
+          `tail-freshness-shadow-${timestamp}.json`,
+        );
+      }
       return;
     }
     try {
@@ -930,6 +1099,13 @@ export function TestDashboard() {
       received: [],
       scheduled: [],
     };
+    tailFreshnessShadowRef.current = null;
+    tailFreshnessShadowEvidenceRef.current = null;
+    tailFreshnessShadowErrorRef.current = null;
+    setTailFreshnessShadowSummary(EMPTY_TAIL_SHADOW_SUMMARY);
+    setTailFreshnessShadowStatus(
+      tailFreshnessShadowEnabledRef.current ? 'ready' : 'off',
+    );
     setSourceChunksSent(0);
     serverTerminalStateRef.current = 'pending';
     setServerTerminalState('pending');
@@ -956,6 +1132,14 @@ export function TestDashboard() {
         data-s2s-phase={phase}
         data-s2s-source-chunks-sent={sourceChunksSent}
         data-s2s-server-terminal-state={serverTerminalState}
+        data-s2s-tail-shadow-enabled={tailFreshnessShadowEnabled}
+        data-s2s-tail-shadow-status={tailFreshnessShadowStatus}
+        data-s2s-tail-shadow-hard-cap-achieved={
+          tailFreshnessShadowSummary.hardCapAchieved
+        }
+        data-s2s-tail-shadow-single-tail-contract={
+          tailFreshnessShadowSummary.singleTailContractHolds
+        }
         data-s2s-recorder-fatal-code={
           renderedDigitalFatalDiagnostic?.code
         }
@@ -1079,6 +1263,26 @@ export function TestDashboard() {
               Adaptive Spanish playback (1.00x / 1.05x / 1.10x)
               <span className="block text-xs text-gray-500">
                 Turn off before starting to capture the fixed 1.00x control.
+              </span>
+            </span>
+          </label>
+
+          <label className="mt-4 flex items-start gap-2 text-sm text-gray-700">
+            <input
+              type="checkbox"
+              checked={tailFreshnessShadowEnabled}
+              onChange={(event) => (
+                setTailFreshnessShadowEnabled(event.target.checked)
+              )}
+              disabled={phase !== 'idle'}
+              data-s2s-control="tail-freshness-shadow"
+              className="mt-0.5 h-4 w-4"
+            />
+            <span>
+              Observation-only 10-second tail-freshness shadow
+              <span className="block text-xs text-gray-500">
+                Default off. Projects suffix truncations from numeric metadata;
+                it never cancels, reschedules, or changes audible audio.
               </span>
             </span>
           </label>
@@ -1256,6 +1460,61 @@ export function TestDashboard() {
               />
               <StatCard label="Elapsed" value={`${(stats.elapsedSec / 60).toFixed(1)} min`} />
               <StatCard label="Chunks Sent" value={stats.chunksSent.toString()} />
+            </div>
+          </div>
+        )}
+
+        {tailFreshnessShadowEnabled && phase !== 'idle' && (
+          <div className="bg-white rounded-2xl shadow-xl p-6">
+            <h2 className="text-lg font-semibold text-gray-800 mb-1">
+              Observation-only Tail-Freshness Shadow
+            </h2>
+            <p className="text-xs text-gray-500 mb-4">
+              Projected 10-second queue policy only. Audible Spanish playback
+              remains unchanged. Status: {tailFreshnessShadowStatus}.
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <StatCard
+                label="Last-decision Queue"
+                value={`${tailFreshnessShadowSummary.lastDecisionQueueSeconds.toFixed(2)}s`}
+                danger={!tailFreshnessShadowSummary.hardCapAchieved}
+              />
+              <StatCard
+                label="Projected Peak"
+                value={`${tailFreshnessShadowSummary.peakQueueAfterTruncationSeconds.toFixed(2)}s`}
+                danger={!tailFreshnessShadowSummary.hardCapAchieved}
+              />
+              <StatCard
+                label="Projected Retained"
+                value={`${tailFreshnessShadowSummary.retainedSourcePercent.toFixed(2)}%`}
+              />
+              <StatCard
+                label="Parents Affected"
+                value={(
+                  tailFreshnessShadowSummary.parentsTruncated
+                  + tailFreshnessShadowSummary.parentsFullyDropped
+                ).toString()}
+              />
+              <StatCard
+                label="Projected Frames Dropped"
+                value={tailFreshnessShadowSummary.framesDropped.toString()}
+              />
+              <StatCard
+                label="Longest Suffix"
+                value={`${tailFreshnessShadowSummary.maxDroppedParentSuffixSeconds.toFixed(2)}s`}
+              />
+              <StatCard
+                label="Residual Breaches"
+                value={tailFreshnessShadowSummary.residualBreachEvents.toString()}
+                danger={tailFreshnessShadowSummary.residualBreachEvents > 0}
+              />
+              <StatCard
+                label="Single-tail Contract"
+                value={tailFreshnessShadowSummary.singleTailContractHolds
+                  ? 'Pass'
+                  : 'Fail'}
+                danger={!tailFreshnessShadowSummary.singleTailContractHolds}
+              />
             </div>
           </div>
         )}

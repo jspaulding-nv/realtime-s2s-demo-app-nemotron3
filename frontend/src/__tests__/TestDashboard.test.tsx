@@ -375,6 +375,86 @@ describe('TestDashboard', () => {
       .toBeInTheDocument();
   });
 
+  it('keeps the observation-only tail-freshness shadow default-off', () => {
+    render(<TestDashboard />);
+
+    const checkbox = screen.getByRole('checkbox', {
+      name: /Observation-only 10-second tail-freshness shadow/i,
+    });
+    expect(checkbox).not.toBeChecked();
+    expect(screen.getByText(/never cancels, reschedules, or changes audible audio/i))
+      .toBeInTheDocument();
+    expect(document.querySelector('[data-s2s-tail-shadow-status]'))
+      .toHaveAttribute('data-s2s-tail-shadow-status', 'off');
+  });
+
+  it('starts the opt-in shadow without changing playback options', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+    render(<TestDashboard />);
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /Observation-only 10-second tail-freshness shadow/i,
+    }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+
+    expect(screen.getByText('Observation-only Tail-Freshness Shadow'))
+      .toBeInTheDocument();
+    expect(screen.getByText(/Status: running/i)).toBeInTheDocument();
+    expect(document.querySelector('[data-s2s-tail-shadow-status]'))
+      .toHaveAttribute('data-s2s-tail-shadow-status', 'running');
+    const outputOptions = playbackOptions.filter(
+      (options) => options.onSchedule !== undefined,
+    ).at(-1);
+    expect(outputOptions).toEqual(expect.objectContaining({
+      adaptivePlayback: true,
+    }));
+  });
+
+  it('latches shadow evidence invalid when scheduled metadata is absent', async () => {
+    const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
+    vi.mocked(useFileAudioSource).mockReturnValue({
+      isLoaded: true,
+      isStreaming: false,
+      duration: 60,
+      position: 0,
+      loadFile: vi.fn(),
+      startStreaming: vi.fn(),
+      stopStreaming: vi.fn(),
+    });
+    render(<TestDashboard />);
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /Observation-only 10-second tail-freshness shadow/i,
+    }));
+    await act(async () => {
+      fireEvent.click(screen.getByText('Start Test'));
+    });
+    const outputOptions = playbackOptions.filter(
+      (options) => options.onSchedule !== undefined,
+    ).at(-1);
+
+    act(() => outputOptions?.onSchedule?.({
+      schedulePerformanceMs: 1,
+      audioContextTimeAtScheduleSeconds: 0,
+      audioBytes: 16_000,
+      sourceDurationSeconds: 0.5,
+    }));
+
+    expect(screen.getByText(/Status: invalid/i)).toBeInTheDocument();
+    expect(document.querySelector('[data-s2s-tail-shadow-status]'))
+      .toHaveAttribute('data-s2s-tail-shadow-status', 'invalid');
+  });
+
   it('starts both playback paths on one capture-owned context when opted in', async () => {
     const { useFileAudioSource } = await import('../hooks/useFileAudioSource');
     vi.mocked(useFileAudioSource).mockReturnValue({

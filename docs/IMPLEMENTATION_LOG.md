@@ -2080,6 +2080,12 @@ with one expected environment-dependent skip.
 - [ ] Complete independent bilingual review and both the five-second and
   ten-second analyses before promoting to five-minute or long-form captures
 - [ ] Run a parent/frame-aligned guarded-edge capacity counterfactual
+- [x] Run an offline frame-boundary hard-cap counterfactual
+- [x] Run a single-tail parent truncation counterfactual
+- [x] Implement an observation-only live single-tail shadow scheduler and
+  independent evidence replay
+- [ ] Pass the live shadow on the 60-second preflight, then five minutes and
+  all three long-form samples
 - [ ] Repeat publisher-handoff telemetry over complete long-form samples before
   claiming the historical late-sample anomaly is eliminated
 - [x] Fit and document a privacy-safe post-NMT TTS character/duration model
@@ -2087,3 +2093,150 @@ with one expected environment-dependent skip.
 - [x] Run matched unsplit/40/45/60 short and five-minute real-time canaries
 - [x] Keep unapproved private/internal container references out of external
   documentation
+
+## 2026-08-04 — private stage-quality isolation and context canary
+
+- Added `staged_pipeline_smoke.py --private-stage-trace`. The option is
+  default-off and restores source/translated text only to the caller-selected
+  private smoke report; routine staged telemetry and the WebSocket service
+  remain text-free.
+- Added `analyze_private_stage_quality.py` and a private runbook. The analyzer
+  hash-binds the returned review, identical source PCM, fresh translated PCM,
+  and per-parent stage report; writes only owner-private artifacts; and creates
+  source/translated WAV pairs for every reviewed window without requiring a
+  reviewer to pause at a landmark.
+- The analyzer now emits both the original fixed source window and the full
+  source envelope represented by selected translated parents. This exposed a
+  3.44-second content-boundary mismatch in the sole negative-meaning review
+  pair, so that observation is treated as confounded rather than as proof of an
+  NMT failure.
+- Added a default-off `STAGED_SEGMENT_PUNCTUATION_MIN_CHARS` canary. A positive
+  value coalesces a short punctuation boundary only when additional text is
+  already buffered; standalone short utterances retain immediate punctuation
+  emission.
+- Ran matched real-time 60-second private control and 20-character canary
+  replays on the healthy pinned stack. Both completed without retry. The
+  canary reduced total parents from 23 to 20 and worst-window parents from 10
+  to 7, but the worst-window synthesized duration increased from 17.601 to
+  17.973 seconds. It remains unpromoted pending a content-aligned bilingual
+  A/B.
+- Focused analyzer, segmenter, staged-pipeline, and API tests passed: 162.
+
+## 2026-08-04 — frame-boundary hard-cap counterfactual
+
+- Extended the deterministic freshness simulator with an explicitly
+  destructive `oldest_frame_first` mode. It may remove only scheduled frames
+  strictly beyond the cancellation guard; existing complete-parent strategies
+  remain unchanged.
+- Added `analyze_frame_freshness_cap.py`. It reloads the validated schema-3
+  trace, reconciles frame and byte accounting, sweeps 5/8/10-second caps and
+  guard sensitivity, and classifies partial-parent loss as prefix, suffix,
+  contiguous internal, or fragmented. Output is privacy-safe and offline-only.
+- On the retained five-minute 2,782-frame/74-parent trace, all three frame caps
+  were achieved. The 10-second policy retained 90.89% of audio and held peak
+  queue at 9.999 seconds, but it removed 250 frames across nine partially cut
+  parents. Two cuts were internal contiguous gaps and seven were fragmented;
+  none was a clean prefix or suffix.
+- Raw frame eviction remains unpromoted. The next objective gate is a
+  single-tail parent truncation simulation that suppresses the remainder of a
+  stale parent rather than creating multiple holes inside it.
+
+## 2026-08-04 — single-tail parent truncation counterfactual
+
+- Added a deterministic `truncate_parent_tail` simulator mode. On a cap
+  breach, it keeps the maximum eligible prefix, removes one trailing suffix,
+  and suppresses future frames through that parent's completion marker.
+- Generalized `analyze_frame_freshness_cap.py` to select raw-frame or
+  parent-tail strategies and to verify frame/byte accounting, loss shape, cap
+  compliance, and the single-tail invariant.
+- On the retained five-minute 2,782-frame/74-parent trace, 5-, 8-, and
+  10-second caps all held. The 10-second policy retained 90.49% of translated
+  audio, dropped 265 frames across nine partial parents, held queue p95/peak at
+  9.133/9.999 seconds, and produced only trailing suffix cuts. There were zero
+  internal or fragmented gaps; the largest removed suffix was 7.289 seconds.
+- The policy remains offline and unpromoted because its projected 9.51% audio
+  loss has no semantic-quality approval. The next objective gate is an
+  observation-only live shadow scheduler before any audible cancellation.
+
+## 2026-08-05 — observation-only live single-tail shadow
+
+- Added a default-off numeric-only shadow scheduler to the Test Dashboard. It
+  consumes protocol-v1 parent/frame arrivals and the live AudioContext clock,
+  causally applies the 10-second/100 ms-guard single-tail policy, and never
+  touches Web Audio nodes, PCM, or the audible no-drop schedule.
+- The dashboard displays projected queue, retention, affected parents,
+  dropped frames, longest suffix, residual breaches, and the single-tail
+  invariant. A naturally completed run exports a private
+  `tail-freshness-shadow-*.json` artifact alongside its timing CSV.
+- The shadow fails closed on missing metadata, identity/order changes, byte or
+  duration mismatches, incomplete parent completion, or a non-suffix loss
+  shape. Manual stop cannot produce valid shadow evidence.
+- Added `analyze_live_tail_shadow.py`, which strictly validates the privacy and
+  accounting contract and independently replays every browser arrival through
+  the Python freshness simulator. Altered queue decisions, losses, or summary
+  claims are rejected.
+- Added focused frontend, dashboard-integration, and Python analyzer tests,
+  plus `docs/LIVE_TAIL_FRESHNESS_SHADOW.md`. No live Riva qualification result
+  is claimed yet; the next gate is one natural-completion 60-second preflight.
+
+## 2026-08-05 — first automated live shadow probe
+
+- Added `run_live_tail_shadow_preflight.py`, a non-formal engineering runner
+  that fixes the staged schema-3/500 ms/800 ms EOU controls, verifies Riva
+  readiness and read-only Docker identity, hash-checks the exact fixture,
+  builds a production frontend, drives local headless Chrome, and independently
+  validates both downloaded artifacts. It never enables PCM capture or mutates
+  Riva containers and cleans up only its own children.
+- Passed two natural-completion 60-second runs on Nemotron ASR 1.2.0, Riva
+  Translate 1.5.2, and Magpie TTS 1.7.0. The hardened confirmation exercised
+  the new fixture-hash and read-only Docker attestation checks. Both traces had
+  23 parents, retained 100% of generated audio, and matched the independent
+  Python replay; ordinary live TTS variation produced 114 versus 113 frames.
+- The largest projected queue was 5.567 seconds, so neither run required
+  truncation. The 10-second cap held with zero residual breaches and the
+  single-tail invariant passed twice. This validates live causal observation
+  and export, not the overload branch.
+- The run is explicitly non-formal because the working tree was dirty. The
+  next gate is the same live shadow over five real-time minutes, where prior
+  offline evidence predicts actual suffix suppression pressure.
+
+## 2026-08-05 — five-minute live shadow capacity gate
+
+- Extended `run_live_tail_shadow_preflight.py` with `--five-minute`. It
+  hash-checks the tracked long-form source, deterministically creates the exact
+  historical 300-second WAV prefix, verifies its registered hash, and retains
+  all outputs under a fresh ignored private directory.
+- The natural-completion 500 ms-profile run processed 74 parents and 595
+  frames. The unchanged no-drop schedule reached 24.727 seconds of backlog and
+  reached its final zero-queue sample about 27.041 seconds after input ended.
+- The live shadow held its projected queue to 9.991 seconds with no residual
+  breach. It projected retaining 247.844 of 279.896 generated seconds (88.55%)
+  and removing 32.052 seconds across ten partially truncated parents. All
+  losses were trailing suffixes; no parent was fully removed, and the longest
+  suffix was 8.143 seconds.
+- The independent Python replay matched every decision and aggregate. Seven of
+  nine parents affected in the retained offline trace were affected again.
+- The older offline trace used 100 ms frames and generated 2.01% less TTS
+  audio, so its 90.49% retention is not an exact matched comparator. The next
+  gate is one live 100 ms/500 ms comparison before committing hours to all
+  three complete samples.
+
+## 2026-08-05 — live 100 ms/500 ms frame comparison
+
+- Parameterized the live shadow runner with an explicit, fail-closed
+  `--incremental-frame-ms {100,500}` control. The selected value is forced into
+  the backend environment, checked through `/api/config`, encoded in the
+  private runtime record, and included in the output-directory identity.
+- The matched 100 ms five-minute arm completed naturally with 2,780 frames and
+  the same 74 parents. It retained 250.470 of 274.044 generated seconds
+  (91.40%), removed 23.574 seconds across ten trailing suffixes, held the cap at
+  9.999 seconds with zero residual breaches, and matched the independent replay.
+- Compared with the 500 ms arm, 100 ms retained 2.85 percentage points more
+  audio, removed 8.478 fewer seconds, and shortened the longest suffix from
+  8.143 to 6.918 seconds. The unchanged no-drop peak/tail also fell from
+  24.727/27.041 seconds to 16.491/18.032 seconds.
+- Magpie generated 2.09% less audio in the 100 ms call, so the entire
+  improvement cannot be attributed to framing. The 100 ms transport is still
+  selected for the next observation-only long-form gate because it was stable,
+  cap-compliant, lower-loss, and closely reproduced the retained historical
+  100 ms trace. Deployment and audible cancellation remain unchanged.

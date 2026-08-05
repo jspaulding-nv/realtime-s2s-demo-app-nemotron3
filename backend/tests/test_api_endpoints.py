@@ -149,6 +149,9 @@ async def test_config_and_root_expose_active_pipeline_mode(client: AsyncClient):
         ),
         "segmentMaxChars": staged_pipeline_config.segment_max_chars,
         "segmentMaxAgeMs": staged_pipeline_config.segment_max_age_ms,
+        "segmentPunctuationMinChars": (
+            staged_pipeline_config.segment_punctuation_min_chars
+        ),
         "asrEventQueueMaxSize": staged_pipeline_config.asr_event_queue_maxsize,
         "nmtQueueMaxSize": staged_pipeline_config.nmt_queue_maxsize,
         "ttsQueueMaxSize": staged_pipeline_config.tts_queue_maxsize,
