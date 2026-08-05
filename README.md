@@ -509,7 +509,9 @@ failed attempt, and can continue an interrupted VM run with
 The completed August 5 gate is documented in the
 [three-sample long-form result](docs/LIVE_TAIL_FRESHNESS_SHADOW_LONG_FORM_RESULT_2026-08-05.md).
 All three mechanical shadows passed, but the projected policy would remove
-10.97% of translated audio in aggregate. Audible cancellation remains disabled.
+10.97% of translated audio in aggregate. A no-drop replay also found that even
+1.60x constant playback left 16–22 second queue peaks. Audible cancellation
+remains disabled, and playback speed alone is not the recommended next fix.
 
 See the
 [live tail-freshness shadow runbook](docs/LIVE_TAIL_FRESHNESS_SHADOW.md) for

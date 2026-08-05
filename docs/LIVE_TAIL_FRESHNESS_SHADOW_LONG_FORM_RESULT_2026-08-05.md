@@ -88,18 +88,50 @@ The second claim fails the current engineering gate because an audience could
 lose complete ideas, including one entire translated parent and multi-second
 parent suffixes. No mechanical invariant establishes semantic safety.
 
+## Offline no-drop playback-rate counterfactual
+
+The exact translated-audio arrival traces were replayed after the live gate at
+constant rates from 1.10x through 1.60x. Every scenario preserved every PCM
+chunk and kept the captured arrival timestamps and input boundary unchanged.
+
+| Constant rate | Sample 01 queue p95 / peak | Sample 02 queue p95 / peak | Sample 03 queue p95 / peak |
+|---:|---:|---:|---:|
+| 1.10x | 59.587 / 68.995 s | 40.432 / 49.978 s | 21.673 / 35.531 s |
+| 1.25x | 17.168 / 25.842 s | 17.593 / 23.696 s | 12.843 / 30.262 s |
+| 1.40x | 12.751 / 22.482 s | 12.492 / 19.935 s | 8.528 / 26.122 s |
+| 1.60x | 9.362 / 18.984 s | 8.251 / 16.016 s | 5.889 / 21.810 s |
+
+No tested constant rate held the hard 10-second peak without content loss. A
+1.60x rate brought time-weighted queue p95 below 10 seconds on all samples but
+still left 16.016–21.810 second peaks. Such a rate is not a reasonable listener
+candidate and was evaluated only to locate the mechanical bound.
+
+Captured short-window burst rates explain why average Spanish expansion is not
+enough to size playback speed:
+
+| Trace | 30 s arrival-rate p95 | 60 s arrival-rate p95 | 300 s arrival-rate p95 |
+|---|---:|---:|---:|
+| Sample 01 | 1.574x | 1.364x | 1.188x |
+| Sample 02 | 1.529x | 1.346x | 1.198x |
+| Sample 03 | 1.413x | 1.239x | 1.108x |
+
+Translated media arrives in bursts much faster than its long-run 1.071x
+generated/source ratio. Playback acceleration alone cannot absorb those bursts
+inside a 10-second hard ceiling at a listener-tolerable rate.
+
 ## Recommended next technical gate
 
-Keep audible cancellation disabled. Reuse these exact arrival traces for a fast
-offline counterfactual that measures constant and adaptive pitch-preserving
-time-scale policies before another real-time run. Determine the minimum playback
-rate and threshold policy needed to hold queue p95 and peak near 10 seconds with
-zero content loss. Include at least 1.10x, 1.15x, 1.20x, and a bounded ramp policy.
+Keep audible cancellation disabled and do not pursue progressively higher
+playback rates as the primary fix. Use the saved timing traces to attribute the
+30-second and 60-second arrival bursts across ASR finalization, NMT completion,
+TTS first audio, TTS completion, and browser delivery. The next implementation
+candidate should reduce or safely absorb those upstream bursts rather than
+masking them with listener-side speed.
 
-If no listener-tolerable rate holds the bound, the architecture needs an
-explicit product choice among translated-content compression, summarization,
-source-speaker pacing, or a larger audience-delay SLA. Tail cancellation should
-not become the implicit answer.
+The architecture also needs an explicit product choice among interpreter-style
+translated-content compression, source-speaker pacing, a larger audience-delay
+SLA, or an approved overload policy. Tail cancellation should not become the
+implicit answer.
 
 Any promising time-scale arm must then use pitch-preserving processing and pass
 native-Spanish review for intelligibility, naturalness, boundary continuity,
@@ -118,6 +150,10 @@ sample. Each attempt retains the decoded source WAV, numeric shadow JSON, timing
 CSV, application logs, Docker attestation, and independent analyzer reports.
 Do not commit or externally publish this directory without a separate privacy
 review.
+
+The private directory also retains the no-drop capacity-sweep JSON and Markdown
+reports. Derived compatibility CSVs are not primary evidence; the original
+timing exports remain authoritative.
 
 ## Claim boundaries
 
