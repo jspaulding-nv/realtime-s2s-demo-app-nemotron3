@@ -175,7 +175,8 @@ session identity, PCM, text, and wall-clock timestamps.
 3. Select 100 ms versus 500 ms publication with one matched live comparison.
    **100 ms selected for further observation.**
 4. Run the live shadow across all three long-form samples and verify every
-   artifact independently.
+   artifact independently. **Passed mechanically at 100 ms; rejected for
+   audible promotion because projected aggregate removal was 10.97%.**
 5. Require all runs to hold the 10-second projected scheduled-audio cap, keep
    the single-tail invariant, and report the complete loss distribution.
 6. Only then design a separate default-off audible canary with fade and
@@ -183,6 +184,11 @@ session identity, PCM, text, and wall-clock timestamps.
 
 An audible canary would still require bilingual quality review. A mechanical
 shadow pass cannot establish that omitted suffixes preserve meaning.
+
+See the
+[complete long-form result](LIVE_TAIL_FRESHNESS_SHADOW_LONG_FORM_RESULT_2026-08-05.md)
+for the three per-sample queue peaks, retention values, loss distribution, and
+the decision to keep audible cancellation disabled.
 
 ## Claim boundaries
 

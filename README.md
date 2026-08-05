@@ -506,6 +506,11 @@ failed attempt, and can continue an interrupted VM run with
 `--resume-dir experiment_results/<batch-directory>`. One pass requires about
 103.7 minutes of source time plus translated-tail drain and application startup.
 
+The completed August 5 gate is documented in the
+[three-sample long-form result](docs/LIVE_TAIL_FRESHNESS_SHADOW_LONG_FORM_RESULT_2026-08-05.md).
+All three mechanical shadows passed, but the projected policy would remove
+10.97% of translated audio in aggregate. Audible cancellation remains disabled.
+
 See the
 [live tail-freshness shadow runbook](docs/LIVE_TAIL_FRESHNESS_SHADOW.md) for
 the 60-second, five-minute, and three-sample promotion order. A cap pass is
@@ -1062,6 +1067,7 @@ Detailed guides:
 - [Live tail-freshness shadow five-minute result](docs/LIVE_TAIL_FRESHNESS_SHADOW_5MIN_RESULT_2026-08-05.md)
 - [Live tail-freshness shadow 100 ms/500 ms comparison](docs/LIVE_TAIL_FRESHNESS_SHADOW_FRAME_COMPARISON_2026-08-05.md)
 - [Complete three-sample tail-shadow runbook](docs/LONG_FORM_TAIL_SHADOW_RUNBOOK.md)
+- [Complete three-sample tail-shadow result](docs/LIVE_TAIL_FRESHNESS_SHADOW_LONG_FORM_RESULT_2026-08-05.md)
 - [Protocol-v1 60-second formal canary](docs/AUDIO_METADATA_60S_CANARY_2026-07-25.md)
 - [Semantic source-event latency gate](docs/SEMANTIC_EVENT_LATENCY_GATE.md)
 - [Headless scheduled semantic-delay gate](docs/HEADLESS_SEMANTIC_DELAY_GATE.md)
